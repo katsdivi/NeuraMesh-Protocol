@@ -105,6 +105,48 @@ final class CapabilitiesTests: XCTestCase {
         XCTAssertEqual(try NMPCapabilities.decode(slice), sample)
     }
 
+    // MARK: v2 reachability fields (Phase 5)
+
+    func testV2ReachabilityFieldsRoundTrip() throws {
+        var reachable = sample
+        reachable.udpPort = 51_820
+        reachable.noiseStaticPublicKey = Data((0..<32).map { UInt8($0) })
+
+        // Binary round trip.
+        let decoded = try NMPCapabilities.decode(try reachable.encode())
+        XCTAssertEqual(decoded, reachable)
+
+        // TXT round trip.
+        let dict = reachable.txtDictionary()
+        XCTAssertEqual(dict["port"], "51820")
+        XCTAssertEqual(NMPCapabilities(txtDictionary: dict), reachable)
+    }
+
+    func testV1BlobDecodesWithDefaultReachability() throws {
+        // A Phase 4 (v1) advertisement: same layout, no port/pk tail.
+        var v1Blob = try sample.encode()
+        v1Blob = v1Blob.dropLast(3) // strip v2 tail: port(2) + pkLen(1)=0
+        v1Blob[0] = 1
+        let decoded = try NMPCapabilities.decode(v1Blob)
+        XCTAssertEqual(decoded.udpPort, 0)
+        XCTAssertNil(decoded.noiseStaticPublicKey)
+        XCTAssertEqual(decoded.peerID, sample.peerID)
+        XCTAssertEqual(decoded.modelFormats, sample.modelFormats)
+    }
+
+    func testEncodeAndDecodeRejectBadKeyLength() throws {
+        var bad = sample
+        bad.noiseStaticPublicKey = Data([1, 2, 3])
+        XCTAssertThrowsError(try bad.encode()) {
+            XCTAssertEqual($0 as? NMPCapabilitiesError, .invalidPublicKeyLength(3))
+        }
+
+        // TXT parse drops a malformed pk instead of rejecting the peer.
+        var dict = sample.txtDictionary()
+        dict["pk"] = Data([1, 2, 3]).base64EncodedString()
+        XCTAssertNil(NMPCapabilities(txtDictionary: dict)?.noiseStaticPublicKey)
+    }
+
     // MARK: Compute class
 
     func testComputeClassOrdering() {

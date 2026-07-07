@@ -81,6 +81,22 @@ public enum PeerConnectionError: Error, Equatable, Sendable {
     case noiseFailure(String)
 }
 
+/// Phase 6: structured loss-recovery events, one per recovery action the
+/// connection takes. `onDiagnostic` carries the same information as prose;
+/// this is the machine-readable feed the testing dashboard renders.
+public enum NMPPacketEvent: Equatable, Sendable {
+    /// A lost DATA packet was reconstructed from XOR parity — recovery
+    /// without a round trip.
+    case fecRecovered(sequence: UInt32)
+    /// The receiver requested retransmission of these missing sequences.
+    case nackSent(sequences: [UInt32])
+    /// The sender re-sent this sequence verbatim in answer to a peer NACK.
+    case retransmitted(sequence: UInt32)
+    /// The reliability machinery gave up on these sequences (attempts
+    /// exhausted or aged out of the retransmit window).
+    case unrecoverableLoss(sequences: [UInt32])
+}
+
 // MARK: - PeerConnection
 
 public final class PeerConnection {
@@ -100,6 +116,9 @@ public final class PeerConnection {
     /// Sequences abandoned by the reliability layer (NACK attempts exhausted
     /// or aged out of the retransmit window). Phase 3's FEC consumes this.
     public var onUnrecoverableLoss: ((_ sequences: [UInt32]) -> Void)?
+    /// Phase 6: structured loss/recovery event stream (FEC reconstructions,
+    /// NACKs sent, retransmits served). Consumed by the testing dashboard.
+    public var onPacketEvent: ((NMPPacketEvent) -> Void)?
 
     // MARK: State
 
@@ -517,6 +536,7 @@ public final class PeerConnection {
                 if !agedOut.isEmpty {
                     onDiagnostic?("gaps aged out of retransmit window: \(agedOut)")
                     onUnrecoverableLoss?(agedOut)
+                    onPacketEvent?(.unrecoverableLoss(sequences: agedOut))
                 }
                 // FLUSH = end of burst; nothing behind it will fill gaps.
                 if packet.header.flags.contains(.flush) {
@@ -584,6 +604,7 @@ public final class PeerConnection {
         for seq in sequences {
             if let datagram = retransmitBuffer.datagram(for: seq) {
                 onDiagnostic?("retransmitting seq=\(seq) on NACK")
+                onPacketEvent?(.retransmitted(sequence: seq))
                 transport.send(datagram)
             } else {
                 onDiagnostic?("NACK for seq=\(seq) outside retransmit window; ignored")
@@ -598,10 +619,12 @@ public final class PeerConnection {
         if !gaveUp.isEmpty {
             onDiagnostic?("NACK attempts exhausted for \(gaveUp)")
             onUnrecoverableLoss?(gaveUp)
+            onPacketEvent?(.unrecoverableLoss(sequences: gaveUp))
         }
         if !toNack.isEmpty {
             do {
                 _ = try send(packetType: .nack, payload: NMPNackCodec.encode(toNack))
+                onPacketEvent?(.nackSent(sequences: toNack))
             } catch {
                 onDiagnostic?("failed to send NACK for \(toNack): \(error)")
             }
@@ -652,6 +675,7 @@ public final class PeerConnection {
             lossTracker.markRecovered(recovery.sequence)
             onDiagnostic?("FEC recovered seq=\(recovery.sequence) "
                           + "(group 0x\(String(recovery.groupID, radix: 16)))")
+            onPacketEvent?(.fecRecovered(sequence: recovery.sequence))
             let header = NMPHeader(
                 isEncrypted: true,
                 flags: [],

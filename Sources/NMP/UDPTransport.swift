@@ -47,6 +47,19 @@ public final class UDPTransport: NMPTransport {
         self.queue = queue
     }
 
+    /// Dial an arbitrary endpoint — notably a Bonjour `.service` endpoint
+    /// from a browse result. Network.framework resolves the service's SRV
+    /// record and connects UDP to the advertised port; NMP peers bind
+    /// their UDP listener and their Bonjour TCP anchor to the SAME port
+    /// number precisely so this resolution lands on the NMP listener
+    /// (see PeerNode.swift).
+    public init(endpoint: NWEndpoint, queue: DispatchQueue) {
+        let params = NWParameters.udp
+        params.allowLocalEndpointReuse = true
+        self.connection = NWConnection(to: endpoint, using: params)
+        self.queue = queue
+    }
+
     /// Wrap an already-accepted inbound connection (from UDPListener).
     public init(acceptedConnection: NWConnection, queue: DispatchQueue) {
         self.connection = acceptedConnection

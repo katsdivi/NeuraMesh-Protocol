@@ -72,16 +72,23 @@ public enum NMPCapabilitiesError: Error, Equatable, Sendable {
     case invalidUTF8
     case stringTooLong(Int)
     case tooManyModelFormats(Int)
+    case invalidPublicKeyLength(Int)
 }
 
 // MARK: - Capabilities
 
 public struct NMPCapabilities: Equatable, Sendable {
     /// Binary format version this implementation writes.
-    public static let formatVersion: UInt8 = 1
+    /// v1 (Phase 4): identity + capacity fields.
+    /// v2 (Phase 5): appends reachability — `udpPort` and the Noise static
+    /// public key — so a discovered peer can be DIALED with zero manual
+    /// configuration. v1 blobs still decode (fields default).
+    public static let formatVersion: UInt8 = 2
     /// Fixed-length prefix: version(1) + peerID(4) + ramMB(4) + compute(1)
     /// + load(1) + tpsCenti(4) + nameLen(1).
     static let fixedPrefixByteCount = 16
+    /// Curve25519 public keys are exactly 32 bytes.
+    public static let noiseKeyByteCount = 32
 
     public var peerID: UInt32
     /// Human-readable model, e.g. "MacBook Pro M3", "iPhone 15 Pro".
@@ -98,6 +105,15 @@ public struct NMPCapabilities: Equatable, Sendable {
     /// Supported model container formats, e.g. ["gguf", "safetensors"].
     /// Max 255 entries, each ≤255 UTF-8 bytes.
     public var modelFormats: [String]
+    /// v2: UDP port this peer's NMP listener accepts handshakes on.
+    /// 0 = not listening / not advertised (e.g. a pure initiator).
+    public var udpPort: UInt16
+    /// v2: this peer's long-term Curve25519 static public key (32 bytes).
+    /// Advertising it lets any discovered peer initiate Noise IK without
+    /// out-of-band key exchange. Public keys are public; AUTHENTICITY of a
+    /// TXT-learned key is trust-on-first-use unless the responder's key is
+    /// independently pinned via `authorizedStaticKeys` — see Phase5_Design.md.
+    public var noiseStaticPublicKey: Data?
 
     public init(
         peerID: UInt32,
@@ -106,7 +122,9 @@ public struct NMPCapabilities: Equatable, Sendable {
         computeClass: NMPComputeClass,
         currentLoadPercent: Double = 0,
         maxInferenceTokensPerSecond: Double = 0,
-        modelFormats: [String] = []
+        modelFormats: [String] = [],
+        udpPort: UInt16 = 0,
+        noiseStaticPublicKey: Data? = nil
     ) {
         self.peerID = peerID
         self.deviceName = deviceName
@@ -115,6 +133,8 @@ public struct NMPCapabilities: Equatable, Sendable {
         self.currentLoadPercent = currentLoadPercent
         self.maxInferenceTokensPerSecond = maxInferenceTokensPerSecond
         self.modelFormats = modelFormats
+        self.udpPort = udpPort
+        self.noiseStaticPublicKey = noiseStaticPublicKey
     }
 
     // MARK: Binary wire format
@@ -129,7 +149,8 @@ public struct NMPCapabilities: Equatable, Sendable {
     ///   bytes 11-14  TOKENS_PER_SEC (u32, centi-tokens/sec)
     ///   byte 15      NAME_LEN (u8), then NAME (UTF-8)
     ///   next         FMT_COUNT (u8), then FMT_COUNT × (LEN u8 ‖ UTF-8)
-    ///   trailing     reserved for future fields — v1 decoders ignore it
+    ///   v2 only      UDP_PORT (u16) ‖ PK_LEN (u8: 0 or 32) ‖ PK bytes
+    ///   trailing     reserved for future fields — decoders ignore it
     public func encode() throws -> Data {
         let nameBytes = Data(deviceName.utf8)
         guard nameBytes.count <= Int(UInt8.max) else {
@@ -137,6 +158,9 @@ public struct NMPCapabilities: Equatable, Sendable {
         }
         guard modelFormats.count <= Int(UInt8.max) else {
             throw NMPCapabilitiesError.tooManyModelFormats(modelFormats.count)
+        }
+        if let key = noiseStaticPublicKey, key.count != Self.noiseKeyByteCount {
+            throw NMPCapabilitiesError.invalidPublicKeyLength(key.count)
         }
 
         var out = Data(capacity: Self.fixedPrefixByteCount + nameBytes.count + 1)
@@ -159,6 +183,14 @@ public struct NMPCapabilities: Equatable, Sendable {
             out.append(UInt8(bytes.count))
             out.append(bytes)
         }
+        // v2 reachability fields.
+        out.appendBigEndian(udpPort)
+        if let key = noiseStaticPublicKey {
+            out.append(UInt8(key.count))
+            out.append(key)
+        } else {
+            out.append(0)
+        }
         return out
     }
 
@@ -170,7 +202,7 @@ public struct NMPCapabilities: Equatable, Sendable {
                 expectedAtLeast: fixedPrefixByteCount, got: bytes.count)
         }
         let version = bytes[0]
-        guard version == formatVersion else {
+        guard version >= 1, version <= formatVersion else {
             throw NMPCapabilitiesError.unsupportedVersion(version)
         }
         guard let compute = NMPComputeClass(rawValue: bytes[9]) else {
@@ -193,6 +225,29 @@ public struct NMPCapabilities: Equatable, Sendable {
             let length = Int(bytes[cursor]); cursor += 1
             formats.append(try readString(bytes, length: length, cursor: &cursor))
         }
+
+        // v2 reachability fields; a v1 blob simply ends here.
+        var udpPort: UInt16 = 0
+        var publicKey: Data?
+        if version >= 2 {
+            guard bytes.count >= cursor + 3 else {
+                throw NMPCapabilitiesError.truncated(expectedAtLeast: cursor + 3, got: bytes.count)
+            }
+            udpPort = (UInt16(bytes[cursor]) << 8) | UInt16(bytes[cursor + 1])
+            cursor += 2
+            let keyLength = Int(bytes[cursor]); cursor += 1
+            if keyLength > 0 {
+                guard keyLength == noiseKeyByteCount else {
+                    throw NMPCapabilitiesError.invalidPublicKeyLength(keyLength)
+                }
+                guard bytes.count >= cursor + keyLength else {
+                    throw NMPCapabilitiesError.truncated(
+                        expectedAtLeast: cursor + keyLength, got: bytes.count)
+                }
+                publicKey = bytes.subdata(in: cursor..<cursor + keyLength)
+                cursor += keyLength
+            }
+        }
         // Any bytes past `cursor` are fields from a future revision: ignored.
 
         return NMPCapabilities(
@@ -202,7 +257,9 @@ public struct NMPCapabilities: Equatable, Sendable {
             computeClass: compute,
             currentLoadPercent: Double(bytes[10]),
             maxInferenceTokensPerSecond: Double(bytes.readBigEndianUInt32(at: 11)) / 100,
-            modelFormats: formats
+            modelFormats: formats,
+            udpPort: udpPort,
+            noiseStaticPublicKey: publicKey
         )
     }
 
@@ -223,9 +280,10 @@ public struct NMPCapabilities: Equatable, Sendable {
     // MARK: Bonjour TXT dictionary
 
     /// TXT record key/value form. Keys are short by mDNS convention (TXT
-    /// records should stay well under 1300 bytes).
+    /// records should stay well under 1300 bytes; the base64 static key is
+    /// 44 chars). `port`/`pk` are omitted when unset.
     public func txtDictionary() -> [String: String] {
-        [
+        var dict = [
             "v": String(Self.formatVersion),
             "id": String(peerID, radix: 16),
             "name": String(deviceName.prefix(63)),
@@ -235,6 +293,9 @@ public struct NMPCapabilities: Equatable, Sendable {
             "tps": String(format: "%.2f", maxInferenceTokensPerSecond),
             "fmt": modelFormats.joined(separator: ","),
         ]
+        if udpPort != 0 { dict["port"] = String(udpPort) }
+        if let key = noiseStaticPublicKey { dict["pk"] = key.base64EncodedString() }
+        return dict
     }
 
     /// Lenient TXT parse: `id` and `compute` are required (a peer we cannot
@@ -250,6 +311,10 @@ public struct NMPCapabilities: Equatable, Sendable {
         let formats = (dict["fmt"] ?? "")
             .split(separator: ",")
             .map(String.init)
+        // A malformed pk is dropped (peer stays discoverable, just not
+        // dialable) rather than rejecting the whole advertisement.
+        var publicKey = dict["pk"].flatMap { Data(base64Encoded: $0) }
+        if publicKey?.count != Self.noiseKeyByteCount { publicKey = nil }
         self.init(
             peerID: id,
             deviceName: dict["name"] ?? "",
@@ -257,7 +322,9 @@ public struct NMPCapabilities: Equatable, Sendable {
             computeClass: compute,
             currentLoadPercent: dict["load"].flatMap(Double.init)?.clamped(to: 0...100) ?? 0,
             maxInferenceTokensPerSecond: dict["tps"].flatMap(Double.init) ?? 0,
-            modelFormats: formats
+            modelFormats: formats,
+            udpPort: dict["port"].flatMap(UInt16.init) ?? 0,
+            noiseStaticPublicKey: publicKey
         )
     }
 }

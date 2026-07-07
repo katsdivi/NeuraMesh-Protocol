@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  NeuraMeshPeer — REQUIRED Info.plist additions.
+
+  Xcode 14+ generates the Info.plist from build settings; add these two
+  keys via the target's Info tab (see Docs/CrossDevice_Setup_Guide.md,
+  step 4). This file is the reference for what they must contain —
+  without BOTH keys, iOS silently blocks Bonjour and the mesh never
+  assembles.
+-->
+<plist version="1.0">
+<dict>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>NeuraMesh discovers and connects to nearby devices to run distributed AI inference on your local network.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_neuramesh._tcp</string>
+    </array>
+</dict>
+</plist>

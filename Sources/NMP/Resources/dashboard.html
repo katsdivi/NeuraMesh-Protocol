@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>NeuraMesh Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Courier New', monospace;
+            background: #0d0d0d;
+            color: #00ff00;
+            padding: 20px;
+        }
+        h1 { margin-bottom: 4px; font-size: 24px; }
+        h2, h3 { margin-bottom: 10px; font-size: 15px; }
+        #conn-status { margin-bottom: 16px; font-size: 12px; color: #888; }
+        #conn-status.live { color: #00ff00; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 15px; }
+        .card {
+            border: 1px solid #00ff00;
+            padding: 15px;
+            background: #1a1a1a;
+        }
+        .card.dead { border-color: #ff3333; opacity: 0.55; }
+        .card.dead h3::after { content: "  ☠ LOST"; color: #ff3333; }
+        .metric-row { display: flex; justify-content: space-between; margin: 5px 0; }
+        .metric-label { font-weight: bold; }
+        .metric-value { color: #ffff00; }
+        #inference-progress { width: 100%; margin: 10px 0; accent-color: #00ff00; }
+        #controls { border-color: #ff6600; }
+        .control-group { margin: 10px 0; }
+        input[type="range"] { width: 300px; vertical-align: middle; }
+        button {
+            background: #00ff00;
+            color: #000;
+            border: none;
+            padding: 8px 16px;
+            margin: 5px 5px 5px 0;
+            cursor: pointer;
+            font-family: monospace;
+            font-weight: bold;
+        }
+        button:hover { background: #00cc00; }
+        #packet-log, #bench-log {
+            height: 220px;
+            overflow-y: auto;
+            padding: 10px;
+            font-size: 12px;
+            line-height: 1.5;
+        }
+        .packet-loss { color: #ff6600; }
+        .packet-fec { color: #00ffff; }
+        .packet-nack { color: #ffff00; }
+        .packet-retx { color: #ff99ff; }
+        .mesh-event { color: #ffffff; }
+        .span-all { grid-column: 1 / -1; }
+    </style>
+</head>
+<body>
+    <h1>🌐 NeuraMesh Dashboard</h1>
+    <div id="conn-status">connecting…</div>
+
+    <div class="grid">
+        <div id="peers-container" class="grid span-all"></div>
+
+        <div class="card span-all">
+            <h2>Inference Progress</h2>
+            <progress id="inference-progress" max="100" value="0"></progress>
+            <div class="metric-row">
+                <span id="stage">Idle</span>
+                <span id="loss-status">loss: 0%</span>
+            </div>
+        </div>
+
+        <div id="controls" class="card span-all">
+            <h2>Test Controls</h2>
+            <div class="control-group">
+                <label>Loss Rate:
+                    <input type="range" id="loss-slider" min="0" max="20" value="0" step="1">
+                </label>
+                <span id="loss-value">0%</span>
+            </div>
+            <div class="control-group">
+                <button onclick="send({type:'inject_peer_drop'})">💣 Inject Peer Drop</button>
+                <button onclick="send({type:'start_benchmark'})">📊 Start Benchmark</button>
+                <button onclick="send({type:'reset_metrics'})">🔄 Reset Metrics</button>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3>📡 Packet Log (FEC / NACK Recovery)</h3>
+            <div id="packet-log"></div>
+        </div>
+
+        <div class="card">
+            <h3>📈 Benchmark & Mesh Events</h3>
+            <div id="bench-log"></div>
+        </div>
+    </div>
+
+    <script>
+        let ws;
+        function connect() {
+            ws = new WebSocket('ws://' + location.host + '/ws');
+            ws.onopen = () => {
+                const el = document.getElementById('conn-status');
+                el.innerText = 'live — ' + location.host;
+                el.className = 'live';
+            };
+            ws.onclose = () => {
+                const el = document.getElementById('conn-status');
+                el.innerText = 'disconnected — retrying…';
+                el.className = '';
+                setTimeout(connect, 1500);
+            };
+            ws.onmessage = (event) => {
+                const msg = JSON.parse(event.data);
+                switch (msg.type) {
+                    case 'peer_update':
+                        updatePeerCard(msg);
+                        break;
+                    case 'inference_progress':
+                        document.getElementById('inference-progress').value = msg.progress;
+                        document.getElementById('stage').innerText = msg.stage;
+                        break;
+                    case 'packet_event':
+                        logPacketEvent(msg);
+                        break;
+                    case 'mesh_event':
+                        appendLog('bench-log', msg.message, 'mesh-event');
+                        break;
+                    case 'benchmark_result':
+                        appendLog('bench-log',
+                            `${msg.name}: p50=${msg.p50_ms.toFixed(1)}ms ` +
+                            `p95=${msg.p95_ms.toFixed(1)}ms p99=${msg.p99_ms.toFixed(1)}ms ` +
+                            `→ ${msg.throughput.toFixed(1)} tok/s ${msg.notes || ''}`,
+                            'mesh-event');
+                        break;
+                    case 'loss_rate':
+                        document.getElementById('loss-status').innerText =
+                            'loss: ' + (msg.rate * 100).toFixed(0) + '%';
+                        break;
+                }
+            };
+        }
+        connect();
+
+        function send(obj) {
+            if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+        }
+
+        function updatePeerCard(msg) {
+            let card = document.getElementById('peer-' + msg.peerID);
+            if (!card) {
+                card = document.createElement('div');
+                card.id = 'peer-' + msg.peerID;
+                document.getElementById('peers-container').appendChild(card);
+            }
+            card.className = 'card' + (msg.alive ? '' : ' dead');
+            card.innerHTML = `
+                <h3>Peer 0x${msg.peerID.toUpperCase()} — ${msg.name}</h3>
+                <div class="metric-row">
+                    <span class="metric-label">Latency:</span>
+                    <span class="metric-value">${msg.latencyMS} ms</span>
+                </div>
+                <div class="metric-row">
+                    <span class="metric-label">Load:</span>
+                    <span class="metric-value">${msg.loadPercent}%</span>
+                </div>
+                <div class="metric-row">
+                    <span class="metric-label">Assigned:</span>
+                    <span class="metric-value">${msg.assigned}</span>
+                </div>`;
+        }
+
+        function logPacketEvent(msg) {
+            const classes = {
+                fec_recovered: 'packet-fec',
+                nack_sent: 'packet-nack',
+                retransmitted: 'packet-retx',
+                unrecoverable_loss: 'packet-loss',
+            };
+            appendLog('packet-log',
+                `${msg.event} seq=${msg.seq.join(',')} peer=0x${msg.peer}`,
+                classes[msg.event] || '');
+        }
+
+        function appendLog(id, text, className) {
+            const log = document.getElementById(id);
+            const entry = document.createElement('div');
+            entry.className = className;
+            entry.innerText = `[${new Date().toLocaleTimeString()}] ${text}`;
+            log.appendChild(entry);
+            log.scrollTop = log.scrollHeight;
+            while (log.children.length > 200) log.removeChild(log.firstChild);
+        }
+
+        document.getElementById('loss-slider').addEventListener('input', (e) => {
+            document.getElementById('loss-value').innerText = e.target.value + '%';
+            send({ type: 'set_loss_rate', rate: parseFloat(e.target.value) / 100 });
+        });
+    </script>
+</body>
+</html>
