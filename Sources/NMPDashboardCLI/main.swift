@@ -18,9 +18,61 @@
 //                                                  benchmark, CSVs to dir
 //                                                  (default: Results/)
 //
+//  Phase 8 — real LLM engine:
+//    swift run nmp-dashboard [port] --engine llamaCpp --model PATH
+//                            [--gpu-layers N] [--placement local|remote]
+//
+//  llamaCpp mode serves REAL llama.cpp text through POST /api/inference.
+//  --placement remote (default) puts the model behind an in-process link
+//  running the full protocol stack (Noise IK, AES-GCM, FEC, NACK — the
+//  loss slider works); --placement local is the single-device baseline.
+//  Falls back to the reference mesh (with a warning) when the shim or
+//  model is missing — see scripts/setup_llama.sh.
+//
 
 import Foundation
 import NMP
+
+// MARK: - Arguments
+
+struct DashboardArguments {
+    var port: UInt16 = 8080
+    var engine = "reference"
+    var modelPath: String?
+    var gpuLayers: Int32 = -1
+    var placement = NMPLlamaTestbed.Placement.remotePeer
+
+    static func parse() -> DashboardArguments {
+        var arguments = DashboardArguments()
+        var iterator = CommandLine.arguments.dropFirst().makeIterator()
+        while let flag = iterator.next() {
+            let value = { iterator.next() }
+            switch flag {
+            case "--engine": arguments.engine = value() ?? arguments.engine
+            case "--model": arguments.modelPath = value()
+            case "--gpu-layers": arguments.gpuLayers = value().flatMap(Int32.init) ?? -1
+            case "--placement":
+                arguments.placement = value().flatMap {
+                    NMPLlamaTestbed.Placement(rawValue: $0 == "remote" ? "remotePeer" : $0)
+                } ?? arguments.placement
+            case "--help", "-h":
+                print("""
+                usage: nmp-dashboard [port] [--engine reference|llamaCpp] \
+                [--model path.gguf] [--gpu-layers N] [--placement local|remote]
+                """)
+                exit(0)
+            default:
+                if let parsed = UInt16(flag) {
+                    arguments.port = parsed
+                } else {
+                    FileHandle.standardError.write(Data("unknown flag \(flag)\n".utf8))
+                    exit(2)
+                }
+            }
+        }
+        return arguments
+    }
+}
 
 // MARK: - Headless benchmark mode
 
@@ -44,7 +96,135 @@ if CommandLine.arguments.dropFirst().first == "--benchmark" {
     }
 }
 
-let port = CommandLine.arguments.dropFirst().first.flatMap(UInt16.init) ?? 8080
+let dashboardArguments = DashboardArguments.parse()
+let port = dashboardArguments.port
+
+// MARK: - Phase 8: llamaCpp engine mode
+
+/// Real-LLM dashboard: single full-range llama shard (local or behind the
+/// in-process link), POST /api/inference generates real text. Never
+/// returns. See the header comment for what is and isn't available here.
+func runLlamaDashboard(model: NMPLlamaModel, placement: NMPLlamaTestbed.Placement) -> Never {
+    let engine = NMPLlamaComputeEngine(model: model)
+    print("[nmp-dashboard] llamaCpp engine: \(model.name) — "
+          + "\(model.layerCount) layers × \(model.hiddenSize) hidden, "
+          + "vocab \(model.vocabSize), ctx \(model.contextSize)")
+
+    let testbed: NMPLlamaTestbed
+    do {
+        testbed = try NMPLlamaTestbed(
+            engine: engine, modelTag: model.name, placement: placement)
+        let plan = try testbed.startSync()
+        let shard = plan[0]
+        print("[nmp-dashboard] llama mesh live: layers "
+              + "\(shard.startLayer)..<\(shard.endLayer) on "
+              + (placement == .local ? "coordinator (local)" : "in-process peer (full stack)"))
+    } catch {
+        fatalError("llama mesh assembly failed: \(error)")
+    }
+
+    let server = NMPDashboardServer()
+    server.onDiagnostic = { print("[nmp-dashboard] \($0)") }
+    do {
+        try server.start(port: port)
+    } catch {
+        fatalError("dashboard server failed to start: \(error)")
+    }
+    print("[nmp-dashboard] dashboard running at http://localhost:\(server.boundPort)")
+
+    testbed.onPacketEvent = { event in
+        server.reportPacketEvent(event, peerID: testbed.peerID)
+    }
+    testbed.onInferenceServed = { _, layers, seconds in
+        server.updatePeerState(
+            peerID: testbed.peerID, name: "llama-peer (in-process)",
+            latencyMS: Int(seconds * 1000), loadPercent: 0,
+            assigned: "layers \(layers.lowerBound)-\(layers.upperBound - 1)",
+            alive: true)
+    }
+    server.updatePeerState(
+        peerID: testbed.coordinatorID, name: "coordinator (tokenizer)",
+        latencyMS: 0, loadPercent: 0,
+        assigned: placement == .local ? "layers 0-\(engine.layerCount - 1)" : "—",
+        alive: true)
+    if placement == .remotePeer {
+        server.updatePeerState(
+            peerID: testbed.peerID, name: "llama-peer (in-process)",
+            latencyMS: 0, loadPercent: 0,
+            assigned: "layers 0-\(engine.layerCount - 1)", alive: true)
+    }
+
+    server.onControl = { control in
+        switch control {
+        case .setLossRate(let rate):
+            guard placement == .remotePeer else {
+                server.reportMeshEvent("loss injection needs --placement remote")
+                return
+            }
+            testbed.setLossRate(rate)
+            server.reportLossRate(rate)
+            server.reportMeshEvent(String(format: "loss rate set to %.0f%%", rate * 100))
+        case .injectPeerDrop:
+            server.reportMeshEvent("peer drop n/a: a llama mesh has one shard "
+                                   + "(the model is whole on one peer)")
+        case .startBenchmark:
+            server.reportMeshEvent("loss-sweep benchmark n/a with llamaCpp — "
+                                   + "use POST /api/inference for timed generations")
+        case .resetMetrics:
+            server.reportMeshEvent("metrics reset")
+        }
+    }
+
+    let promptService = NMPPromptInferenceService(
+        orchestrator: testbed.orchestrator,
+        codec: NMPLlamaPromptCodec(model: model))
+    promptService.onProgress = { done, total in
+        server.updateInferenceProgress(
+            progress: Double(done) / Double(max(total, 1)),
+            stage: "llama generation: token \(done)/\(total)")
+    }
+    server.onInferenceRequest = { request, respond in
+        server.reportMeshEvent("🌐 llama inference: up to \(request.maxTokens) token(s)")
+        promptService.run(prompt: request.prompt, maxTokens: request.maxTokens) { result in
+            switch result {
+            case .success(let generation):
+                server.reportMeshEvent(String(
+                    format: "🌐 llama inference done: %d tokens in %.1f ms "
+                        + "(%.2f tok/s) across %d shard(s)",
+                    generation.tokenCount, generation.totalSeconds * 1000,
+                    Double(generation.tokenCount) / max(generation.totalSeconds, 0.001),
+                    generation.shardCount))
+                respond(.success(generation))
+            case .failure(.busy):
+                respond(.failure(status: 429, message: "an inference is already running — retry shortly"))
+            case .failure(.emptyPrompt):
+                respond(.failure(status: 400, message: "prompt is empty"))
+            case .failure(.codec(let reason)):
+                respond(.failure(status: 400, message: "prompt encoding failed: \(reason)"))
+            case .failure(.orchestration(let error)):
+                server.reportMeshEvent("🌐 llama inference failed: \(error)")
+                respond(.failure(status: 500, message: "mesh orchestration failed: \(error)"))
+            }
+        }
+    }
+
+    print("[nmp-dashboard] Ctrl-C to stop")
+    dispatchMain()
+}
+
+if dashboardArguments.engine == "llamaCpp" {
+    guard let modelPath = dashboardArguments.modelPath else {
+        FileHandle.standardError.write(Data("--engine llamaCpp requires --model path.gguf\n".utf8))
+        exit(2)
+    }
+    do {
+        let model = try NMPLlamaModel(
+            modelPath: modelPath, gpuLayers: dashboardArguments.gpuLayers)
+        runLlamaDashboard(model: model, placement: dashboardArguments.placement)
+    } catch {
+        print("⚠️  llamaCpp engine unavailable (\(error)) — falling back to reference mesh")
+    }
+}
 
 // MARK: - Mesh
 
@@ -187,6 +367,46 @@ server.onControl = { control in
     }
 }
 
+// MARK: - Wiring: REST inference → mesh
+
+// POST /api/inference: prompt in, mesh-generated tokens out. The heartbeat
+// loop below pauses while a request runs so its passes don't interleave
+// with (and inflate) the request's per-token timings.
+var apiInferenceRunning = false
+
+let promptService = NMPPromptInferenceService(
+    orchestrator: testbed.orchestrator, hiddenSize: testbed.hiddenSize)
+promptService.onProgress = { done, total in
+    server.updateInferenceProgress(
+        progress: Double(done) / Double(max(total, 1)),
+        stage: "API generation: token \(done)/\(total)")
+}
+
+server.onInferenceRequest = { request, respond in
+    stateQueue.async { apiInferenceRunning = true }
+    server.reportMeshEvent("🌐 API inference: up to \(request.maxTokens) token(s)")
+    promptService.run(prompt: request.prompt, maxTokens: request.maxTokens) { result in
+        stateQueue.async { apiInferenceRunning = false }
+        switch result {
+        case .success(let generation):
+            server.reportMeshEvent(String(
+                format: "🌐 API inference done: %d tokens in %.1f ms across %d shard(s)",
+                generation.tokenCount, generation.totalSeconds * 1000,
+                generation.shardCount))
+            respond(.success(generation))
+        case .failure(.busy):
+            respond(.failure(status: 429, message: "an inference is already running — retry shortly"))
+        case .failure(.emptyPrompt):
+            respond(.failure(status: 400, message: "prompt is empty"))
+        case .failure(.codec(let reason)):
+            respond(.failure(status: 400, message: "prompt encoding failed: \(reason)"))
+        case .failure(.orchestration(let error)):
+            server.reportMeshEvent("🌐 API inference failed: \(error)")
+            respond(.failure(status: 500, message: "mesh orchestration failed: \(error)"))
+        }
+    }
+}
+
 // MARK: - Background inference loop (the dashboard's heartbeat)
 
 let inferenceQueue = DispatchQueue(label: "nmp.dashboard.inference")
@@ -195,7 +415,7 @@ func runInferenceLoop() {
         var generation = 0
         while true {
             var skip = false
-            stateQueue.sync { skip = benchmarkRunning }
+            stateQueue.sync { skip = benchmarkRunning || apiInferenceRunning }
             if skip {
                 Thread.sleep(forTimeInterval: 0.5)
                 continue

@@ -22,6 +22,12 @@
 //  Inbound control messages: set_loss_rate {rate}, inject_peer_drop,
 //  start_benchmark, reset_metrics — surfaced via `onControl`.
 //
+//  REST: POST /api/inference {prompt, max_tokens} runs a prompt through
+//  the mesh via `onInferenceRequest` and returns generated text + measured
+//  metrics as JSON. 503 when no handler is wired, 429 while a generation
+//  is in flight. No CORS headers: the expected caller is a server-side
+//  process (the NeuraMesh web app's API route), not a browser page.
+//
 
 import Foundation
 import Network
@@ -135,10 +141,25 @@ public final class NMPDashboardServer {
         case startTimeout
     }
 
+    /// One parsed POST /api/inference request.
+    public struct InferenceRequest: Equatable, Sendable {
+        public let prompt: String
+        public let maxTokens: Int
+    }
+
+    /// What the inference handler reports back; the server serializes it.
+    public enum InferenceResponse {
+        case success(NMPPromptInferenceService.GenerationResult)
+        case failure(status: Int, message: String)
+    }
+
     /// Control messages from any connected dashboard. Fires on the
     /// server's queue.
     public var onControl: ((ControlMessage) -> Void)?
     public var onDiagnostic: ((String) -> Void)?
+    /// Handler for POST /api/inference. Fires on the server's queue; the
+    /// reply callback may be invoked from any queue, exactly once.
+    public var onInferenceRequest: ((InferenceRequest, @escaping (InferenceResponse) -> Void) -> Void)?
 
     /// Actual bound port (differs from the requested one when passing 0).
     public private(set) var boundPort: UInt16 = 0
@@ -155,6 +176,9 @@ public final class NMPDashboardServer {
         let connection: NWConnection
         var buffer = Data()
         var isWebSocket = false
+        /// Parsed request head while its body is still arriving.
+        var pendingHead: String?
+        var pendingBodyLength = 0
         init(connection: NWConnection) { self.connection = connection }
     }
 
@@ -336,27 +360,71 @@ public final class NMPDashboardServer {
             while let frame = NMPWebSocketCodec.decodeFrame(from: &client.buffer) {
                 handleFrame(frame, from: client)
             }
-        } else if let headerEnd = client.buffer.range(of: Data("\r\n\r\n".utf8)) {
-            let head = String(decoding: Data(client.buffer[..<headerEnd.lowerBound]),
-                              as: UTF8.self)
-            client.buffer = Data(client.buffer[headerEnd.upperBound...])
-            handleHTTPRequest(head: head, client: client)
+        } else {
+            tryHandleHTTP(client)
         }
     }
 
     // MARK: HTTP
 
-    private func handleHTTPRequest(head: String, client: Client) {
+    /// 1 MB body cap — prompts are small; anything bigger is a bug or abuse.
+    private static let maxBodyBytes = 1 << 20
+
+    /// Dispatches a request once its head AND full body are buffered.
+    private func tryHandleHTTP(_ client: Client) {
+        // A head was parsed earlier; we were waiting on body bytes.
+        if let head = client.pendingHead {
+            guard client.buffer.count >= client.pendingBodyLength else { return }
+            let body = client.buffer.prefix(client.pendingBodyLength)
+            client.buffer = Data(client.buffer.dropFirst(client.pendingBodyLength))
+            client.pendingHead = nil
+            handleHTTPRequest(head: head, body: Data(body), client: client)
+            return
+        }
+        guard let headerEnd = client.buffer.range(of: Data("\r\n\r\n".utf8)) else { return }
+        let head = String(decoding: Data(client.buffer[..<headerEnd.lowerBound]),
+                          as: UTF8.self)
+        client.buffer = Data(client.buffer[headerEnd.upperBound...])
+
+        let contentLength = Self.contentLength(inHead: head)
+        guard contentLength <= Self.maxBodyBytes else {
+            respond(client, status: "413 Payload Too Large", body: "body too large\n")
+            return
+        }
+        if client.buffer.count >= contentLength {
+            let body = client.buffer.prefix(contentLength)
+            client.buffer = Data(client.buffer.dropFirst(contentLength))
+            handleHTTPRequest(head: head, body: Data(body), client: client)
+        } else {
+            client.pendingHead = head
+            client.pendingBodyLength = contentLength
+        }
+    }
+
+    private static func contentLength(inHead head: String) -> Int {
+        for line in head.split(separator: "\r\n").dropFirst() {
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let key = line[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
+            if key == "content-length" {
+                return Int(line[line.index(after: colon)...]
+                    .trimmingCharacters(in: .whitespaces)) ?? 0
+            }
+        }
+        return 0
+    }
+
+    private func handleHTTPRequest(head: String, body: Data, client: Client) {
         let lines = head.split(separator: "\r\n", omittingEmptySubsequences: true)
         guard let requestLine = lines.first else {
             client.connection.cancel()
             return
         }
         let parts = requestLine.split(separator: " ")
-        guard parts.count >= 2, parts[0] == "GET" else {
-            respond(client, status: "405 Method Not Allowed", body: "GET only\n")
+        guard parts.count >= 2 else {
+            respond(client, status: "400 Bad Request", body: "malformed request line\n")
             return
         }
+        let method = String(parts[0])
         let path = String(parts[1])
 
         var headers: [String: String] = [:]
@@ -365,6 +433,19 @@ public final class NMPDashboardServer {
             let key = line[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
             let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
             headers[key] = value
+        }
+
+        if method == "POST" {
+            guard path == "/api/inference" else {
+                respond(client, status: "404 Not Found", body: "not found\n")
+                return
+            }
+            handleInferencePOST(body: body, client: client)
+            return
+        }
+        guard method == "GET" else {
+            respond(client, status: "405 Method Not Allowed", body: "GET or POST only\n")
+            return
         }
 
         if path == "/ws" {
@@ -392,6 +473,66 @@ public final class NMPDashboardServer {
                     contentType: "text/html; charset=utf-8")
         default:
             respond(client, status: "404 Not Found", body: "not found\n")
+        }
+    }
+
+    // MARK: POST /api/inference
+
+    private func handleInferencePOST(body: Data, client: Client) {
+        guard let handler = onInferenceRequest else {
+            respondJSON(client, status: "503 Service Unavailable",
+                        object: ["error": "no inference pipeline is wired to this server"])
+            return
+        }
+        guard let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let prompt = object["prompt"] as? String,
+              !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            respondJSON(client, status: "400 Bad Request",
+                        object: ["error": "body must be JSON with a non-empty 'prompt'"])
+            return
+        }
+        let maxTokens = (object["max_tokens"] as? Int) ?? 32
+
+        handler(InferenceRequest(prompt: prompt, maxTokens: maxTokens)) { [weak self, weak client] response in
+            guard let self, let client else { return }
+            // The handler may reply from any queue; connection sends are
+            // thread-safe, but client bookkeeping stays on our queue.
+            self.queue.async {
+                switch response {
+                case .success(let result):
+                    let tokensPerSec = result.totalSeconds > 0
+                        ? Double(result.tokenCount) / result.totalSeconds : 0
+                    self.respondJSON(client, status: "200 OK", object: [
+                        "output": result.text,
+                        "token_count": result.tokenCount,
+                        "latency_ms": (result.totalSeconds * 1000 * 10).rounded() / 10,
+                        "tokens_per_sec": (tokensPerSec * 100).rounded() / 100,
+                        "network_payload_bytes": result.networkPayloadBytes,
+                        "shard_count": result.shardCount,
+                        "engine": result.engine,
+                    ])
+                case .failure(let status, let message):
+                    self.respondJSON(
+                        client,
+                        status: "\(status) \(Self.reasonPhrase(for: status))",
+                        object: ["error": message])
+                }
+            }
+        }
+    }
+
+    private func respondJSON(_ client: Client, status: String, object: [String: Any]) {
+        let body = (try? JSONSerialization.data(withJSONObject: object))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        respond(client, status: status, body: body, contentType: "application/json")
+    }
+
+    private static func reasonPhrase(for status: Int) -> String {
+        switch status {
+        case 400: return "Bad Request"
+        case 429: return "Too Many Requests"
+        case 503: return "Service Unavailable"
+        default: return "Internal Server Error"
         }
     }
 

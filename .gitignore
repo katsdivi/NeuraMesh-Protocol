@@ -6,3 +6,5 @@ xcuserdata/
 DerivedData/
 .DS_Store
 *.gguf
+# Phase 8: built llama.cpp shim (scripts/setup_llama.sh output)
+Vendor/

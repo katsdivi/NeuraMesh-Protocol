@@ -29,6 +29,20 @@ public struct NMPShardPlanEntry: Equatable, Sendable {
     public let endLayer: Int
 
     public var layerSpan: Int { endLayer - startLayer }
+
+    public init(peerID: UInt32, shardIndex: Int, startLayer: Int, endLayer: Int) {
+        self.peerID = peerID
+        self.shardIndex = shardIndex
+        self.startLayer = startLayer
+        self.endLayer = endLayer
+    }
+
+    /// The whole model as one shard on `peerID` — the only legal llama
+    /// plan (llama.cpp executes full models; see LlamaEngine.swift).
+    public static func fullRange(peerID: UInt32, layerCount: Int) -> NMPShardPlanEntry {
+        NMPShardPlanEntry(peerID: peerID, shardIndex: 0,
+                          startLayer: 0, endLayer: layerCount)
+    }
 }
 
 public enum NMPModelSharder {

@@ -3,16 +3,19 @@
 Custom UDP-based transport protocol for distributed AI inference across Apple device meshes.
 NACK-only reliability, XOR FEC, 1-RTT Noise IK handshake, AES-256-GCM per session.
 
-**Status: all 6 phases complete.** Core transport (Phase 1: handshake + encryption +
+**Status: Phases 1–6 + 8 complete.** Core transport (Phase 1: handshake + encryption +
 sequencing), NACK-only reliability with a 64-packet retransmission window and sliding
 replay window (Phase 2), XOR FEC over 4-packet groups + AWDL contention suppression
 (Phase 3: sub-millisecond loss recovery, ~75× faster than the NACK path),
 zero-configuration mesh assembly (Phase 4: Bonjour/mDNS discovery, capability
 advertisement via TXT records, deterministic coordinator election), sharded multi-peer
 inference (Phase 5: GGUF parsing, proportional layer sharding, pipelined orchestration,
-bit-exact output at 1.02× single-device latency), and production hardening (Phase 6:
+bit-exact output at 1.02× single-device latency), production hardening (Phase 6:
 peer-drop detection + failover with 0.4 ms re-sharding, stage retry under unrecoverable
-loss, web testing dashboard, comprehensive benchmark suite). **207 tests pass, 0 failures.**
+loss, web testing dashboard, comprehensive benchmark suite), and **real LLM inference
+(Phase 8: llama.cpp behind the engine seam — quantized GGUF models, coordinator holds
+only the tokenizer, weights on the peer, every token one real mesh round trip; see
+`Docs/Phase8_Design.md`)**. **231 tests pass, 0 failures.**
 
 ## Requirements
 
@@ -24,13 +27,34 @@ loss, web testing dashboard, comprehensive benchmark suite). **207 tests pass, 0
 ```bash
 cd NeuraMeshProtocol
 swift build
-swift test                             # 207 unit + loopback integration tests
+swift test                             # 231 unit + loopback integration tests
 
 swift run nmp-peer                     # compute peer (cross-device mesh)
 swift run nmp-coordinator              # coordinator + cross-device benchmark
 swift run nmp-dashboard                # testing dashboard on http://localhost:8080
 swift run nmp-dashboard --benchmark    # headless benchmark suite → Results/*.csv
 ```
+
+### Real LLM inference (Phase 8)
+
+```bash
+brew install llama.cpp && scripts/setup_llama.sh    # one-time: build the shim
+
+# single device / full-stack-in-one-process (POST /api/inference for text):
+swift run nmp-dashboard --engine llamaCpp --model ~/models/model.gguf --placement local
+swift run nmp-dashboard --engine llamaCpp --model ~/models/model.gguf   # remote shard
+
+# real two-process / two-device mesh (weights on the peer, tokenizer on the coordinator):
+swift run nmp-peer        --engine llamaCpp --model ~/models/model.gguf
+swift run nmp-coordinator --engine llamaCpp --model ~/models/model.gguf \
+                          --prompt "The capital of France is" --tokens 16
+```
+
+A llama plan is one full-range shard — llama.cpp cannot execute layer
+sub-ranges, so "distributed" means real remote execution over the real
+transport, with greedy sampling making output identical across placements.
+Step-by-step guide, measured results, and the design rationale:
+`Docs/Phase8_Design.md`.
 
 Or open the folder directly in Xcode (`File > Open…`) — SwiftPM packages open natively;
 no `.xcodeproj` is required or checked in. Cross-device setup (Mac coordinator +
@@ -67,6 +91,12 @@ iPhone peer): see `Docs/CrossDevice_Setup_Guide.md`.
 | `MeshTestbed.swift` | Phase 6: full in-process mesh (real crypto/FEC/NACK) for dashboard, benchmarks, tests |
 | `BenchmarkSuite.swift` | Phase 6: scenario runner, p50/p95/p99, CSV export |
 | `DashboardServer.swift` | Phase 6: HTTP + RFC 6455 WebSocket server on NWListener (zero dependencies) |
+| `PromptInferenceService.swift` | Phase 6+: prompt → per-token mesh passes; Phase 8: codec-driven token loop with EOS early stop |
+| `PromptCodec.swift` | Phase 8: text seam (`NMPPromptCodec`) — reference pseudo-text vs real-LLM codecs |
+| `LlamaWire.swift` | Phase 8: token-state wire format riding inside activation tensors (exact-as-Float32) |
+| `LlamaRuntime.swift` | Phase 8: dlopen binding to the C shim + `NMPLlamaModel` handle (weights or vocab-only) |
+| `LlamaEngine.swift` | Phase 8: `NMPLlamaComputeEngine` (real forward passes, full-range shards) + llama prompt codec |
+| `LlamaTestbed.swift` | Phase 8: single-shard mesh assembly — local baseline or full-stack in-process peer |
 
 ## Success Criteria
 
@@ -117,6 +147,16 @@ Phase 6:
 - [x] Benchmarks: loss ≤2% free; 5%/10%/15% → -49%/-55%/-81% throughput; burst recovery <1 s; peer join re-shard 0.4 ms
 - [x] 0 regressions: **207 tests pass** (178 prior + 29 new)
 
+Phase 8 (validated 2026-07-09, Apple M3, Qwen2.5-0.5B Q4_K_M):
+
+- [x] llama.cpp loads quantized GGUF models behind `NMPShardComputeEngine` (shim dlopen'd, package stays dependency-free)
+- [x] Real LLM text via POST /api/inference — `engine: "llamaCpp"`, coherent output, EOS-aware early stop
+- [x] Remote full-range shard over the real stack: output IDENTICAL to single device (greedy determinism), payload measured
+- [x] Two-process mesh over UDP + Bonjour: coordinator vocab-only, weights on the peer — 16.9–18.5 tok/s, per-token p50 ≈58 ms, 3/3 runs identical
+- [x] Llama-2-7B-Chat Q4_K_M over the same real mesh: 8.7–12.1 tok/s, per-token p50 ≈68 ms, runs identical, coordinator stays tokenizer-sized
+- [x] Protocol overhead honest and small: ≈8–17 ms/token, shrinking as model compute grows
+- [x] 0 regressions: **231 tests pass** (12 new: wire format, engine, vocab-only, mesh identity, EOS accounting)
+
 ## Design Docs
 
 - `Docs/NMP_Specification.md` — protocol spec (source of truth)
@@ -137,5 +177,8 @@ Phase 6:
   topology rationale, application-layer tensor chunking, measured overhead table
 - `Docs/Phase6_Design.md` — Phase 6 fault tolerance: activity-based liveness, failover
   path, stage retry vs NACK give-up, dashboard architecture, what's deliberately out
+- `Docs/Phase8_Design.md` — Phase 8 llama.cpp integration: why llama shards are
+  full-range (no public sub-range API, KV-cache locality), the dlopen'd C shim, the
+  token-state wire format, step-by-step testing guide with measured results
 - `Docs/Benchmarks.md` — how to run the benchmark suite and interpret the results
 - `Docs/CrossDevice_Setup_Guide.md` — Mac + iPhone mesh walkthrough

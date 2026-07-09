@@ -18,6 +18,19 @@
 //            (default 8)
 //  --wait    discovery timeout in seconds (default 60)
 //
+//  Phase 8 — real LLM over the real mesh:
+//    swift run nmp-coordinator --engine llamaCpp --model path.gguf
+//                              [--prompt "..."] [--tokens N] [--runs N]
+//
+//  The coordinator loads only the TOKENIZER (vocab-only, a few MB); the
+//  remote nmp-peer (--engine llamaCpp) owns the weights and serves the
+//  model's full layer range — llama.cpp cannot execute layer sub-ranges,
+//  so a llama plan is one full-range shard and "distributed" means real
+//  remote execution over the real transport (see LlamaEngine.swift).
+//  Every generated token is one full mesh round trip. Runs repeat the
+//  same prompt; greedy sampling makes outputs bit-identical across runs
+//  and identical to single-device output from the same weights.
+//
 
 import Foundation
 import NMP
@@ -38,6 +51,9 @@ struct CoordinatorArguments {
     /// alone is so fast that network dominates and the mesh/baseline
     /// ratio is meaningless. Use the same value on the peers.
     var slowMillisPerLayer = 0.0
+    var engineKind = "reference"
+    var modelPath: String?
+    var prompt = "Hello, my name is"
 
     static func parse() -> CoordinatorArguments {
         var arguments = CoordinatorArguments()
@@ -54,10 +70,14 @@ struct CoordinatorArguments {
             case "--tokens": arguments.tokens = value().flatMap(Int.init) ?? arguments.tokens
             case "--wait": arguments.waitSeconds = value().flatMap(Double.init) ?? arguments.waitSeconds
             case "--slow": arguments.slowMillisPerLayer = value().flatMap(Double.init) ?? 0
+            case "--engine": arguments.engineKind = value() ?? arguments.engineKind
+            case "--model": arguments.modelPath = value()
+            case "--prompt": arguments.prompt = value() ?? arguments.prompt
             case "--help", "-h":
                 print("""
                 usage: nmp-coordinator [--peers N] [--layers N] [--hidden N] \
-                [--gguf path] [--tag modelTag] [--runs N] [--tokens N] [--wait seconds]
+                [--gguf path] [--tag modelTag] [--runs N] [--tokens N] [--wait seconds] \
+                [--engine reference|llamaCpp] [--model path.gguf] [--prompt "..."]
                 """)
                 exit(0)
             default:
@@ -73,23 +93,52 @@ let arguments = CoordinatorArguments.parse()
 
 // MARK: - Engine
 
-let engine: NMPReferenceComputeEngine
+let engine: NMPShardComputeEngine
 var modelTag = arguments.modelTag
-if let path = arguments.ggufPath {
+/// Set in llamaCpp mode: the coordinator's VOCAB-ONLY handle (tokenizer +
+/// metadata, no weights — the remote peer owns those).
+var llamaModel: NMPLlamaModel?
+
+if arguments.engineKind == "llamaCpp" {
+    guard let modelPath = arguments.modelPath else {
+        FileHandle.standardError.write(Data("--engine llamaCpp requires --model path.gguf\n".utf8))
+        exit(2)
+    }
+    do {
+        let model = try NMPLlamaModel(modelPath: modelPath, vocabOnly: true)
+        llamaModel = model
+        engine = NMPLlamaComputeEngine(model: model)
+        modelTag = model.name
+        print("[coordinator] llamaCpp (vocab-only): \(model.name) — "
+              + "\(model.layerCount) layers × \(model.hiddenSize) hidden, "
+              + "vocab \(model.vocabSize)")
+    } catch {
+        FileHandle.standardError.write(Data("""
+        failed to load llama tokenizer: \(error)
+        checklist: brew install llama.cpp && scripts/setup_llama.sh, and --model must point at a .gguf file
+        \n
+        """.utf8))
+        exit(1)
+    }
+} else if let path = arguments.ggufPath {
     do {
         let gguf = try NMPGGUFModel.load(path: path)
-        engine = try NMPReferenceComputeEngine(gguf: gguf)
+        let referenceEngine = try NMPReferenceComputeEngine(gguf: gguf)
+        referenceEngine.simulatedSecondsPerLayer = arguments.slowMillisPerLayer / 1000
+        engine = referenceEngine
         if let name = gguf.modelName { modelTag = name }
         print("[coordinator] loaded GGUF: \(gguf.modelName ?? path) — "
-              + "\(engine.layerCount) layers × \(engine.hiddenSize) hidden")
+              + "\(referenceEngine.layerCount) layers × \(referenceEngine.hiddenSize) hidden")
     } catch {
         FileHandle.standardError.write(Data("failed to load GGUF at \(path): \(error)\n".utf8))
         exit(1)
     }
 } else {
-    engine = NMPReferenceComputeEngine(layerCount: arguments.layers, hiddenSize: arguments.hidden)
+    let referenceEngine = NMPReferenceComputeEngine(
+        layerCount: arguments.layers, hiddenSize: arguments.hidden)
+    referenceEngine.simulatedSecondsPerLayer = arguments.slowMillisPerLayer / 1000
+    engine = referenceEngine
 }
-engine.simulatedSecondsPerLayer = arguments.slowMillisPerLayer / 1000
 
 // MARK: - Helpers
 
@@ -145,6 +194,79 @@ guard assembled.wait(timeout: .now() + arguments.waitSeconds) == .success else {
     \n
     """.utf8))
     exit(1)
+}
+
+// MARK: - Phase 8: llama generation over the real mesh
+
+/// Full-range shard on the first ready peer, then `runs` prompt
+/// generations — every token one real mesh round trip. Never returns.
+func runLlamaGenerations(model: NMPLlamaModel) -> Never {
+    guard let shardPeerID = node.readyPeers.keys.sorted().first else {
+        FileHandle.standardError.write(Data("no ready peer to place the llama shard on\n".utf8))
+        exit(1)
+    }
+    let plan = [NMPShardPlanEntry.fullRange(peerID: shardPeerID,
+                                            layerCount: engine.layerCount)]
+    let assigned = DispatchSemaphore(value: 0)
+    node.orchestrator.assignShards(plan) { result in
+        if case .failure(let error) = result {
+            FileHandle.standardError.write(Data("shard assignment failed: \(error)\n".utf8))
+            exit(1)
+        }
+        assigned.signal()
+    }
+    assigned.wait()
+
+    print("\n=== Llama plan (model '\(modelTag)') ===")
+    print("  shard 0: layers 0..<\(engine.layerCount) (full model) → peer \(hex(shardPeerID))")
+    print("  coordinator: tokenizer only (no weights loaded)")
+    print("\n=== \(arguments.runs) generation(s): \"\(arguments.prompt)\" "
+          + "(up to \(arguments.tokens) tokens) ===")
+
+    let service = NMPPromptInferenceService(
+        orchestrator: node.orchestrator,
+        codec: NMPLlamaPromptCodec(model: model))
+
+    var texts: [String] = []
+    var bestTokensPerSecond = 0.0
+    for run in 1...max(1, arguments.runs) {
+        let done = DispatchSemaphore(value: 0)
+        service.run(prompt: arguments.prompt, maxTokens: arguments.tokens) { result in
+            switch result {
+            case .failure(let error):
+                FileHandle.standardError.write(Data("generation failed: \(error)\n".utf8))
+                exit(1)
+            case .success(let generation):
+                let tokensPerSecond = Double(generation.tokenCount)
+                    / max(generation.totalSeconds, 0.001)
+                bestTokensPerSecond = max(bestTokensPerSecond, tokensPerSecond)
+                texts.append(generation.text)
+                let perToken = generation.perTokenSeconds.map { $0 * 1000 }
+                print("  run \(run): \(generation.tokenCount) tokens in "
+                      + "\(ms(generation.totalSeconds)) ms "
+                      + "(\(String(format: "%.2f", tokensPerSecond)) tok/s, "
+                      + "payload \(generation.networkPayloadBytes) B, "
+                      + "per-token p50 ~\(String(format: "%.1f", perToken.sorted()[perToken.count / 2])) ms)")
+                print("    → \(generation.text)")
+            }
+            done.signal()
+        }
+        done.wait()
+    }
+
+    print("\n=== Results ===")
+    print("  engine: llamaCpp (real model, remote full-range shard)")
+    print("  best throughput: \(String(format: "%.2f", bestTokensPerSecond)) tokens/s")
+    let deterministic = Set(texts).count == 1
+    print("  determinism: \(arguments.runs) runs "
+          + (deterministic ? "IDENTICAL output ✓ (greedy sampling)" : "DIVERGED ✗"))
+    print("  (single-device comparison: run the same model via "
+          + "`nmp-dashboard --engine llamaCpp --placement local` and POST the same prompt)")
+    exit(deterministic ? 0 : 1)
+}
+
+if let llamaModel {
+    runLlamaGenerations(model: llamaModel)
 }
 
 // MARK: - Shard assignment
