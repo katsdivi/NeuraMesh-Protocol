@@ -79,17 +79,24 @@ public final class NMPMeshTestbed {
     private var nextPeerID: UInt32 = 0x0000_0002
     private var linkCounter = 0
     private let simulatedSecondsPerLayer: TimeInterval
+    private let simulatedPeerSlowdowns: [Double]
 
     /// Builds the mesh and completes every handshake before returning.
-    /// - Parameter simulatedSecondsPerLayer: artificial per-layer compute
-    ///   delay on every engine, so benchmark pipelines resemble real model
-    ///   stage times instead of being pure network measurements.
+    /// - Parameters:
+    ///   - simulatedSecondsPerLayer: artificial per-layer compute delay on
+    ///     every engine, so benchmark pipelines resemble real model stage
+    ///     times instead of being pure network measurements.
+    ///   - simulatedPeerSlowdowns: Phase 9 — per-remote-peer multipliers on
+    ///     `simulatedSecondsPerLayer` (by join order; missing entries = 1),
+    ///     making the mesh HETEROGENEOUS so adaptive sharding has real
+    ///     speed differences to balance against.
     public init(
         layerCount: Int = 12,
         hiddenSize: Int = 1024,
         remotePeerCount: Int = 2,
         modelTag: String = "testbed-ref-model",
         simulatedSecondsPerLayer: TimeInterval = 0,
+        simulatedPeerSlowdowns: [Double] = [],
         handshakeTimeout: TimeInterval = 5,
         heartbeatTimeout: TimeInterval = 5
     ) throws {
@@ -97,6 +104,7 @@ public final class NMPMeshTestbed {
         self.hiddenSize = hiddenSize
         self.modelTag = modelTag
         self.simulatedSecondsPerLayer = simulatedSecondsPerLayer
+        self.simulatedPeerSlowdowns = simulatedPeerSlowdowns
 
         coordinatorEngine = NMPReferenceComputeEngine(
             layerCount: layerCount, hiddenSize: hiddenSize)
@@ -162,7 +170,9 @@ public final class NMPMeshTestbed {
 
         let engine = NMPReferenceComputeEngine(
             layerCount: layerCount, hiddenSize: hiddenSize)
-        engine.simulatedSecondsPerLayer = simulatedSecondsPerLayer
+        let slowdown = remotePeers.count < simulatedPeerSlowdowns.count
+            ? simulatedPeerSlowdowns[remotePeers.count] : 1
+        engine.simulatedSecondsPerLayer = simulatedSecondsPerLayer * slowdown
         let shardEngine = NMPPeerShardEngine(
             connection: peerSide, engine: engine,
             modelTag: modelTag, localPeerID: peerID)

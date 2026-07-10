@@ -67,6 +67,18 @@ public final class NMPLlamaComputeEngine: NMPShardComputeEngine {
         guard input.count == hiddenSize else {
             throw NMPComputeError.invalidInputWidth(expected: hiddenSize, got: input.count)
         }
+        // Phase 9: a verify request asks for the greedy argmax at EVERY
+        // decoded position — speculative-draft verification in one pass.
+        if NMPLlamaWire.isVerifyRequest(input) {
+            let request = try NMPLlamaWire.decodeVerifyRequest(input)
+            let verdicts = try model.decodeGreedyPerPosition(
+                tokens: request.tokens, basePos: request.basePos)
+            return try NMPLlamaWire.encode(
+                NMPLlamaWire.VerifyResponse(
+                    nextPos: request.basePos + request.tokens.count,
+                    verdicts: verdicts),
+                width: hiddenSize)
+        }
         guard NMPLlamaWire.isRequest(input) else {
             throw NMPLlamaEngineError.notTokenState
         }

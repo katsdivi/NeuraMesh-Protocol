@@ -163,9 +163,13 @@ public final class NMPPeerShardEngine {
             return
         }
 
+        // Phase 9: requests may arrive zero-trimmed or mixed-precision
+        // (magic-sniffed); the response mirrors the request's format, so a
+        // coordinator only ever receives what it opted into.
+        let requestFormat = NMPActivationCodec.formatOf(tensorBytes)
         let input: [Float]
         do {
-            input = try NMPTensorCodec.decode(tensorBytes)
+            input = try NMPActivationCodec.decode(tensorBytes)
         } catch {
             respondFailure(requestID: requestID, status: .badRequest)
             return
@@ -186,7 +190,7 @@ public final class NMPPeerShardEngine {
             DispatchTime.now().uptimeNanoseconds - began.uptimeNanoseconds) / 1e9
 
         do {
-            let tensor = NMPTensorCodec.encode(output)
+            let tensor = NMPActivationCodec.encode(output, format: requestFormat)
             let chunks = try NMPTensorChunk.split(requestID: requestID, tensorBytes: tensor)
             let response = NMPInferResponseMeta(
                 requestID: requestID, status: .ok,

@@ -67,6 +67,15 @@ public struct NMPInferenceReport: Sendable {
     }
 }
 
+/// One completed pipeline stage (Phase 9: stages are individually
+/// drivable so the pipelined batch executor can overlap sequences).
+public struct NMPStageResult: Sendable {
+    public let output: [Float]
+    public let timing: NMPInferenceReport.ShardTiming
+    /// Application payload bytes moved for this stage (0 for local).
+    public let payloadBytes: Int
+}
+
 // MARK: - Orchestrator
 
 public final class NMPInferenceOrchestrator {
@@ -91,13 +100,48 @@ public final class NMPInferenceOrchestrator {
     public var stageRetryLimit = 1
     /// Peer-reported seconds-per-layer from completed inferences; feed
     /// back into `NMPModelSharder.plan(measuredSecondsPerLayer:)` to
-    /// re-balance the next assignment round.
-    public private(set) var measuredSecondsPerLayer: [UInt32: Double] = [:]
+    /// re-balance the next assignment round. Lock-protected: read by the
+    /// failover orchestrator (its own queue) and the Phase 9 adaptive
+    /// controller while stages write from the orchestrator queue.
+    public var measuredSecondsPerLayer: [UInt32: Double] {
+        measurementsLock.lock()
+        defer { measurementsLock.unlock() }
+        return measurements
+    }
+
+    /// Phase 9: seeds measurements from a persisted profile so a mesh can
+    /// start with last session's balance instead of re-benchmarking.
+    public func seedMeasurements(_ map: [UInt32: Double]) {
+        measurementsLock.lock()
+        defer { measurementsLock.unlock() }
+        for (peerID, seconds) in map where seconds > 0 {
+            measurements[peerID] = seconds
+        }
+    }
+
+    /// Phase 9: activation wire format for remote stages. Peers mirror
+    /// the request's format, and decode is magic-sniffed, so this can
+    /// change between inferences. Keep .float32 toward pre-Phase 9 peers.
+    public var activationWireFormat: NMPActivationWireFormat {
+        get { measurementsLock.lock(); defer { measurementsLock.unlock() }
+              return wireFormat }
+        set { measurementsLock.lock(); defer { measurementsLock.unlock() }
+              wireFormat = newValue }
+    }
+
+    private var measurements: [UInt32: Double] = [:]
+    private var wireFormat: NMPActivationWireFormat = .float32
+    private let measurementsLock = NSLock()
 
     private let localPeerID: UInt32
     private let engine: NMPShardComputeEngine
     private let modelTag: String
     private let queue: DispatchQueue
+    /// Local shards compute here instead of inline on `queue`, so a local
+    /// stage cannot stall response handling for concurrently in-flight
+    /// remote stages (Phase 9 pipelining). Serial: the engine seam is not
+    /// re-entrant.
+    private let localComputeQueue = DispatchQueue(label: "nmp.orchestrator.local-compute")
 
     private var connections: [UInt32: PeerConnection] = [:]
     private var reassemblers: [UInt32: NMPTensorReassembler] = [:]
@@ -281,25 +325,75 @@ public final class NMPInferenceOrchestrator {
             completion(.success((activations, timings, payloadBytes)))
             return
         }
-        let entry = plan[index]
+        computeStageOnQueue(plan[index], activations: activations,
+                            stageTimeout: stageTimeout) { [self] result in
+            switch result {
+            case .failure(let error):
+                completion(.failure(error))
+            case .success(let stage):
+                runStage(index + 1, activations: stage.output,
+                         timings: timings + [stage.timing],
+                         payloadBytes: payloadBytes + stage.payloadBytes,
+                         stageTimeout: stageTimeout, completion: completion)
+            }
+        }
+    }
+
+    /// Runs ONE pipeline stage (local or remote, with the Phase 6 stage
+    /// retry). Public in Phase 9 so `NMPPipelinedBatchExecutor` can keep
+    /// every stage of the plan busy with a different sequence. Completion
+    /// fires on the orchestrator queue.
+    public func computeStage(
+        _ entry: NMPShardPlanEntry,
+        activations: [Float],
+        stageTimeout: TimeInterval = 30,
+        completion: @escaping (Result<NMPStageResult, NMPOrchestrationError>) -> Void
+    ) {
+        queue.async { [self] in
+            computeStageOnQueue(entry, activations: activations,
+                                stageTimeout: stageTimeout, completion: completion)
+        }
+    }
+
+    /// Must run on `queue`; completion fires on `queue`.
+    private func computeStageOnQueue(
+        _ entry: NMPShardPlanEntry,
+        activations: [Float],
+        stageTimeout: TimeInterval,
+        completion: @escaping (Result<NMPStageResult, NMPOrchestrationError>) -> Void
+    ) {
         let stageBegan = DispatchTime.now()
 
         if entry.peerID == localPeerID {
-            do {
-                let output = try engine.runLayers(
-                    start: entry.startLayer, end: entry.endLayer, input: activations)
+            // Off-queue so a long local stage never blocks the handling of
+            // concurrently in-flight remote responses.
+            localComputeQueue.async { [self] in
+                let outcome: Result<[Float], NMPOrchestrationError>
+                do {
+                    outcome = .success(try engine.runLayers(
+                        start: entry.startLayer, end: entry.endLayer, input: activations))
+                } catch {
+                    outcome = .failure(.sendFailed("local compute: \(error)"))
+                }
                 let seconds = TimeInterval(
                     DispatchTime.now().uptimeNanoseconds - stageBegan.uptimeNanoseconds) / 1e9
-                recordMeasurement(peerID: entry.peerID, seconds: seconds, layers: entry.layerSpan)
-                let timing = NMPInferenceReport.ShardTiming(
-                    peerID: entry.peerID, shardIndex: entry.shardIndex,
-                    layers: entry.startLayer..<entry.endLayer,
-                    computeSeconds: seconds, stageSeconds: seconds, isLocal: true)
-                runStage(index + 1, activations: output, timings: timings + [timing],
-                         payloadBytes: payloadBytes, stageTimeout: stageTimeout,
-                         completion: completion)
-            } catch {
-                completion(.failure(.sendFailed("local compute: \(error)")))
+                queue.async { [self] in
+                    switch outcome {
+                    case .failure(let error):
+                        completion(.failure(error))
+                    case .success(let output):
+                        recordMeasurement(peerID: entry.peerID, seconds: seconds,
+                                          layers: entry.layerSpan)
+                        completion(.success(NMPStageResult(
+                            output: output,
+                            timing: NMPInferenceReport.ShardTiming(
+                                peerID: entry.peerID, shardIndex: entry.shardIndex,
+                                layers: entry.startLayer..<entry.endLayer,
+                                computeSeconds: seconds, stageSeconds: seconds,
+                                isLocal: true),
+                            payloadBytes: 0)))
+                    }
+                }
             }
             return
         }
@@ -313,7 +407,7 @@ public final class NMPInferenceOrchestrator {
             case .success(let (tensorBytes, meta, sentBytes)):
                 let output: [Float]
                 do {
-                    output = try NMPTensorCodec.decode(tensorBytes)
+                    output = try NMPActivationCodec.decode(tensorBytes)
                 } catch {
                     completion(.failure(.sendFailed("response decode: \(error)")))
                     return
@@ -323,14 +417,14 @@ public final class NMPInferenceOrchestrator {
                 let computeSeconds = TimeInterval(meta.computeMicros) / 1e6
                 recordMeasurement(peerID: entry.peerID, seconds: computeSeconds,
                                   layers: entry.layerSpan)
-                let timing = NMPInferenceReport.ShardTiming(
-                    peerID: entry.peerID, shardIndex: entry.shardIndex,
-                    layers: entry.startLayer..<entry.endLayer,
-                    computeSeconds: computeSeconds, stageSeconds: stageSeconds,
-                    isLocal: false)
-                runStage(index + 1, activations: output, timings: timings + [timing],
-                         payloadBytes: payloadBytes + sentBytes + tensorBytes.count,
-                         stageTimeout: stageTimeout, completion: completion)
+                completion(.success(NMPStageResult(
+                    output: output,
+                    timing: NMPInferenceReport.ShardTiming(
+                        peerID: entry.peerID, shardIndex: entry.shardIndex,
+                        layers: entry.startLayer..<entry.endLayer,
+                        computeSeconds: computeSeconds, stageSeconds: stageSeconds,
+                        isLocal: false),
+                    payloadBytes: sentBytes + tensorBytes.count)))
             }
         }
     }
@@ -373,7 +467,7 @@ public final class NMPInferenceOrchestrator {
         let requestID = nextRequestID
         nextRequestID &+= 1
 
-        let tensor = NMPTensorCodec.encode(activations)
+        let tensor = NMPActivationCodec.encode(activations, format: activationWireFormat)
         let chunks: [NMPTensorChunk]
         do {
             chunks = try NMPTensorChunk.split(requestID: requestID, tensorBytes: tensor)
@@ -419,7 +513,9 @@ public final class NMPInferenceOrchestrator {
 
     private func recordMeasurement(peerID: UInt32, seconds: TimeInterval, layers: Int) {
         guard layers > 0, seconds > 0 else { return }
-        measuredSecondsPerLayer[peerID] = seconds / Double(layers)
+        measurementsLock.lock()
+        defer { measurementsLock.unlock() }
+        measurements[peerID] = seconds / Double(layers)
     }
 
     // MARK: Inbound from shard peers

@@ -43,6 +43,12 @@ public enum NMPLlamaWire {
 
     public static let requestMagic: Float = 5_000_273  // 0x4C5051 "LPQ"
     public static let responseMagic: Float = 5_000_274 // 0x4C5052 "LPR"
+    // Phase 9 speculative decoding: same layouts, distinct magics. A
+    // verify request asks the peer for the PER-POSITION greedy argmax of
+    // every decoded token (not just the last), so the coordinator can
+    // check a whole draft in one round trip.
+    public static let verifyRequestMagic: Float = 5_000_275  // 0x4C5053 "LPS"
+    public static let verifyResponseMagic: Float = 5_000_276 // 0x4C5054 "LPT"
     static let headerWidth = 3
 
     /// Largest integer the format may carry (exact as Float32).
@@ -82,9 +88,40 @@ public enum NMPLlamaWire {
         }
     }
 
+    /// Per-position greedy verdicts for a verify request: verdicts[i] is
+    /// the model's argmax AFTER decoding request token i — i.e. what the
+    /// model itself would generate next at that point. The coordinator
+    /// accepts the longest draft prefix that matches, plus one bonus
+    /// token (the verdict after the last accepted draft).
+    public struct VerifyResponse: Equatable, Sendable {
+        /// basePos + decoded token count (the full batch — the caller
+        /// rewinds via basePos when a draft suffix is rejected).
+        public let nextPos: Int
+        public let verdicts: [(id: Int32, logit: Float)]
+
+        public init(nextPos: Int, verdicts: [(id: Int32, logit: Float)]) {
+            self.nextPos = nextPos
+            self.verdicts = verdicts
+        }
+
+        public static func == (lhs: VerifyResponse, rhs: VerifyResponse) -> Bool {
+            lhs.nextPos == rhs.nextPos
+                && lhs.verdicts.count == rhs.verdicts.count
+                && zip(lhs.verdicts, rhs.verdicts).allSatisfy {
+                    $0.id == $1.id && $0.logit == $1.logit
+                }
+        }
+    }
+
     /// Max prompt tokens a `width`-wide tensor can carry.
     public static func requestCapacity(width: Int) -> Int {
         max(0, width - headerWidth)
+    }
+
+    /// Max per-position verdicts a `width`-wide tensor can carry (same
+    /// pair layout as responses).
+    public static func verifyCapacity(width: Int) -> Int {
+        responseCapacity(width: width)
     }
 
     /// Max (tokenID, logit) candidates a `width`-wide tensor can carry.
@@ -130,14 +167,54 @@ public enum NMPLlamaWire {
         return vector
     }
 
+    /// Encodes a verify request: identical layout to a request, verify
+    /// magic. The peer decodes the tokens at basePos… and returns one
+    /// greedy verdict per position.
+    public static func encodeVerify(_ request: Request, width: Int) throws -> [Float] {
+        var vector = try encode(request, width: width)
+        vector[0] = verifyRequestMagic
+        return vector
+    }
+
+    public static func encode(_ response: VerifyResponse, width: Int) throws -> [Float] {
+        guard response.verdicts.count <= verifyCapacity(width: width) else {
+            throw NMPLlamaWireError.capacityExceeded(
+                needed: headerWidth + response.verdicts.count * 2, width: width)
+        }
+        try validateExact(response.nextPos)
+        var vector = [Float](repeating: 0, count: width)
+        vector[0] = verifyResponseMagic
+        vector[1] = Float(response.nextPos)
+        vector[2] = Float(response.verdicts.count)
+        for (offset, verdict) in response.verdicts.enumerated() {
+            try validateExact(Int(verdict.id))
+            vector[headerWidth + offset * 2] = Float(verdict.id)
+            vector[headerWidth + offset * 2 + 1] = verdict.logit
+        }
+        return vector
+    }
+
     // MARK: Decode
 
     public static func isRequest(_ vector: [Float]) -> Bool {
         vector.first == requestMagic
     }
 
+    public static func isVerifyRequest(_ vector: [Float]) -> Bool {
+        vector.first == verifyRequestMagic
+    }
+
     public static func decodeRequest(_ vector: [Float]) throws -> Request {
         guard vector.first == requestMagic else { throw NMPLlamaWireError.notARequest }
+        return try decodeRequestBody(vector)
+    }
+
+    public static func decodeVerifyRequest(_ vector: [Float]) throws -> Request {
+        guard vector.first == verifyRequestMagic else { throw NMPLlamaWireError.notARequest }
+        return try decodeRequestBody(vector)
+    }
+
+    private static func decodeRequestBody(_ vector: [Float]) throws -> Request {
         guard vector.count >= headerWidth else {
             throw NMPLlamaWireError.malformed("width \(vector.count) below header")
         }
@@ -150,6 +227,24 @@ public enum NMPLlamaWire {
             Int32(try exactInt(vector[headerWidth + offset], field: "token[\(offset)]"))
         }
         return Request(basePos: basePos, tokens: tokens)
+    }
+
+    public static func decodeVerifyResponse(_ vector: [Float]) throws -> VerifyResponse {
+        guard vector.first == verifyResponseMagic else { throw NMPLlamaWireError.notAResponse }
+        guard vector.count >= headerWidth else {
+            throw NMPLlamaWireError.malformed("width \(vector.count) below header")
+        }
+        let nextPos = try exactInt(vector[1], field: "nextPos")
+        let count = try exactInt(vector[2], field: "verdictCount")
+        guard count >= 0, headerWidth + count * 2 <= vector.count else {
+            throw NMPLlamaWireError.malformed("verdictCount \(count) exceeds width \(vector.count)")
+        }
+        let verdicts = try (0..<count).map { offset -> (id: Int32, logit: Float) in
+            let id = Int32(try exactInt(vector[headerWidth + offset * 2],
+                                        field: "verdict[\(offset)].id"))
+            return (id, vector[headerWidth + offset * 2 + 1])
+        }
+        return VerifyResponse(nextPos: nextPos, verdicts: verdicts)
     }
 
     public static func decodeResponse(_ vector: [Float]) throws -> Response {

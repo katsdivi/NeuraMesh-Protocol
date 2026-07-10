@@ -308,3 +308,60 @@ int nmp_llama_decode_topk(nmp_llama * handle,
     }
     return k;
 }
+
+/// Phase 9 (speculative decoding): one real forward pass that keeps the
+/// logits of EVERY position, not just the last. Trims the KV cache to
+/// base_pos, decodes `n_tokens` tokens at positions base_pos…, and writes
+/// the greedy argmax (token id, logit) of each position's logits — i.e.
+/// what the model itself would generate after each decoded token. The
+/// coordinator uses this to verify a whole draft in one round trip;
+/// rejected suffixes are rewound by the next request's base_pos trim.
+/// Returns n_tokens. Ties break toward the lower id (deterministic).
+int nmp_llama_decode_greedy(nmp_llama * handle,
+                            const int32_t * tokens, int n_tokens, int base_pos,
+                            int32_t * out_ids, float * out_logits) {
+    if (handle == NULL || tokens == NULL || n_tokens <= 0 || base_pos < 0 ||
+        out_ids == NULL || out_logits == NULL) {
+        return NMP_LLAMA_ERR_ARGS;
+    }
+    if (handle->ctx == NULL) {
+        return NMP_LLAMA_ERR_NO_WEIGHTS;
+    }
+
+    llama_memory_seq_rm(llama_get_memory(handle->ctx), 0, base_pos, -1);
+
+    struct llama_batch batch = llama_batch_init(n_tokens, 0, 1);
+    for (int i = 0; i < n_tokens; i++) {
+        batch.token[i]     = tokens[i];
+        batch.pos[i]       = base_pos + i;
+        batch.n_seq_id[i]  = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i]    = 1; // logits at EVERY position
+    }
+    batch.n_tokens = n_tokens;
+
+    int status = llama_decode(handle->ctx, batch);
+    llama_batch_free(batch);
+    if (status != 0) {
+        return NMP_LLAMA_ERR_DECODE;
+    }
+
+    const int n_vocab = llama_vocab_n_tokens(handle->vocab);
+    for (int i = 0; i < n_tokens; i++) {
+        const float * logits = llama_get_logits_ith(handle->ctx, i);
+        if (logits == NULL) {
+            return NMP_LLAMA_ERR_DECODE;
+        }
+        int   best_id    = 0;
+        float best_logit = logits[0];
+        for (int id = 1; id < n_vocab; id++) {
+            if (logits[id] > best_logit) {
+                best_id    = id;
+                best_logit = logits[id];
+            }
+        }
+        out_ids[i]    = best_id;
+        out_logits[i] = best_logit;
+    }
+    return n_tokens;
+}

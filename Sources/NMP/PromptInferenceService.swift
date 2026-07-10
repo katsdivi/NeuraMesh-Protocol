@@ -36,10 +36,27 @@ public final class NMPPromptInferenceService {
         public let networkPayloadBytes: Int
         /// Shards in the plan that served the final pass.
         public let shardCount: Int
-        /// Per-token pipeline latency.
+        /// Per-token pipeline latency (per-ROUND-TRIP when speculation is
+        /// active — one round trip can emit several tokens).
         public let perTokenSeconds: [TimeInterval]
         /// Compute engine identity, surfaced to API clients.
         public let engine: String
+        /// Phase 9: draft/verify accounting; nil when speculation was off.
+        public let speculation: NMPSpeculationStats?
+
+        public init(text: String, tokenCount: Int, totalSeconds: TimeInterval,
+                    networkPayloadBytes: Int, shardCount: Int,
+                    perTokenSeconds: [TimeInterval], engine: String,
+                    speculation: NMPSpeculationStats? = nil) {
+            self.text = text
+            self.tokenCount = tokenCount
+            self.totalSeconds = totalSeconds
+            self.networkPayloadBytes = networkPayloadBytes
+            self.shardCount = shardCount
+            self.perTokenSeconds = perTokenSeconds
+            self.engine = engine
+            self.speculation = speculation
+        }
     }
 
     public enum ServiceError: Error, Equatable {

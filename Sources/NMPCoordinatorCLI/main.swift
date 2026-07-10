@@ -54,6 +54,15 @@ struct CoordinatorArguments {
     var engineKind = "reference"
     var modelPath: String?
     var prompt = "Hello, my name is"
+    // Phase 9
+    /// Draft/verify speculative decoding (llamaCpp only; the remote peer
+    /// needs a Phase 9 shim for per-position verification).
+    var speculation = false
+    /// Small same-vocabulary GGUF drafting locally; default prompt-lookup.
+    var draftModelPath: String?
+    /// Zero-trim token-state tensors (lossless, ~99% smaller llama
+    /// messages). Requires a Phase 9 nmp-peer on the other end.
+    var zeroTrim = false
 
     static func parse() -> CoordinatorArguments {
         var arguments = CoordinatorArguments()
@@ -73,11 +82,15 @@ struct CoordinatorArguments {
             case "--engine": arguments.engineKind = value() ?? arguments.engineKind
             case "--model": arguments.modelPath = value()
             case "--prompt": arguments.prompt = value() ?? arguments.prompt
+            case "--speculation": arguments.speculation = true
+            case "--draft-model": arguments.draftModelPath = value()
+            case "--zero-trim": arguments.zeroTrim = true
             case "--help", "-h":
                 print("""
                 usage: nmp-coordinator [--peers N] [--layers N] [--hidden N] \
                 [--gguf path] [--tag modelTag] [--runs N] [--tokens N] [--wait seconds] \
-                [--engine reference|llamaCpp] [--model path.gguf] [--prompt "..."]
+                [--engine reference|llamaCpp] [--model path.gguf] [--prompt "..."] \
+                [--speculation] [--draft-model path.gguf] [--zero-trim]
                 """)
                 exit(0)
             default:
@@ -217,6 +230,12 @@ func runLlamaGenerations(model: NMPLlamaModel) -> Never {
     }
     assigned.wait()
 
+    // Phase 9: lossless token-state compression (needs a Phase 9 peer).
+    if arguments.zeroTrim {
+        node.orchestrator.activationWireFormat = .zeroTrimmed
+        print("[coordinator] wire format: zeroTrimmed (lossless token-state compression)")
+    }
+
     print("\n=== Llama plan (model '\(modelTag)') ===")
     print("  shard 0: layers 0..<\(engine.layerCount) (full model) → peer \(hex(shardPeerID))")
     print("  coordinator: tokenizer only (no weights loaded)")
@@ -227,11 +246,38 @@ func runLlamaGenerations(model: NMPLlamaModel) -> Never {
         orchestrator: node.orchestrator,
         codec: NMPLlamaPromptCodec(model: model))
 
+    // Phase 9: speculative decoding — drafts locally, verifies a whole
+    // draft in one mesh round trip.
+    var speculativeService: NMPSpeculativeGenerationService?
+    if arguments.speculation {
+        var drafter: NMPSpeculativeDrafter = NMPPromptLookupDrafter()
+        if let draftPath = arguments.draftModelPath {
+            do {
+                let draftModel = try NMPLlamaModel(modelPath: draftPath)
+                if draftModel.vocabSize == model.vocabSize {
+                    drafter = try NMPLlamaDraftModelDrafter(model: draftModel)
+                    print("[coordinator] draft model: \(draftModel.name)")
+                } else {
+                    print("[coordinator] ⚠️ draft vocab \(draftModel.vocabSize) ≠ target "
+                          + "\(model.vocabSize) — using prompt-lookup drafting")
+                }
+            } catch {
+                print("[coordinator] ⚠️ draft model unavailable (\(error)) — "
+                      + "using prompt-lookup drafting")
+            }
+        }
+        speculativeService = NMPSpeculativeGenerationService(
+            orchestrator: node.orchestrator, model: model, drafter: drafter)
+        print("[coordinator] speculation: \(drafter.drafterName), "
+              + "depth \(NMPSpeculativeGenerationService.defaultDepth)")
+    }
+
     var texts: [String] = []
     var bestTokensPerSecond = 0.0
     for run in 1...max(1, arguments.runs) {
         let done = DispatchSemaphore(value: 0)
-        service.run(prompt: arguments.prompt, maxTokens: arguments.tokens) { result in
+        let handleResult: (Result<NMPPromptInferenceService.GenerationResult,
+                                  NMPPromptInferenceService.ServiceError>) -> Void = { result in
             switch result {
             case .failure(let error):
                 FileHandle.standardError.write(Data("generation failed: \(error)\n".utf8))
@@ -246,16 +292,32 @@ func runLlamaGenerations(model: NMPLlamaModel) -> Never {
                       + "\(ms(generation.totalSeconds)) ms "
                       + "(\(String(format: "%.2f", tokensPerSecond)) tok/s, "
                       + "payload \(generation.networkPayloadBytes) B, "
-                      + "per-token p50 ~\(String(format: "%.1f", perToken.sorted()[perToken.count / 2])) ms)")
+                      + "per-trip p50 ~\(String(format: "%.1f", perToken.sorted()[perToken.count / 2])) ms)")
+                if let stats = generation.speculation {
+                    print("    speculative: \(stats.meshRoundTrips) round trip(s) for "
+                          + "\(generation.tokenCount) tokens "
+                          + "(\(String(format: "%.2f", stats.tokensPerRoundTrip(tokenCount: generation.tokenCount))) tok/trip, "
+                          + "\(stats.acceptedDraftTokens)/\(stats.draftedTokens) drafts accepted, "
+                          + "\(stats.fallbackRounds) fallback(s))")
+                }
                 print("    → \(generation.text)")
             }
             done.signal()
+        }
+        if let speculativeService {
+            speculativeService.run(prompt: arguments.prompt,
+                                   maxTokens: arguments.tokens,
+                                   completion: handleResult)
+        } else {
+            service.run(prompt: arguments.prompt, maxTokens: arguments.tokens,
+                        completion: handleResult)
         }
         done.wait()
     }
 
     print("\n=== Results ===")
-    print("  engine: llamaCpp (real model, remote full-range shard)")
+    print("  engine: llamaCpp (real model, remote full-range shard"
+          + (arguments.speculation ? ", speculative" : "") + ")")
     print("  best throughput: \(String(format: "%.2f", bestTokensPerSecond)) tokens/s")
     let deterministic = Set(texts).count == 1
     print("  determinism: \(arguments.runs) runs "

@@ -32,6 +32,9 @@ public enum NMPLlamaRuntimeError: Error, Sendable {
     case callFailed(function: String, status: Int32)
     /// Decode on a vocab-only handle (no weights loaded).
     case weightsNotLoaded
+    /// The loaded shim predates Phase 9 (no per-position greedy decode) —
+    /// rerun scripts/setup_llama.sh to rebuild it.
+    case speculationUnsupported(libraryPath: String)
 }
 
 // MARK: - Shim binding
@@ -60,6 +63,9 @@ public final class NMPLlamaRuntime {
     typealias DecodeTopKFn = @convention(c) (
         OpaquePointer?, UnsafePointer<Int32>?, Int32, Int32, Int32,
         UnsafeMutablePointer<Int32>?, UnsafeMutablePointer<Float>?) -> Int32
+    typealias DecodeGreedyFn = @convention(c) (
+        OpaquePointer?, UnsafePointer<Int32>?, Int32, Int32,
+        UnsafeMutablePointer<Int32>?, UnsafeMutablePointer<Float>?) -> Int32
 
     let open: OpenFn
     let close: CloseFn
@@ -73,6 +79,9 @@ public final class NMPLlamaRuntime {
     let tokenText: TokenTextFn
     let tokenIsEOG: TokenFlagFn
     let decodeTopK: DecodeTopKFn
+    /// Phase 9 symbol; nil when the dylib predates it (speculation is then
+    /// unavailable, everything else keeps working).
+    let decodeGreedy: DecodeGreedyFn?
 
     public let libraryPath: String
     private let library: UnsafeMutableRawPointer
@@ -150,7 +159,12 @@ public final class NMPLlamaRuntime {
         tokenText = try symbol("nmp_llama_token_text", as: TokenTextFn.self)
         tokenIsEOG = try symbol("nmp_llama_token_is_eog", as: TokenFlagFn.self)
         decodeTopK = try symbol("nmp_llama_decode_topk", as: DecodeTopKFn.self)
+        decodeGreedy = dlsym(handle, "nmp_llama_decode_greedy")
+            .map { unsafeBitCast($0, to: DecodeGreedyFn.self) }
     }
+
+    /// Whether the loaded shim supports Phase 9 speculative verification.
+    public var supportsSpeculation: Bool { decodeGreedy != nil }
 }
 
 // MARK: - Model handle
@@ -269,6 +283,28 @@ public final class NMPLlamaModel {
                                         Int32(basePos), Int32(count), &ids, &logits)
         guard status > 0 else {
             throw NMPLlamaRuntimeError.callFailed(function: "decode_topk", status: status)
+        }
+        return (0..<Int(status)).map { (ids[$0], logits[$0]) }
+    }
+
+    /// Phase 9: one REAL forward pass that keeps every position's logits —
+    /// trims the KV cache to `basePos`, decodes `tokens` at basePos…, and
+    /// returns each position's greedy argmax (id, logit). Element i is what
+    /// the model would generate AFTER tokens[0...i] — the verification
+    /// signal for speculative decoding. Requires weights and a Phase 9 shim.
+    public func decodeGreedyPerPosition(
+        tokens: [Int32], basePos: Int) throws -> [(id: Int32, logit: Float)] {
+        guard hasWeights else { throw NMPLlamaRuntimeError.weightsNotLoaded }
+        guard let decodeGreedy = runtime.decodeGreedy else {
+            throw NMPLlamaRuntimeError.speculationUnsupported(
+                libraryPath: runtime.libraryPath)
+        }
+        var ids = [Int32](repeating: 0, count: tokens.count)
+        var logits = [Float](repeating: 0, count: tokens.count)
+        let status = decodeGreedy(handle, tokens, Int32(tokens.count),
+                                  Int32(basePos), &ids, &logits)
+        guard status > 0 else {
+            throw NMPLlamaRuntimeError.callFailed(function: "decode_greedy", status: status)
         }
         return (0..<Int(status)).map { (ids[$0], logits[$0]) }
     }

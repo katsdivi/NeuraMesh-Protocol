@@ -3,7 +3,7 @@
 Custom UDP-based transport protocol for distributed AI inference across Apple device meshes.
 NACK-only reliability, XOR FEC, 1-RTT Noise IK handshake, AES-256-GCM per session.
 
-**Status: Phases 1–6 + 8 complete.** Core transport (Phase 1: handshake + encryption +
+**Status: Phases 1–6 + 8–9 complete.** Core transport (Phase 1: handshake + encryption +
 sequencing), NACK-only reliability with a 64-packet retransmission window and sliding
 replay window (Phase 2), XOR FEC over 4-packet groups + AWDL contention suppression
 (Phase 3: sub-millisecond loss recovery, ~75× faster than the NACK path),
@@ -12,10 +12,14 @@ advertisement via TXT records, deterministic coordinator election), sharded mult
 inference (Phase 5: GGUF parsing, proportional layer sharding, pipelined orchestration,
 bit-exact output at 1.02× single-device latency), production hardening (Phase 6:
 peer-drop detection + failover with 0.4 ms re-sharding, stage retry under unrecoverable
-loss, web testing dashboard, comprehensive benchmark suite), and **real LLM inference
+loss, web testing dashboard, comprehensive benchmark suite), **real LLM inference
 (Phase 8: llama.cpp behind the engine seam — quantized GGUF models, coordinator holds
 only the tokenizer, weights on the peer, every token one real mesh round trip; see
-`Docs/Phase8_Design.md`)**. **231 tests pass, 0 failures.**
+`Docs/Phase8_Design.md`)**, and **the fast mesh (Phase 9: benchmark-driven adaptive
+layer sharding with persisted device profiles, zero-trim + mixed-precision activation
+wire formats, pipeline-parallel batch execution, draft/verify speculative decoding,
+one-command auto-configuration; see `Docs/Phase9_Design.md`)**.
+**272 tests pass, 0 failures.**
 
 ## Requirements
 
@@ -27,7 +31,7 @@ only the tokenizer, weights on the peer, every token one real mesh round trip; s
 ```bash
 cd NeuraMeshProtocol
 swift build
-swift test                             # 231 unit + loopback integration tests
+swift test                             # 272 unit + loopback integration tests
 
 swift run nmp-peer                     # compute peer (cross-device mesh)
 swift run nmp-coordinator              # coordinator + cross-device benchmark
@@ -55,6 +59,31 @@ sub-ranges, so "distributed" means real remote execution over the real
 transport, with greedy sampling making output identical across placements.
 Step-by-step guide, measured results, and the design rationale:
 `Docs/Phase8_Design.md`.
+
+### Fast mesh (Phase 9): one-command setup, compressed wire, speculation
+
+```bash
+swift run nmp-dashboard --auto-config              # reference mesh: probe → balance → persist
+swift run nmp-dashboard --engine llamaCpp --model ~/models/model.gguf \
+                        --auto-config              # llama: zero-trim wire (lossless, ~99% smaller)
+
+# speculative decoding: drafts locally, verifies a whole draft in ONE round trip
+curl -X POST localhost:8080/api/inference \
+     -d '{"prompt":"...","max_tokens":32,"enable_speculation":true}'
+# or serve everything speculatively, optionally with a small same-vocab draft model:
+swift run nmp-dashboard --engine llamaCpp --model ~/models/model.gguf \
+                        --auto-config --speculation [--draft-model small.gguf]
+
+# real two-process mesh with the same levers:
+swift run nmp-coordinator --engine llamaCpp --model ~/models/model.gguf \
+                          --prompt "..." --tokens 32 --speculation --zero-trim
+```
+
+Auto-config benchmarks each device with real probe passes, balances layer
+spans to the measured speeds, persists the profile (`~/.nmp/`), and picks
+the wire format. Speculative output is token-for-token identical to plain
+greedy output — drafts only ever save round trips, never change text.
+Guide + measured results: `Docs/Phase9_Design.md`.
 
 Or open the folder directly in Xcode (`File > Open…`) — SwiftPM packages open natively;
 no `.xcodeproj` is required or checked in. Cross-device setup (Mac coordinator +
@@ -97,6 +126,11 @@ iPhone peer): see `Docs/CrossDevice_Setup_Guide.md`.
 | `LlamaRuntime.swift` | Phase 8: dlopen binding to the C shim + `NMPLlamaModel` handle (weights or vocab-only) |
 | `LlamaEngine.swift` | Phase 8: `NMPLlamaComputeEngine` (real forward passes, full-range shards) + llama prompt codec |
 | `LlamaTestbed.swift` | Phase 8: single-shard mesh assembly — local baseline or full-stack in-process peer |
+| `AdaptiveSharding.swift` | Phase 9: probe-driven layer balancing, balance reporting, persisted device profiles |
+| `OptimizedActivation.swift` | Phase 9: zero-trim (lossless) + mixed-precision (binary16 + critical f32) wire formats |
+| `PipelinedInference.swift` | Phase 9: pipeline-parallel batch executor (independent sequences overlap across stages) |
+| `SpeculativeDecoder.swift` | Phase 9: draft/verify speculative decoding — prompt-lookup + draft-model drafters |
+| `AutoConfig.swift` | Phase 9: one-command setup — membership → benchmark → balance → wire format |
 
 ## Success Criteria
 
@@ -157,6 +191,16 @@ Phase 8 (validated 2026-07-09, Apple M3, Qwen2.5-0.5B Q4_K_M):
 - [x] Protocol overhead honest and small: ≈8–17 ms/token, shrinking as model compute grows
 - [x] 0 regressions: **231 tests pass** (12 new: wire format, engine, vocab-only, mesh identity, EOS accounting)
 
+Phase 9 (validated 2026-07-10, Apple M3, Llama-2-7B-Chat Q4_K_M, 32 tokens):
+
+- [x] One-command auto-config: membership → probe passes → balanced shards → wire format, profile persisted to `~/.nmp/` and reused (probe skipped on restart)
+- [x] Adaptive sharding measurably rebalances a heterogeneous mesh (4×-slower peer gets a smaller span; bit-exact output preserved) — pinned by test
+- [x] Zero-trim wire: 1 048 576 B → **11 928 B** per 32-token generation (−98.9%, lossless), remote throughput 13.4 → 14.0+ tok/s (≈ the 14.3–14.5 local baseline)
+- [x] Mixed-precision wire: ~52% of raw for dense activations, top-2% outliers bit-exact, all 65 536 binary16 patterns pinned by test
+- [x] Pipelined batch execution: ~2.4× measured overlap on a 3-stage mesh, outputs bit-identical to serial passes
+- [x] Speculative decoding: 32 tokens in **8 round trips** (4.0 tok/trip, 100% draft acceptance) on repetitive text; output token-for-token identical to plain greedy in every configuration, adversarial drafter included
+- [x] 0 regressions: **272 tests pass** (41 new: half-float bit-level, codecs, balance math, profiles, heterogeneous rebalancing, batch overlap, verify wire, drafters, toy-LM speculative service, real-model speculative identity)
+
 ## Design Docs
 
 - `Docs/NMP_Specification.md` — protocol spec (source of truth)
@@ -180,5 +224,9 @@ Phase 8 (validated 2026-07-09, Apple M3, Qwen2.5-0.5B Q4_K_M):
 - `Docs/Phase8_Design.md` — Phase 8 llama.cpp integration: why llama shards are
   full-range (no public sub-range API, KV-cache locality), the dlopen'd C shim, the
   token-state wire format, step-by-step testing guide with measured results
+- `Docs/Phase9_Design.md` — Phase 9 fast mesh: adaptive sharding loop, the two wire
+  formats and their determinism ledger, why single-stream pipelining is impossible
+  (and what batching + speculation buy instead), draft/verify protocol, measured
+  results, honest limits of prompt-lookup drafting
 - `Docs/Benchmarks.md` — how to run the benchmark suite and interpret the results
 - `Docs/CrossDevice_Setup_Guide.md` — Mac + iPhone mesh walkthrough

@@ -41,6 +41,17 @@ struct DashboardArguments {
     var modelPath: String?
     var gpuLayers: Int32 = -1
     var placement = NMPLlamaTestbed.Placement.remotePeer
+    // Phase 9
+    /// Automatic setup: benchmark → balanced shards → optimized wire format.
+    var autoConfig = false
+    /// Serve every /api/inference request speculatively (llamaCpp only);
+    /// without the flag, {"enable_speculation": true} opts in per request.
+    var speculation = false
+    /// Small same-vocabulary GGUF drafting for the target model; without
+    /// it speculation uses the prompt-lookup drafter.
+    var draftModelPath: String?
+    /// Probe passes for --auto-config benchmarking.
+    var probePasses = 3
 
     static func parse() -> DashboardArguments {
         var arguments = DashboardArguments()
@@ -55,10 +66,16 @@ struct DashboardArguments {
                 arguments.placement = value().flatMap {
                     NMPLlamaTestbed.Placement(rawValue: $0 == "remote" ? "remotePeer" : $0)
                 } ?? arguments.placement
+            case "--auto-config": arguments.autoConfig = true
+            case "--speculation": arguments.speculation = true
+            case "--draft-model": arguments.draftModelPath = value()
+            case "--probe-passes":
+                arguments.probePasses = value().flatMap(Int.init) ?? arguments.probePasses
             case "--help", "-h":
                 print("""
                 usage: nmp-dashboard [port] [--engine reference|llamaCpp] \
-                [--model path.gguf] [--gpu-layers N] [--placement local|remote]
+                [--model path.gguf] [--gpu-layers N] [--placement local|remote] \
+                [--auto-config] [--probe-passes N] [--speculation] [--draft-model path.gguf]
                 """)
                 exit(0)
             default:
@@ -104,7 +121,8 @@ let port = dashboardArguments.port
 /// Real-LLM dashboard: single full-range llama shard (local or behind the
 /// in-process link), POST /api/inference generates real text. Never
 /// returns. See the header comment for what is and isn't available here.
-func runLlamaDashboard(model: NMPLlamaModel, placement: NMPLlamaTestbed.Placement) -> Never {
+func runLlamaDashboard(model: NMPLlamaModel, arguments: DashboardArguments) -> Never {
+    let placement = arguments.placement
     let engine = NMPLlamaComputeEngine(model: model)
     print("[nmp-dashboard] llamaCpp engine: \(model.name) — "
           + "\(model.layerCount) layers × \(model.hiddenSize) hidden, "
@@ -121,6 +139,47 @@ func runLlamaDashboard(model: NMPLlamaModel, placement: NMPLlamaTestbed.Placemen
               + (placement == .local ? "coordinator (local)" : "in-process peer (full stack)"))
     } catch {
         fatalError("llama mesh assembly failed: \(error)")
+    }
+
+    // Phase 9: auto-config for a llama plan. Layer sharding cannot apply
+    // (one full-range shard by construction), but the wire format can:
+    // token-state vectors are mostly zero padding, so zero-trim them.
+    if arguments.autoConfig {
+        let format = NMPAutoConfig.recommendedWireFormat(engineName: "llamaCpp")
+        testbed.orchestrator.activationWireFormat = format
+        print("[auto-config] llama plan is one full-range shard — layer sharding n/a")
+        print("[auto-config] activation wire format → \(format.rawValue) "
+              + "(lossless, ~99% smaller token-state messages)")
+    }
+
+    // Phase 9: speculative decoding. --speculation serves every request
+    // speculatively; otherwise {"enable_speculation": true} opts in.
+    var speculativeService: NMPSpeculativeGenerationService?
+    if model.runtime.supportsSpeculation {
+        var drafter: NMPSpeculativeDrafter = NMPPromptLookupDrafter()
+        if let draftPath = arguments.draftModelPath {
+            do {
+                let draftModel = try NMPLlamaModel(modelPath: draftPath)
+                if draftModel.vocabSize == model.vocabSize {
+                    drafter = try NMPLlamaDraftModelDrafter(model: draftModel)
+                    print("[nmp-dashboard] draft model: \(draftModel.name) "
+                          + "(\(draftModel.layerCount) layers)")
+                } else {
+                    print("⚠️  draft model vocab \(draftModel.vocabSize) ≠ target "
+                          + "\(model.vocabSize) — falling back to prompt-lookup drafting")
+                }
+            } catch {
+                print("⚠️  draft model unavailable (\(error)) — "
+                      + "falling back to prompt-lookup drafting")
+            }
+        }
+        speculativeService = NMPSpeculativeGenerationService(
+            orchestrator: testbed.orchestrator, model: model, drafter: drafter)
+        print("[nmp-dashboard] speculation ready (\(drafter.drafterName), "
+              + "depth \(NMPSpeculativeGenerationService.defaultDepth)"
+              + (arguments.speculation ? ", default ON)" : ", per-request opt-in)"))
+    } else if arguments.speculation {
+        print("⚠️  --speculation needs a Phase 9 shim — rerun scripts/setup_llama.sh")
     }
 
     let server = NMPDashboardServer()
@@ -178,22 +237,34 @@ func runLlamaDashboard(model: NMPLlamaModel, placement: NMPLlamaTestbed.Placemen
     let promptService = NMPPromptInferenceService(
         orchestrator: testbed.orchestrator,
         codec: NMPLlamaPromptCodec(model: model))
-    promptService.onProgress = { done, total in
+    let reportProgress: (Int, Int) -> Void = { done, total in
         server.updateInferenceProgress(
             progress: Double(done) / Double(max(total, 1)),
             stage: "llama generation: token \(done)/\(total)")
     }
+    promptService.onProgress = reportProgress
+    speculativeService?.onProgress = reportProgress
+
     server.onInferenceRequest = { request, respond in
-        server.reportMeshEvent("🌐 llama inference: up to \(request.maxTokens) token(s)")
-        promptService.run(prompt: request.prompt, maxTokens: request.maxTokens) { result in
+        let handleResult: (Result<NMPPromptInferenceService.GenerationResult,
+                                  NMPPromptInferenceService.ServiceError>) -> Void = { result in
             switch result {
             case .success(let generation):
-                server.reportMeshEvent(String(
+                var summary = String(
                     format: "🌐 llama inference done: %d tokens in %.1f ms "
                         + "(%.2f tok/s) across %d shard(s)",
                     generation.tokenCount, generation.totalSeconds * 1000,
                     Double(generation.tokenCount) / max(generation.totalSeconds, 0.001),
-                    generation.shardCount))
+                    generation.shardCount)
+                if let stats = generation.speculation {
+                    summary += String(
+                        format: " — speculative: %d round trip(s), %.2f tok/trip, "
+                            + "%.0f%% draft acceptance",
+                        stats.meshRoundTrips,
+                        stats.tokensPerRoundTrip(tokenCount: generation.tokenCount),
+                        stats.acceptanceRate * 100)
+                }
+                server.reportMeshEvent(summary)
                 respond(.success(generation))
             case .failure(.busy):
                 respond(.failure(status: 429, message: "an inference is already running — retry shortly"))
@@ -205,6 +276,24 @@ func runLlamaDashboard(model: NMPLlamaModel, placement: NMPLlamaTestbed.Placemen
                 server.reportMeshEvent("🌐 llama inference failed: \(error)")
                 respond(.failure(status: 500, message: "mesh orchestration failed: \(error)"))
             }
+        }
+
+        let speculate = request.enableSpeculation || dashboardArguments.speculation
+        if speculate, let speculativeService {
+            server.reportMeshEvent("🌐 llama inference (speculative): "
+                                   + "up to \(request.maxTokens) token(s)")
+            speculativeService.run(prompt: request.prompt,
+                                   maxTokens: request.maxTokens,
+                                   completion: handleResult)
+        } else {
+            if speculate {
+                server.reportMeshEvent("speculation requested but unavailable "
+                                       + "(rebuild the shim) — serving plain")
+            }
+            server.reportMeshEvent("🌐 llama inference: up to \(request.maxTokens) token(s)")
+            promptService.run(prompt: request.prompt,
+                              maxTokens: request.maxTokens,
+                              completion: handleResult)
         }
     }
 
@@ -220,7 +309,7 @@ if dashboardArguments.engine == "llamaCpp" {
     do {
         let model = try NMPLlamaModel(
             modelPath: modelPath, gpuLayers: dashboardArguments.gpuLayers)
-        runLlamaDashboard(model: model, placement: dashboardArguments.placement)
+        runLlamaDashboard(model: model, arguments: dashboardArguments)
     } catch {
         print("⚠️  llamaCpp engine unavailable (\(error)) — falling back to reference mesh")
     }
@@ -235,7 +324,21 @@ do {
     testbed = try NMPMeshTestbed(
         layerCount: 24, hiddenSize: 1024, remotePeerCount: 3,
         simulatedSecondsPerLayer: 0.002)
-    let plan = try testbed.startSync()
+    let plan: [NMPShardPlanEntry]
+    if dashboardArguments.autoConfig {
+        // Phase 9: benchmark-driven balanced shards + optimized wire format.
+        let setup = NMPAutomaticMeshSetup(
+            failover: testbed.failover, orchestrator: testbed.orchestrator,
+            modelTag: testbed.modelTag, engineName: "reference")
+        setup.onDiagnostic = { print("[auto-config] \($0)") }
+        print("[auto-config] starting automatic mesh setup…")
+        let report = try setup.runSync(
+            probePasses: dashboardArguments.probePasses,
+            makeProbeInput: { testbed.makeInput(seed: UInt64($0)) })
+        plan = report.adaptive.plan
+    } else {
+        plan = try testbed.startSync()
+    }
     print("[nmp-dashboard] mesh live, \(plan.count) shards: "
           + plan.map { "0x\(String($0.peerID, radix: 16))→L\($0.startLayer)..<\($0.endLayer)" }
                 .joined(separator: " "))

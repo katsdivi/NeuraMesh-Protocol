@@ -145,6 +145,15 @@ public final class NMPDashboardServer {
     public struct InferenceRequest: Equatable, Sendable {
         public let prompt: String
         public let maxTokens: Int
+        /// Phase 9: {"enable_speculation": true} — served by the
+        /// speculative path when the CLI wired one up.
+        public let enableSpeculation: Bool
+
+        public init(prompt: String, maxTokens: Int, enableSpeculation: Bool = false) {
+            self.prompt = prompt
+            self.maxTokens = maxTokens
+            self.enableSpeculation = enableSpeculation
+        }
     }
 
     /// What the inference handler reports back; the server serializes it.
@@ -492,8 +501,10 @@ public final class NMPDashboardServer {
             return
         }
         let maxTokens = (object["max_tokens"] as? Int) ?? 32
+        let enableSpeculation = (object["enable_speculation"] as? Bool) ?? false
 
-        handler(InferenceRequest(prompt: prompt, maxTokens: maxTokens)) { [weak self, weak client] response in
+        handler(InferenceRequest(prompt: prompt, maxTokens: maxTokens,
+                                 enableSpeculation: enableSpeculation)) { [weak self, weak client] response in
             guard let self, let client else { return }
             // The handler may reply from any queue; connection sends are
             // thread-safe, but client bookkeeping stays on our queue.
@@ -502,7 +513,7 @@ public final class NMPDashboardServer {
                 case .success(let result):
                     let tokensPerSec = result.totalSeconds > 0
                         ? Double(result.tokenCount) / result.totalSeconds : 0
-                    self.respondJSON(client, status: "200 OK", object: [
+                    var object: [String: Any] = [
                         "output": result.text,
                         "token_count": result.tokenCount,
                         "latency_ms": (result.totalSeconds * 1000 * 10).rounded() / 10,
@@ -510,7 +521,22 @@ public final class NMPDashboardServer {
                         "network_payload_bytes": result.networkPayloadBytes,
                         "shard_count": result.shardCount,
                         "engine": result.engine,
-                    ])
+                    ]
+                    if let stats = result.speculation {
+                        object["speculation"] = [
+                            "drafter": stats.drafterName,
+                            "mesh_round_trips": stats.meshRoundTrips,
+                            "drafted_tokens": stats.draftedTokens,
+                            "accepted_draft_tokens": stats.acceptedDraftTokens,
+                            "fallback_rounds": stats.fallbackRounds,
+                            "acceptance_rate":
+                                (stats.acceptanceRate * 1000).rounded() / 1000,
+                            "tokens_per_round_trip":
+                                (stats.tokensPerRoundTrip(tokenCount: result.tokenCount)
+                                 * 100).rounded() / 100,
+                        ]
+                    }
+                    self.respondJSON(client, status: "200 OK", object: object)
                 case .failure(let status, let message):
                     self.respondJSON(
                         client,
