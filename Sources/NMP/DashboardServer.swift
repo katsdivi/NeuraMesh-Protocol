@@ -148,11 +148,17 @@ public final class NMPDashboardServer {
         /// Phase 9: {"enable_speculation": true} — served by the
         /// speculative path when the CLI wired one up.
         public let enableSpeculation: Bool
+        /// Mesh 2.0: {"enable_comparison": true} — attach the protocol
+        /// comparison (measured NMP + modeled TCP/QUIC) to the response.
+        public let enableComparison: Bool
 
-        public init(prompt: String, maxTokens: Int, enableSpeculation: Bool = false) {
+        public init(prompt: String, maxTokens: Int,
+                    enableSpeculation: Bool = false,
+                    enableComparison: Bool = false) {
             self.prompt = prompt
             self.maxTokens = maxTokens
             self.enableSpeculation = enableSpeculation
+            self.enableComparison = enableComparison
         }
     }
 
@@ -169,6 +175,73 @@ public final class NMPDashboardServer {
     /// Handler for POST /api/inference. Fires on the server's queue; the
     /// reply callback may be invoked from any queue, exactly once.
     public var onInferenceRequest: ((InferenceRequest, @escaping (InferenceResponse) -> Void) -> Void)?
+
+    // MARK: Mesh 2.0 web UI surface
+
+    /// One parsed POST /api/benchmark/run request.
+    public struct BenchmarkRequest: Equatable, Sendable {
+        public let prompt: String
+        public let maxTokens: Int
+        public let runs: Int
+
+        public init(prompt: String, maxTokens: Int, runs: Int) {
+            self.prompt = prompt
+            self.maxTokens = maxTokens
+            self.runs = runs
+        }
+    }
+
+    /// Why a benchmark run failed, surfaced verbatim to the API caller.
+    public struct BenchmarkFailure: Error, Sendable {
+        public let message: String
+        public init(_ message: String) { self.message = message }
+    }
+
+    /// Handler for POST /api/benchmark/run: run `runs` sequential
+    /// generations and return each result (or one failure). Fires on
+    /// the server's queue; reply from any queue, exactly once.
+    public var onBenchmarkRequest: ((BenchmarkRequest,
+        @escaping (Result<[NMPPromptInferenceService.GenerationResult],
+                          BenchmarkFailure>) -> Void) -> Void)?
+
+    /// Static facts about the running mesh, surfaced by GET /health and
+    /// the UI's dashboard. Set once by the CLI after assembly.
+    public struct MeshInfo: Sendable {
+        public var engine = "reference"
+        public var modelName = ""
+        public var shardCount = 0
+        public var wireFormat = "float32"
+        public var speculationAvailable = false
+
+        public init() {}
+    }
+
+    public var meshInfo: MeshInfo {
+        get { queue.sync { storedMeshInfo } }
+        set { queue.async { self.storedMeshInfo = newValue } }
+    }
+
+    /// Directory of the built web UI (web/ → Public/). When set, GET
+    /// serves files from it with an index.html fallback for SPA routes;
+    /// when nil, the legacy embedded dashboard page is served at /.
+    public var publicDirectory: URL? {
+        get { queue.sync { storedPublicDirectory } }
+        set { queue.async { self.storedPublicDirectory = newValue } }
+    }
+
+    private var storedMeshInfo = MeshInfo()
+    private var storedPublicDirectory: URL?
+
+    /// Latest state per peer — the same facts `updatePeerState` pushes
+    /// over the WebSocket, retained for GET /api/devices.
+    struct PeerSnapshot {
+        var name: String
+        var latencyMS: Int
+        var loadPercent: Int
+        var assigned: String
+        var alive: Bool
+    }
+    private var peerSnapshots: [UInt32: PeerSnapshot] = [:]
 
     /// Actual bound port (differs from the requested one when passing 0).
     public private(set) var boundPort: UInt16 = 0
@@ -272,6 +345,11 @@ public final class NMPDashboardServer {
 
     public func updatePeerState(peerID: UInt32, name: String, latencyMS: Int,
                                 loadPercent: Int, assigned: String, alive: Bool) {
+        queue.async { [self] in
+            peerSnapshots[peerID] = PeerSnapshot(
+                name: name, latencyMS: latencyMS, loadPercent: loadPercent,
+                assigned: assigned, alive: alive)
+        }
         broadcast(object: [
             "type": "peer_update",
             "peerID": String(peerID, radix: 16),
@@ -444,17 +522,40 @@ public final class NMPDashboardServer {
             headers[key] = value
         }
 
+        // CORS preflight (a Vite dev server or another origin's page may
+        // call the API cross-origin on the trusted LAN).
+        if method == "OPTIONS" {
+            respond(client, status: "204 No Content", body: "")
+            return
+        }
+
         if method == "POST" {
-            guard path == "/api/inference" else {
+            switch path {
+            case "/api/inference":
+                handleInferencePOST(body: body, client: client)
+            case "/api/benchmark/run":
+                handleBenchmarkPOST(body: body, client: client)
+            case "/api/comparison":
+                handleComparisonPOST(body: body, client: client)
+            default:
                 respond(client, status: "404 Not Found", body: "not found\n")
-                return
             }
-            handleInferencePOST(body: body, client: client)
             return
         }
         guard method == "GET" else {
             respond(client, status: "405 Method Not Allowed", body: "GET or POST only\n")
             return
+        }
+
+        switch path {
+        case "/health":
+            handleHealthGET(client)
+            return
+        case "/api/devices":
+            handleDevicesGET(client)
+            return
+        default:
+            break
         }
 
         if path == "/ws" {
@@ -476,13 +577,210 @@ public final class NMPDashboardServer {
             return
         }
 
+        // Static web UI (Mesh 2.0): serve from publicDirectory when set,
+        // with index.html as the SPA fallback for non-file routes. The
+        // legacy embedded page stays reachable at /legacy either way.
+        if path == "/legacy" || path == "/dashboard.html" {
+            respond(client, status: "200 OK", body: Self.dashboardHTML(),
+                    contentType: "text/html; charset=utf-8")
+            return
+        }
+        if let publicDirectory = storedPublicDirectory {
+            serveStatic(path: path, from: publicDirectory, client: client)
+            return
+        }
         switch path {
-        case "/", "/index.html", "/dashboard.html":
+        case "/", "/index.html":
             respond(client, status: "200 OK", body: Self.dashboardHTML(),
                     contentType: "text/html; charset=utf-8")
         default:
             respond(client, status: "404 Not Found", body: "not found\n")
         }
+    }
+
+    // MARK: Static files (SPA)
+
+    private static let mimeTypes: [String: String] = [
+        "html": "text/html; charset=utf-8",
+        "js": "text/javascript; charset=utf-8",
+        "css": "text/css; charset=utf-8",
+        "json": "application/json",
+        "svg": "image/svg+xml",
+        "png": "image/png",
+        "ico": "image/x-icon",
+        "webp": "image/webp",
+        "woff2": "font/woff2",
+        "map": "application/json",
+        "txt": "text/plain; charset=utf-8",
+    ]
+
+    private func serveStatic(path: String, from root: URL, client: Client) {
+        // /api paths never fall through to the SPA.
+        if path.hasPrefix("/api") {
+            respondJSON(client, status: "404 Not Found", object: ["error": "not found"])
+            return
+        }
+        let rawPath = path.split(separator: "?").first.map(String.init) ?? path
+        let relative = rawPath == "/" ? "index.html"
+            : String(rawPath.dropFirst().removingPercentEncoding ?? String(rawPath.dropFirst()))
+        let candidate = root.appendingPathComponent(relative).standardizedFileURL
+
+        // Traversal guard: the resolved file must stay inside the root.
+        let rootPath = root.standardizedFileURL.path
+        guard candidate.path == rootPath
+                || candidate.path.hasPrefix(rootPath + "/") else {
+            respond(client, status: "403 Forbidden", body: "forbidden\n")
+            return
+        }
+
+        var isDirectory: ObjCBool = false
+        let exists = FileManager.default.fileExists(
+            atPath: candidate.path, isDirectory: &isDirectory)
+        let fileURL: URL
+        if exists && !isDirectory.boolValue {
+            fileURL = candidate
+        } else {
+            // SPA fallback: unknown (extension-less) routes get the app
+            // shell; missing assets stay honest 404s.
+            guard !relative.contains(".") else {
+                respond(client, status: "404 Not Found", body: "not found\n")
+                return
+            }
+            fileURL = root.appendingPathComponent("index.html")
+        }
+
+        guard let contents = try? Data(contentsOf: fileURL) else {
+            respond(client, status: "404 Not Found", body: "not found\n")
+            return
+        }
+        let contentType = Self.mimeTypes[fileURL.pathExtension.lowercased()]
+            ?? "application/octet-stream"
+        respondData(client, status: "200 OK", payload: contents,
+                    contentType: contentType)
+    }
+
+    // MARK: GET /health + /api/devices
+
+    private func handleHealthGET(_ client: Client) {
+        let info = storedMeshInfo
+        respondJSON(client, status: "200 OK", object: [
+            "status": "ok",
+            "mesh": [
+                "engine": info.engine,
+                "model": info.modelName,
+                "shard_count": info.shardCount,
+                "wire_format": info.wireFormat,
+                "speculation_available": info.speculationAvailable,
+                "peers": peerSnapshots.count,
+                "peers_alive": peerSnapshots.values.filter(\.alive).count,
+            ],
+        ])
+    }
+
+    private func handleDevicesGET(_ client: Client) {
+        let devices = peerSnapshots
+            .sorted { $0.key < $1.key }
+            .map { peerID, snapshot -> [String: Any] in
+                [
+                    "id": String(peerID, radix: 16),
+                    "name": snapshot.name,
+                    "latency_ms": snapshot.latencyMS,
+                    "load_percent": snapshot.loadPercent,
+                    "assigned": snapshot.assigned,
+                    "alive": snapshot.alive,
+                ]
+            }
+        respondJSONArray(client, status: "200 OK", array: devices)
+    }
+
+    // MARK: POST /api/benchmark/run
+
+    private func handleBenchmarkPOST(body: Data, client: Client) {
+        guard let handler = onBenchmarkRequest else {
+            respondJSON(client, status: "503 Service Unavailable",
+                        object: ["error": "no benchmark pipeline is wired to this server"])
+            return
+        }
+        guard let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let prompt = object["prompt"] as? String,
+              !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            respondJSON(client, status: "400 Bad Request",
+                        object: ["error": "body must be JSON with a non-empty 'prompt'"])
+            return
+        }
+        let request = BenchmarkRequest(
+            prompt: prompt,
+            maxTokens: (object["max_tokens"] as? Int) ?? 32,
+            runs: min(max((object["runs"] as? Int) ?? 3, 1), 10))
+
+        handler(request) { [weak self, weak client] result in
+            guard let self, let client else { return }
+            self.queue.async {
+                switch result {
+                case .failure(let failure):
+                    self.respondJSON(client, status: "500 Internal Server Error",
+                                     object: ["error": failure.message])
+                case .success(let generations):
+                    let latencies = generations.map { $0.totalSeconds * 1000 }
+                    let throughputs = generations.map {
+                        $0.totalSeconds > 0
+                            ? Double($0.tokenCount) / $0.totalSeconds : 0
+                    }
+                    let meanLatency = latencies.reduce(0, +) / Double(max(1, latencies.count))
+                    let variance = latencies
+                        .map { ($0 - meanLatency) * ($0 - meanLatency) }
+                        .reduce(0, +) / Double(max(1, latencies.count))
+                    self.respondJSON(client, status: "200 OK", object: [
+                        "prompt": request.prompt,
+                        "avg_tokens_per_sec": Self.round2(
+                            throughputs.reduce(0, +) / Double(max(1, throughputs.count))),
+                        "avg_latency_ms": Self.round2(meanLatency),
+                        "stddev_latency_ms": Self.round2(variance.squareRoot()),
+                        "runs": generations.enumerated().map { index, generation in
+                            [
+                                "run": index + 1,
+                                "tokens_per_sec": Self.round2(throughputs[index]),
+                                "latency_ms": Self.round2(latencies[index]),
+                                "token_count": generation.tokenCount,
+                                "payload_bytes": generation.networkPayloadBytes,
+                            ] as [String: Any]
+                        },
+                    ])
+                }
+            }
+        }
+    }
+
+    // MARK: POST /api/comparison
+
+    private func handleComparisonPOST(body: Data, client: Client) {
+        guard let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let tokens = object["tokens"] as? Int, tokens > 0,
+              let payloadBytes = object["payload_bytes"] as? Int,
+              let roundTrips = object["round_trips"] as? Int,
+              let measuredMs = object["measured_total_ms"] as? Double, measuredMs > 0
+        else {
+            respondJSON(client, status: "400 Bad Request", object: [
+                "error": "body must be JSON with tokens, payload_bytes, "
+                    + "round_trips, measured_total_ms (from a real run)",
+            ])
+            return
+        }
+        let inputs = NMPProtocolComparisonModel.Inputs(
+            tokens: tokens, payloadBytes: payloadBytes, roundTrips: roundTrips,
+            measuredTotalSeconds: measuredMs / 1000,
+            lanRTTMs: (object["lan_rtt_ms"] as? Double) ?? 2.0,
+            lossRate: (object["loss_rate"] as? Double) ?? 0.0)
+        respondJSON(client, status: "200 OK", object: [
+            "note": "NMP row is the measured run; TCP/QUIC rows are that run "
+                + "re-priced with modeled transport costs (see assumptions)",
+            "protocols": NMPProtocolComparisonModel.compare(inputs)
+                .map(\.asJSONObject),
+        ])
+    }
+
+    private static func round2(_ value: Double) -> Double {
+        (value * 100).rounded() / 100
     }
 
     // MARK: POST /api/inference
@@ -502,9 +800,11 @@ public final class NMPDashboardServer {
         }
         let maxTokens = (object["max_tokens"] as? Int) ?? 32
         let enableSpeculation = (object["enable_speculation"] as? Bool) ?? false
+        let enableComparison = (object["enable_comparison"] as? Bool) ?? false
 
         handler(InferenceRequest(prompt: prompt, maxTokens: maxTokens,
-                                 enableSpeculation: enableSpeculation)) { [weak self, weak client] response in
+                                 enableSpeculation: enableSpeculation,
+                                 enableComparison: enableComparison)) { [weak self, weak client] response in
             guard let self, let client else { return }
             // The handler may reply from any queue; connection sends are
             // thread-safe, but client bookkeeping stays on our queue.
@@ -513,6 +813,11 @@ public final class NMPDashboardServer {
                 case .success(let result):
                     let tokensPerSec = result.totalSeconds > 0
                         ? Double(result.tokenCount) / result.totalSeconds : 0
+                    // A round trip = one full mesh pass; the speculative
+                    // path counts them explicitly, the plain path spends
+                    // one per pass (perTokenSeconds entries).
+                    let roundTrips = result.speculation?.meshRoundTrips
+                        ?? result.perTokenSeconds.count
                     var object: [String: Any] = [
                         "output": result.text,
                         "token_count": result.tokenCount,
@@ -521,7 +826,20 @@ public final class NMPDashboardServer {
                         "network_payload_bytes": result.networkPayloadBytes,
                         "shard_count": result.shardCount,
                         "engine": result.engine,
+                        "round_trips": roundTrips,
+                        "wire_format": self.storedMeshInfo.wireFormat,
                     ]
+                    if enableComparison, result.tokenCount > 0, result.totalSeconds > 0 {
+                        object["protocol_comparison"] = [
+                            "note": "NMP row measured; TCP/QUIC modeled from it",
+                            "protocols": NMPProtocolComparisonModel.compare(.init(
+                                tokens: result.tokenCount,
+                                payloadBytes: result.networkPayloadBytes,
+                                roundTrips: roundTrips,
+                                measuredTotalSeconds: result.totalSeconds))
+                                .map(\.asJSONObject),
+                        ] as [String: Any]
+                    }
                     if let stats = result.speculation {
                         object["speculation"] = [
                             "drafter": stats.drafterName,
@@ -562,12 +880,28 @@ public final class NMPDashboardServer {
         }
     }
 
+    private func respondJSONArray(_ client: Client, status: String, array: [Any]) {
+        let body = (try? JSONSerialization.data(withJSONObject: array))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+        respond(client, status: status, body: body, contentType: "application/json")
+    }
+
     private func respond(_ client: Client, status: String, body: String,
                          contentType: String = "text/plain; charset=utf-8") {
-        let payload = Data(body.utf8)
+        respondData(client, status: status, payload: Data(body.utf8),
+                    contentType: contentType)
+    }
+
+    private func respondData(_ client: Client, status: String, payload: Data,
+                             contentType: String) {
+        // Permissive CORS: the server is a trusted-LAN testing tool; the
+        // UI may be served from a dev origin (Vite) during development.
         let head = "HTTP/1.1 \(status)\r\n"
             + "Content-Type: \(contentType)\r\n"
             + "Content-Length: \(payload.count)\r\n"
+            + "Access-Control-Allow-Origin: *\r\n"
+            + "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            + "Access-Control-Allow-Headers: Content-Type\r\n"
             + "Connection: close\r\n\r\n"
         var response = Data(head.utf8)
         response.append(payload)

@@ -8,3 +8,6 @@ DerivedData/
 *.gguf
 # Phase 8: built llama.cpp shim (scripts/setup_llama.sh output)
 Vendor/
+# Mesh 2.0: web UI toolchain (the BUILT app in Public/ IS committed, so
+# `swift run nmp-dashboard --ui` works without npm)
+web/node_modules/

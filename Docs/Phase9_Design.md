@@ -319,7 +319,7 @@ What the numbers say:
 |---|---|
 | `speculationUnsupported` / "--speculation needs a Phase 9 shim" | rerun `scripts/setup_llama.sh` (new shim function) |
 | peer fails to decode requests after `--zero-trim` | the peer is a pre-Phase 9 build — rebuild it or drop the flag |
-| acceptance rate ~0 on natural prompts with prompt-lookup | expected — use `--draft-model` with a same-vocabulary small GGUF |
+| acceptance rate ~0 on natural prompts with prompt-lookup | expected — use `--draft-model` with a same-vocabulary small GGUF (TinyLlama-1.1B measured at 54–72% acceptance on Llama-2-7B: `Docs/Mesh2_WebUI_Guide.md` §4) |
 | draft model warning "vocab N ≠ target M" | draft and target must share a tokenizer (e.g. TinyLlama for Llama-2, Qwen-0.5B for larger Qwen) |
 | auto-config keeps re-probing | device names changed between runs, or the profile file is unwritable — check `~/.nmp/` |
 | mesh output no longer bit-exact vs baseline | you opted into `.mixedPrecision`; use `.float32`/`.zeroTrimmed` where bit-exactness is required |

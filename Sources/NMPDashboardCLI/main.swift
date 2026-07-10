@@ -37,10 +37,16 @@ import NMP
 
 struct DashboardArguments {
     var port: UInt16 = 8080
+    var portExplicit = false
     var engine = "reference"
     var modelPath: String?
     var gpuLayers: Int32 = -1
     var placement = NMPLlamaTestbed.Placement.remotePeer
+    // Mesh 2.0
+    /// Serve the React web UI from Public/, advertise over Bonjour, and
+    /// print the multi-device access banner (QR + hostname + IPs).
+    /// Defaults the port to 3000 unless one is given explicitly.
+    var ui = false
     // Phase 9
     /// Automatic setup: benchmark → balanced shards → optimized wire format.
     var autoConfig = false
@@ -71,24 +77,92 @@ struct DashboardArguments {
             case "--draft-model": arguments.draftModelPath = value()
             case "--probe-passes":
                 arguments.probePasses = value().flatMap(Int.init) ?? arguments.probePasses
+            case "--ui": arguments.ui = true
             case "--help", "-h":
                 print("""
                 usage: nmp-dashboard [port] [--engine reference|llamaCpp] \
                 [--model path.gguf] [--gpu-layers N] [--placement local|remote] \
-                [--auto-config] [--probe-passes N] [--speculation] [--draft-model path.gguf]
+                [--auto-config] [--probe-passes N] [--speculation] [--draft-model path.gguf] \
+                [--ui]
                 """)
                 exit(0)
             default:
                 if let parsed = UInt16(flag) {
                     arguments.port = parsed
+                    arguments.portExplicit = true
                 } else {
                     FileHandle.standardError.write(Data("unknown flag \(flag)\n".utf8))
                     exit(2)
                 }
             }
         }
+        if arguments.ui && !arguments.portExplicit {
+            arguments.port = 3000
+        }
         return arguments
     }
+}
+
+// MARK: - Mesh 2.0 web UI wiring (shared by both engine paths)
+
+/// Bonjour advert must outlive this scope.
+var webUIBroadcaster: NMPWebUIBroadcaster?
+
+/// Locates the built React app (web/ → Public/): next to the CWD when
+/// running from the package root, or alongside the binary.
+func locatePublicDirectory() -> URL? {
+    let candidates = [
+        URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("Public"),
+        Bundle.main.bundleURL.deletingLastPathComponent()
+            .appendingPathComponent("Public"),
+    ]
+    return candidates.first {
+        FileManager.default.fileExists(
+            atPath: $0.appendingPathComponent("index.html").path)
+    }
+}
+
+/// Sequential benchmark runs over the single-flight prompt service.
+func wireBenchmark(server: NMPDashboardServer,
+                   run: @escaping (String, Int,
+                       @escaping (Result<NMPPromptInferenceService.GenerationResult,
+                                         NMPPromptInferenceService.ServiceError>) -> Void) -> Void) {
+    server.onBenchmarkRequest = { request, respond in
+        var results: [NMPPromptInferenceService.GenerationResult] = []
+        func step() {
+            guard results.count < request.runs else {
+                respond(.success(results))
+                return
+            }
+            run(request.prompt, request.maxTokens) { result in
+                switch result {
+                case .success(let generation):
+                    results.append(generation)
+                    step()
+                case .failure(let error):
+                    respond(.failure(.init("run \(results.count + 1) failed: \(error)")))
+                }
+            }
+        }
+        step()
+    }
+}
+
+/// Serves Public/, registers the Bonjour advert, prints the banner.
+func activateWebUI(server: NMPDashboardServer, meshSummary: [String]) {
+    if let publicDirectory = locatePublicDirectory() {
+        server.publicDirectory = publicDirectory
+        print("[nmp-dashboard] web UI: \(publicDirectory.path)")
+    } else {
+        print("⚠️  Public/index.html not found — serving the legacy dashboard.")
+        print("    Build the web UI first: cd web && npm install && npm run build")
+    }
+    let broadcaster = NMPWebUIBroadcaster(port: server.boundPort)
+    broadcaster.onDiagnostic = { print("[nmp-dashboard] \($0)") }
+    broadcaster.start()
+    webUIBroadcaster = broadcaster
+    print(NMPWebUIBanner.render(port: server.boundPort, meshSummary: meshSummary))
 }
 
 // MARK: - Headless benchmark mode
@@ -295,6 +369,35 @@ func runLlamaDashboard(model: NMPLlamaModel, arguments: DashboardArguments) -> N
                               maxTokens: request.maxTokens,
                               completion: handleResult)
         }
+    }
+
+    // Mesh 2.0: health/devices facts + benchmark + multi-device web UI.
+    var meshInfo = NMPDashboardServer.MeshInfo()
+    meshInfo.engine = "llamaCpp"
+    meshInfo.modelName = model.name
+    meshInfo.shardCount = 1
+    meshInfo.wireFormat = testbed.orchestrator.activationWireFormat.rawValue
+    meshInfo.speculationAvailable = speculativeService != nil
+    server.meshInfo = meshInfo
+
+    wireBenchmark(server: server) { prompt, maxTokens, completion in
+        if dashboardArguments.speculation, let speculativeService {
+            speculativeService.run(prompt: prompt, maxTokens: maxTokens,
+                                   completion: completion)
+        } else {
+            promptService.run(prompt: prompt, maxTokens: maxTokens,
+                              completion: completion)
+        }
+    }
+
+    if dashboardArguments.ui {
+        activateWebUI(server: server, meshSummary: [
+            "Mesh: llamaCpp — \(model.name)",
+            "Placement: " + (placement == .local
+                ? "single device" : "remote shard (full protocol stack)"),
+            "Wire format: \(meshInfo.wireFormat)"
+                + (meshInfo.speculationAvailable ? ", speculation ready" : ""),
+        ])
     }
 
     print("[nmp-dashboard] Ctrl-C to stop")
@@ -508,6 +611,32 @@ server.onInferenceRequest = { request, respond in
             respond(.failure(status: 500, message: "mesh orchestration failed: \(error)"))
         }
     }
+}
+
+// MARK: - Mesh 2.0: web UI + health + benchmark (reference mesh)
+
+var referenceMeshInfo = NMPDashboardServer.MeshInfo()
+referenceMeshInfo.engine = "reference"
+referenceMeshInfo.modelName = testbed.modelTag
+referenceMeshInfo.shardCount = testbed.failover.activePlan.count
+referenceMeshInfo.wireFormat = testbed.orchestrator.activationWireFormat.rawValue
+server.meshInfo = referenceMeshInfo
+
+// Benchmark runs pause the heartbeat loop exactly like API inference does.
+wireBenchmark(server: server) { prompt, maxTokens, completion in
+    stateQueue.async { apiInferenceRunning = true }
+    promptService.run(prompt: prompt, maxTokens: maxTokens) { result in
+        stateQueue.async { apiInferenceRunning = false }
+        completion(result)
+    }
+}
+
+if dashboardArguments.ui {
+    activateWebUI(server: server, meshSummary: [
+        "Mesh: reference engine — \(testbed.failover.activePlan.count) shard(s), "
+            + "\(testbed.failover.activePeers.count) device(s)",
+        "Wire format: \(referenceMeshInfo.wireFormat)",
+    ])
 }
 
 // MARK: - Background inference loop (the dashboard's heartbeat)

@@ -18,8 +18,11 @@ only the tokenizer, weights on the peer, every token one real mesh round trip; s
 `Docs/Phase8_Design.md`)**, and **the fast mesh (Phase 9: benchmark-driven adaptive
 layer sharding with persisted device profiles, zero-trim + mixed-precision activation
 wire formats, pipeline-parallel batch execution, draft/verify speculative decoding,
-one-command auto-configuration; see `Docs/Phase9_Design.md`)**.
-**272 tests pass, 0 failures.**
+one-command auto-configuration; see `Docs/Phase9_Design.md`)**, plus **Mesh 2.0
+(browser UI served by the coordinator itself — same live interface on every device
+on the Wi-Fi, honest measured-vs-modeled protocol comparison, benchmarking center,
+QR/Bonjour discovery; see `Docs/Mesh2_WebUI_Guide.md`)**.
+**291 tests pass, 0 failures.**
 
 ## Requirements
 
@@ -31,7 +34,7 @@ one-command auto-configuration; see `Docs/Phase9_Design.md`)**.
 ```bash
 cd NeuraMeshProtocol
 swift build
-swift test                             # 272 unit + loopback integration tests
+swift test                             # 291 unit + loopback integration tests
 
 swift run nmp-peer                     # compute peer (cross-device mesh)
 swift run nmp-coordinator              # coordinator + cross-device benchmark
@@ -85,6 +88,24 @@ the wire format. Speculative output is token-for-token identical to plain
 greedy output — drafts only ever save round trips, never change text.
 Guide + measured results: `Docs/Phase9_Design.md`.
 
+### Mesh 2.0: multi-device web UI
+
+```bash
+swift run nmp-dashboard --ui           # browser UI on port 3000, all interfaces
+swift run nmp-dashboard --ui --engine llamaCpp \
+    --model ~/models/llama-2-7b-chat.Q4_K_M.gguf --auto-config
+```
+
+The coordinator itself serves a React UI (prebuilt in `Public/` — npm only
+needed to edit `web/`). The startup banner prints your Mac's real
+`<hostname>.local:3000`, its LAN IPs, and a QR code; open it from Mac,
+iPhone, iPad simultaneously — every tab shows the same live mesh. Views:
+mesh dashboard, inference runner (speculation toggle, protocol comparison
+attached to the real run), benchmark center, protocol what-if explorer,
+chaos slider. The comparison is honest: the NMP row is the measured run;
+TCP/QUIC rows are that run re-priced with clearly-labeled modeled costs.
+Trusted LAN only (no TLS/auth). Setup guide: `Docs/Mesh2_WebUI_Guide.md`.
+
 Or open the folder directly in Xcode (`File > Open…`) — SwiftPM packages open natively;
 no `.xcodeproj` is required or checked in. Cross-device setup (Mac coordinator +
 iPhone peer): see `Docs/CrossDevice_Setup_Guide.md`.
@@ -131,6 +152,8 @@ iPhone peer): see `Docs/CrossDevice_Setup_Guide.md`.
 | `PipelinedInference.swift` | Phase 9: pipeline-parallel batch executor (independent sequences overlap across stages) |
 | `SpeculativeDecoder.swift` | Phase 9: draft/verify speculative decoding — prompt-lookup + draft-model drafters |
 | `AutoConfig.swift` | Phase 9: one-command setup — membership → benchmark → balance → wire format |
+| `WebUI.swift` | Mesh 2.0: protocol comparison model (measured NMP + modeled TCP/QUIC), LAN identity, Bonjour advert, CoreImage QR banner |
+| `web/` → `Public/` | Mesh 2.0: React UI source → committed build the coordinator serves (`--ui`) |
 
 ## Success Criteria
 
@@ -201,6 +224,16 @@ Phase 9 (validated 2026-07-10, Apple M3, Llama-2-7B-Chat Q4_K_M, 32 tokens):
 - [x] Speculative decoding: 32 tokens in **8 round trips** (4.0 tok/trip, 100% draft acceptance) on repetitive text; output token-for-token identical to plain greedy in every configuration, adversarial drafter included
 - [x] 0 regressions: **272 tests pass** (41 new: half-float bit-level, codecs, balance math, profiles, heterogeneous rebalancing, batch overlap, verify wire, drafters, toy-LM speculative service, real-model speculative identity)
 
+Mesh 2.0 (validated 2026-07-10, Apple M3):
+
+- [x] `--ui`: coordinator serves the React app on all interfaces (default :3000); same live state on every device (3 s polling + WebSocket pushes)
+- [x] Startup banner prints the REAL `<hostname>.local` + LAN IPs + scannable CoreImage QR (no fake `neuramesh.local` claims); Bonjour advert `_neuramesh-ui._tcp`
+- [x] REST surface: `/health`, `/api/devices`, `/api/benchmark/run` (avg + σ), `/api/comparison`, extended `/api/inference` (`round_trips`, `wire_format`, `enable_comparison`, `enable_speculation`) — CORS'd, SPA-served with traversal guard
+- [x] Protocol comparison is honest: NMP row = the measured run; TCP/QUIC = that run re-priced with labeled modeled costs anchored to in-repo measurements (1.0 ms Noise IK handshake, 0.15 ms FEC recovery)
+- [x] TinyLlama-1.1B draft model measured on Llama-2-7B: natural-text acceptance 0% (prompt-lookup) → **54–72%**, round trips 32 → **10–12**, payload → ~1.4 KB, output identical; wall clock loses in-process (shared GPU) and is documented as a physical-mesh win
+- [x] Zero-dependency rule intact: no Vapor — the NWListener server grew the routes; QR via CoreImage; React toolchain isolated in `web/` with its build committed
+- [x] 0 regressions: **291 tests pass** (19 new: comparison model math, routes, CORS, SPA fallback + traversal, benchmark σ, banner + QR)
+
 ## Design Docs
 
 - `Docs/NMP_Specification.md` — protocol spec (source of truth)
@@ -228,5 +261,8 @@ Phase 9 (validated 2026-07-10, Apple M3, Llama-2-7B-Chat Q4_K_M, 32 tokens):
   formats and their determinism ledger, why single-stream pipelining is impossible
   (and what batching + speculation buy instead), draft/verify protocol, measured
   results, honest limits of prompt-lookup drafting
+- `Docs/Mesh2_WebUI_Guide.md` — Mesh 2.0 multi-device web UI: architecture, zero-friction
+  setup guide, hostname honesty (`.local` reality), measured-vs-modeled comparison rules,
+  TinyLlama draft-model measurements
 - `Docs/Benchmarks.md` — how to run the benchmark suite and interpret the results
 - `Docs/CrossDevice_Setup_Guide.md` — Mac + iPhone mesh walkthrough
