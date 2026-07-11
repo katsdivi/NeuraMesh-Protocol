@@ -127,8 +127,11 @@ Mesh 2.1 adds, on the same stack:
   shows up the moment it opens the page (`GET /api/clients` lists them).
 
 Or open the folder directly in Xcode (`File > Open…`) — SwiftPM packages open natively;
-no `.xcodeproj` is required or checked in. Cross-device setup (Mac coordinator +
-iPhone peer): see `Docs/CrossDevice_Setup_Guide.md`.
+no `.xcodeproj` is required or checked in.
+
+**Full operator's manual — every mode, how to test each feature, connecting
+peers, troubleshooting: `Docs/Start_Here.md`.** Cross-device setup (Mac
+coordinator + iPhone peer): `Docs/CrossDevice_Setup_Guide.md`.
 
 ## Modules
 
@@ -268,6 +271,10 @@ Mesh 2.1 (validated 2026-07-11, Apple M3):
 
 ## Design Docs
 
+- **`Docs/Start_Here.md` — the operator's manual: every launch mode and when to
+  use it, tab-by-tab UI guide, a testing playbook for every feature (streaming,
+  the measured race, allocation, chaos, speculation), how to connect mesh peers
+  (one command → two processes → two devices), troubleshooting. Read this first.**
 - `Docs/NMP_Specification.md` — protocol spec (source of truth)
 - `Docs/Phase1_Design.md` — Phase 1 decisions, tradeoffs, and flagged known issues
   (constant-time properties, nonce exhaustion at 2^32, clock-sync assumption)
