@@ -3,6 +3,7 @@
 
 export interface MeshHealth {
   status: string;
+  hostname: string;
   mesh: {
     engine: string;
     model: string;

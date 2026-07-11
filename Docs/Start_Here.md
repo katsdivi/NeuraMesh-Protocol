@@ -79,6 +79,40 @@ swift run nmp-dashboard --ui --engine llamaCpp \
 
 Stop everything with Ctrl-C. That's it.
 
+### 2.1 Install it as an app on your phone (PWA — no Xcode, ever)
+
+One-time, ~20 seconds:
+
+1. Start the mesh on the Mac (any `--ui` command above).
+2. On the phone, scan the QR from the banner (or type the URL).
+3. iOS Safari: **Share ▸ Add to Home Screen**. Android Chrome:
+   **⋮ ▸ Add to Home screen**.
+4. A **NeuraMesh** icon appears on the home screen.
+
+Every time after that: **tap the icon**. The app opens full-screen,
+shows "Looking for your mesh…", finds the coordinator it was installed
+from, flashes "✓ Connected to <your-mac>", and you're in — live
+dashboard, streaming inference, device sliders, everything. If the Mac
+isn't running yet, the app just keeps looking and connects the moment
+`swift run nmp-dashboard --ui` comes up. No re-pairing, no Xcode, no
+cables.
+
+Two honest notes:
+
+- **The PWA is a remote control, not a compute peer.** Browsers cannot
+  open UDP sockets, so a phone contributing *compute* to the mesh still
+  needs the native peer app (`Docs/CrossDevice_Setup_Guide.md`). For
+  watching, running, benchmarking, and managing the mesh — the PWA is
+  everything.
+- **Why install from the mesh and not from a public website:** browsers
+  block pages served over HTTPS (any public domain) from talking to
+  `http://` devices on your LAN (mixed-content policy), and no browser
+  API can do Bonjour discovery. A hosted PWA that connects to your Mac
+  would need per-device TLS certificates + DNS plumbing (what Plex
+  does). Installing from `http://<your-mac>.local:3000` sidesteps all of
+  it: same origin, zero infrastructure, and "which mesh do I connect
+  to?" answers itself.
+
 **Security scope, once and clearly**: the dashboard/UI has no TLS and no
 auth by design — it is a trusted-LAN testing tool. Never port-forward it
 or run it on a network you don't trust.
@@ -305,6 +339,11 @@ trip. `--slow 5` on a reference peer handicaps it so you can watch the
 sharder give it fewer layers.
 
 ### 6.3 Two real devices (Mac + iPhone/iPad/second Mac)
+
+**First decide what the second device is for.** If you want it to
+*watch and control* the mesh — install the PWA (§2.1, 20 seconds, no
+Xcode) and you're done. Only continue here if you want the device to
+*contribute compute* as a real NMP peer (UDP stack in a native app).
 
 Follow **`Docs/CrossDevice_Setup_Guide.md`** top to bottom — it's a
 click-by-click walkthrough (Xcode signing for the phone, the Local

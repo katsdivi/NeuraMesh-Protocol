@@ -46,7 +46,8 @@ export function Navbar({
       </nav>
       <div className={`mesh-pill ${reachable ? 'online' : 'offline'}`}>
         {reachable
-          ? `${health?.mesh.engine ?? '…'} · ${health?.mesh.peers_alive ?? 0} peer(s)`
+          ? `${health?.hostname?.replace(/\.local$/, '') ?? '…'} · `
+            + `${health?.mesh.engine ?? '…'} · ${health?.mesh.peers_alive ?? 0} peer(s)`
           : 'mesh unreachable'}
       </div>
     </header>

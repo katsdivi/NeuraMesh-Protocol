@@ -126,6 +126,16 @@ Mesh 2.1 adds, on the same stack:
 - **Web-client tracking** — `/health` reports `web_clients`; the phone
   shows up the moment it opens the page (`GET /api/clients` lists them).
 
+Mesh 2.2 makes the web app an **installable PWA, served by the mesh
+itself**: scan the QR once, Share ▸ Add to Home Screen, and from then on
+tapping the NeuraMesh icon opens a full-screen app that finds and
+reconnects to your mesh automatically ("Looking for your mesh…" →
+"✓ Connected to <your-mac>"). No Xcode, no re-pairing. (A PWA is a
+control surface — a phone that should *contribute compute* still needs
+the native peer app; browsers can't open UDP sockets. And it installs
+from the mesh, not a public domain, because HTTPS pages can't reach
+`http://` LAN devices — see `Docs/Start_Here.md` §2.1.)
+
 Or open the folder directly in Xcode (`File > Open…`) — SwiftPM packages open natively;
 no `.xcodeproj` is required or checked in.
 

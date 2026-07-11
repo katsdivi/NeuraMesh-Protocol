@@ -827,6 +827,7 @@ public final class NMPDashboardServer {
         "woff2": "font/woff2",
         "map": "application/json",
         "txt": "text/plain; charset=utf-8",
+        "webmanifest": "application/manifest+json",
     ]
 
     private func serveStatic(path: String, from root: URL, client: Client) {
@@ -880,6 +881,8 @@ public final class NMPDashboardServer {
         let info = storedMeshInfo
         respondJSON(client, status: "200 OK", object: [
             "status": "ok",
+            // Which machine the PWA just found ("Connected to <host>").
+            "hostname": NMPLANIdentity.localHostname(),
             "mesh": [
                 "engine": info.engine,
                 "model": info.modelName,

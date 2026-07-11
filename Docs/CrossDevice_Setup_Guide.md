@@ -1,5 +1,13 @@
 # Cross-Device Setup Guide — Run the Mesh on Your Mac + iPhone
 
+> **Most people don't need this page.** If you want your phone to
+> *watch and control* the mesh — live dashboard, streaming inference,
+> device sliders — install the PWA instead: start the mesh with `--ui`,
+> scan the QR, **Share ▸ Add to Home Screen**. 20 seconds, no Xcode; see
+> `Docs/Start_Here.md` §2.1. This guide is only for making the phone a
+> **compute peer** (running the native NMP UDP stack), which a browser
+> app cannot do.
+
 Follow this top to bottom. Every step says exactly what to click or type,
 what you should see, and what to do if you don't see it. Total time:
 **~15 minutes** the first run, ~1 minute after that.

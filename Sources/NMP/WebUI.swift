@@ -33,6 +33,9 @@ import Network
 #if canImport(CoreImage)
 import CoreImage
 #endif
+#if canImport(SystemConfiguration)
+import SystemConfiguration
+#endif
 
 // MARK: - Protocol comparison model
 
@@ -164,12 +167,25 @@ public enum NMPProtocolComparisonModel {
 /// What this machine is actually reachable as on the local network.
 public enum NMPLANIdentity {
 
-    /// The machine's mDNS hostname ("<name>.local"), from gethostname().
+    /// The machine's mDNS hostname ("<name>.local"). The Local Hostname
+    /// (System Settings ▸ Sharing) is the authoritative source — it is
+    /// what Bonjour actually answers to. gethostname() is only the
+    /// fallback: on DHCP networks it can be the bare IP ("192.168.1.90"),
+    /// which must not get ".local" glued onto it.
     public static func localHostname() -> String {
+        #if canImport(SystemConfiguration)
+        if let name = SCDynamicStoreCopyLocalHostName(nil) as String?,
+           !name.isEmpty {
+            return name + ".local"
+        }
+        #endif
         var buffer = [CChar](repeating: 0, count: 256)
         guard gethostname(&buffer, buffer.count) == 0 else { return "localhost" }
         let name = String(cString: buffer)
-        return name.hasSuffix(".local") ? name : name + ".local"
+        if name.hasSuffix(".local") { return name }
+        // A dotted-quad "hostname" is an IP — return it verbatim.
+        let isIPv4 = !name.isEmpty && name.allSatisfy { $0.isNumber || $0 == "." }
+        return isIPv4 ? name : name + ".local"
     }
 
     /// Non-loopback IPv4 addresses (Wi-Fi/Ethernet), for the banner and
@@ -354,6 +370,10 @@ public enum NMPWebUIBanner {
                 lines.append("    \(row)")
             }
         }
+        lines.append("")
+        lines.append("  Install as an app (one-time, no Xcode): open the URL on the")
+        lines.append("  phone, then Share ▸ Add to Home Screen. Next time, just tap")
+        lines.append("  the NeuraMesh icon — it reconnects to this mesh by itself.")
         lines.append("════════════════════════════════════════════════════════════")
         lines.append("")
         return lines.joined(separator: "\n")

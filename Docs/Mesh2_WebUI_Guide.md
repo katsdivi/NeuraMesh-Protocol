@@ -269,7 +269,35 @@ that shares a TCP segment with the 101 upgrade response makes
 URLSessionWebSocketTask/Safari fail the handshake — the `client_update`
 broadcast is therefore delayed 250 ms off the upgrade path.
 
-### 5.5 Pre-existing races found while stabilizing
+### 5.5 The installable PWA (Mesh 2.2)
+
+The web app is a proper PWA served by the mesh itself: manifest +
+generated icons (`scripts/make_pwa_icons.py` → `web/public/`), iOS
+Add-to-Home-Screen metadata, a "Looking for your mesh…" screen that
+polls until the coordinator answers (and re-finds it after outages,
+with a "✓ Connected to <hostname>" toast), and the coordinator's real
+Local Hostname in `/health` (via `SCDynamicStoreCopyLocalHostName` —
+`gethostname()` can return a bare DHCP IP, which must not get `.local`
+appended).
+
+Design decisions, honestly:
+
+- **Installed FROM the mesh, not from a public domain.** An HTTPS-hosted
+  PWA cannot fetch `http://` LAN endpoints (mixed-content policy) and
+  browsers have no Bonjour API — "the hosted app scans your network" is
+  not implementable. Plex-style per-device TLS certificates + DNS would
+  fix it at the cost of real infrastructure; installing from
+  `http://<mac>.local:3000` gives the same journey with zero.
+- **The service worker only registers in secure contexts** (https /
+  localhost) — browsers refuse SWs over LAN http, and the app works
+  fully without one. `web/public/sw.js` is the app-shell cache for
+  anyone who later fronts the mesh with TLS. Consequence over plain
+  http: tapping the icon while the Mac is off shows a browser error, not
+  the finder screen — only TLS can change that.
+- **A PWA is a control surface, not a compute peer** — no UDP in
+  browsers. Phone-as-peer stays native (`CrossDevice_Setup_Guide.md`).
+
+### 5.6 Pre-existing races found while stabilizing
 
 Full-suite hammering surfaced two latent bugs (both pre-date Mesh 2.1,
 both now fixed and pinned by 5 consecutive clean 306-test runs):
