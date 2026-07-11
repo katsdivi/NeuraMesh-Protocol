@@ -381,8 +381,15 @@ func runLlamaDashboard(model: NMPLlamaModel, arguments: DashboardArguments) -> N
     let llamaStateQueue = DispatchQueue(label: "nmp.dashboard.llama.state")
     var llamaGenerationRunning = false
     var llamaLastServedAt: Date?
+    // Mesh 2.3: serve count + per-link throughput for the device panel.
+    var llamaRequestsServed = 0
+    var llamaTrafficBaseline: (sent: UInt64, received: UInt64, at: Date)?
+    var llamaNetRates: (toDeviceBps: Int, fromDeviceBps: Int)?
     testbed.onInferenceServed = { [existing = testbed.onInferenceServed] id, layers, seconds in
-        llamaStateQueue.async { llamaLastServedAt = Date() }
+        llamaStateQueue.async {
+            llamaLastServedAt = Date()
+            llamaRequestsServed += 1
+        }
         existing?(id, layers, seconds)
     }
 
@@ -488,8 +495,26 @@ func runLlamaDashboard(model: NMPLlamaModel, arguments: DashboardArguments) -> N
     server.onDeviceMetricsRequest = { respond in
         llamaStateQueue.async {
             let sample = resourceMonitor.sample()
+            let now = Date()
             let computingNow = llamaGenerationRunning
-                || (llamaLastServedAt.map { Date().timeIntervalSince($0) < 1.0 } ?? false)
+                || (llamaLastServedAt.map { now.timeIntervalSince($0) < 1.0 } ?? false)
+
+            // Live link throughput (remotePeer only) — same 0.5 s-window
+            // diffing as the reference path.
+            if let totals = testbed.wireTraffic {
+                if let baseline = llamaTrafficBaseline {
+                    let elapsed = now.timeIntervalSince(baseline.at)
+                    if elapsed >= 0.5 {
+                        llamaNetRates = (
+                            toDeviceBps: Int(Double(totals.sentBytes - baseline.sent) / elapsed),
+                            fromDeviceBps: Int(Double(totals.receivedBytes - baseline.received) / elapsed))
+                        llamaTrafficBaseline = (totals.sentBytes, totals.receivedBytes, now)
+                    }
+                } else {
+                    llamaTrafficBaseline = (totals.sentBytes, totals.receivedBytes, now)
+                }
+            }
+
             var peers: [[String: Any]] = [
                 [
                     "id": String(testbed.coordinatorID, radix: 16),
@@ -499,23 +524,40 @@ func runLlamaDashboard(model: NMPLlamaModel, arguments: DashboardArguments) -> N
                         ? "layers 0-\(engine.layerCount - 1)" : "tokenizer only",
                     "compute_share": 1.0,
                     "computing": computingNow && placement == .local,
+                    "is_coordinator": true,
+                    "link": "local — no network hop",
                 ],
             ]
             if placement == .remotePeer {
-                peers.append([
+                var peer: [String: Any] = [
                     "id": String(testbed.peerID, radix: 16),
                     "name": "llama-peer (in-process)",
                     "alive": true,
                     "assigned": "layers 0-\(engine.layerCount - 1)",
                     "compute_share": 1.0,
                     "computing": computingNow,
-                ])
+                    "is_coordinator": false,
+                    "link": "in-process link (full NMP stack: Noise IK, AES-GCM, FEC, NACK)",
+                    "requests_served": llamaRequestsServed,
+                ]
+                if let totals = testbed.wireTraffic {
+                    peer["wire_in_mb"] =
+                        (Double(totals.sentBytes) / 1_048_576 * 100).rounded() / 100
+                    peer["wire_out_mb"] =
+                        (Double(totals.receivedBytes) / 1_048_576 * 100).rounded() / 100
+                }
+                if let rates = llamaNetRates {
+                    peer["net_in_bytes_per_sec"] = rates.toDeviceBps
+                    peer["net_out_bytes_per_sec"] = rates.fromDeviceBps
+                }
+                peers.append(peer)
             }
             respond([
                 "host": sample.asJSONObject,
                 "host_note": "all mesh peers run in-process — these are "
                     + "genuinely this machine's live kernel counters "
-                    + "(watch process_footprint_mb during a generation)",
+                    + "(watch process_footprint_mb and gpu_percent during "
+                    + "a generation: llama.cpp computes on the GPU via Metal)",
                 "generation_in_flight": llamaGenerationRunning,
                 "allocation_supported": false,
                 "allocation_note": "a llama plan is one full-range shard "
@@ -523,6 +565,14 @@ func runLlamaDashboard(model: NMPLlamaModel, arguments: DashboardArguments) -> N
                     + "to re-balance — compute shares apply to the "
                     + "reference mesh",
                 "peers": peers,
+                "totals": [
+                    "devices": peers.count,
+                    "devices_alive": peers.count,
+                    "layers_assigned": engine.layerCount,
+                    "requests_served": llamaRequestsServed,
+                    "net_bytes_per_sec": llamaNetRates.map { $0.toDeviceBps + $0.fromDeviceBps } ?? 0,
+                    "generation_in_flight": llamaGenerationRunning,
+                ] as [String: Any],
             ])
         }
     }
@@ -619,6 +669,36 @@ var benchmarkRunning = false
 testbed.orchestrator.onPeerMetrics = { metrics in
     stateQueue.async { latestMetrics[metrics.peerID] = metrics }
 }
+
+// Mesh 2.3: per-device telemetry, all measured.
+// - latestResources: each peer's own kernel-counter sample, shipped over
+//   the mesh (in-process peers report this same host — the hostname match
+//   tells the UI to say so instead of pretending they are separate boxes).
+// - serveStats: requests actually served per peer, straight from the
+//   peer-side shard engines — the direct "this device is computing" proof.
+// - trafficBaselines/latestNetRates: coordinator-side wire totals per
+//   link, diffed between polls into live bytes/sec.
+var latestResources: [UInt32: (report: NMPPeerResourceReport, at: Date)] = [:]
+testbed.orchestrator.onPeerResourceReport = { report in
+    stateQueue.async { latestResources[report.peerID] = (report, Date()) }
+}
+
+var serveStats: [UInt32: (served: Int, lastComputeSeconds: Double, lastAt: Date)] = [:]
+func recordServe(peerID: UInt32, computeSeconds: Double) {
+    stateQueue.async {
+        serveStats[peerID] = ((serveStats[peerID]?.served ?? 0) + 1,
+                              computeSeconds, Date())
+    }
+}
+for peer in testbed.remotePeers {
+    let peerID = peer.capabilities.peerID
+    peer.shardEngine.onInferenceServed = { _, _, seconds in
+        recordServe(peerID: peerID, computeSeconds: seconds)
+    }
+}
+
+var trafficBaselines: [UInt32: (sent: UInt64, received: UInt64, at: Date)] = [:]
+var latestNetRates: [UInt32: (toDeviceBps: Int, fromDeviceBps: Int)] = [:]
 
 func assignmentLabel(for peerID: UInt32) -> String {
     guard let entry = testbed.failover.activePlan.first(where: { $0.peerID == peerID }) else {
@@ -804,8 +884,11 @@ wireComparisonRun(server: server) { request, completion in
     }
 }
 
-// Mesh 2.1: live device metrics — host kernel counters plus per-peer
-// mesh facts (assignment, measured speed, compute share, liveness).
+// Mesh 2.1/2.3: live device metrics — host kernel counters plus per-peer
+// mesh facts (assignment, measured speed, compute share, liveness) plus
+// per-device telemetry: peer-reported resources, live wire throughput,
+// requests served, and mesh totals. Every number is measured; the labels
+// say where it was measured.
 server.onDeviceMetricsRequest = { respond in
     stateQueue.async {
         let sample = resourceMonitor.sample()
@@ -815,9 +898,32 @@ server.onDeviceMetricsRequest = { respond in
         let alivePeerIDs = Set(testbed.failover.activePeers.map(\.peerID))
         let planned = Dictionary(uniqueKeysWithValues:
             testbed.failover.activePlan.map { ($0.peerID, $0) })
+        let connections = Dictionary(uniqueKeysWithValues:
+            testbed.remotePeers.map { ($0.capabilities.peerID, $0.coordinatorSide) })
+        let now = Date()
+
+        // Refresh per-link throughput from the connections' wire totals.
+        // Rates only update when ≥0.5 s has passed since the last baseline
+        // (several browsers polling at once would otherwise shrink the
+        // window into noise); between updates the last rate is served.
+        for (peerID, connection) in connections {
+            let totals = connection.trafficTotals
+            guard let baseline = trafficBaselines[peerID] else {
+                trafficBaselines[peerID] = (totals.sentBytes, totals.receivedBytes, now)
+                continue
+            }
+            let elapsed = now.timeIntervalSince(baseline.at)
+            guard elapsed >= 0.5 else { continue }
+            latestNetRates[peerID] = (
+                toDeviceBps: Int(Double(totals.sentBytes - baseline.sent) / elapsed),
+                fromDeviceBps: Int(Double(totals.receivedBytes - baseline.received) / elapsed))
+            trafficBaselines[peerID] = (totals.sentBytes, totals.receivedBytes, now)
+        }
 
         let peers = testbed.failover.activePeers.map { caps -> [String: Any] in
             let entry = planned[caps.peerID]
+            let stats = serveStats[caps.peerID]
+            let secondsSinceServe = stats.map { now.timeIntervalSince($0.lastAt) }
             var peer: [String: Any] = [
                 "id": String(caps.peerID, radix: 16),
                 "name": caps.deviceName,
@@ -827,26 +933,92 @@ server.onDeviceMetricsRequest = { respond in
                 } ?? "—",
                 "layer_span": entry?.layerSpan ?? 0,
                 "compute_share": shares[caps.peerID] ?? 1.0,
-                // The dashboard heartbeat keeps the mesh under continuous
-                // load, so "computing" = in the plan while a pass runs.
-                "computing": entry != nil,
+                // Served a request in the last 1.5 s (the heartbeat runs a
+                // pass every ~0.4 s, so an assigned live peer stays hot).
+                "computing": entry != nil
+                    && (secondsSinceServe.map { $0 < 1.5 } ?? false),
                 "load_percent": Int(latestMetrics[caps.peerID]?.currentLoadPercent ?? 0),
+                "is_coordinator": caps.peerID == testbed.coordinatorID,
+                "link": connections[caps.peerID] != nil
+                    ? "in-process link (full NMP stack: Noise IK, AES-GCM, FEC, NACK)"
+                    : "local shard on the coordinator — no network hop",
             ]
             if let rate = measured[caps.peerID] {
                 peer["measured_ms_per_layer"] = (rate * 1000 * 100).rounded() / 100
             }
+            if let stats {
+                peer["requests_served"] = stats.served
+                peer["last_compute_ms"] =
+                    (stats.lastComputeSeconds * 1000 * 100).rounded() / 100
+                peer["seconds_since_active"] =
+                    ((secondsSinceServe ?? 0) * 10).rounded() / 10
+            }
+            if let connection = connections[caps.peerID] {
+                let totals = connection.trafficTotals
+                // Device perspective: "in" = what the coordinator sent it.
+                peer["wire_in_mb"] =
+                    (Double(totals.sentBytes) / 1_048_576 * 100).rounded() / 100
+                peer["wire_out_mb"] =
+                    (Double(totals.receivedBytes) / 1_048_576 * 100).rounded() / 100
+                if let rates = latestNetRates[caps.peerID] {
+                    peer["net_in_bytes_per_sec"] = rates.toDeviceBps
+                    peer["net_out_bytes_per_sec"] = rates.fromDeviceBps
+                }
+            }
+            if let (report, at) = latestResources[caps.peerID] {
+                var resources: [String: Any] = [
+                    "hostname": report.hostname,
+                    "same_host_as_coordinator": report.hostname == sample.hostname,
+                    "age_seconds": (now.timeIntervalSince(at) * 10).rounded() / 10,
+                    "ram_total_mb": Int(report.ramTotalMB),
+                    "ram_used_mb": Int(report.ramUsedMB),
+                    "ram_used_percent": report.ramTotalMB > 0
+                        ? (Double(report.ramUsedMB) / Double(report.ramTotalMB)
+                            * 1000).rounded() / 10 : 0,
+                    "process_footprint_mb": Int(report.processFootprintMB),
+                    "storage_total_gb":
+                        (Double(report.storageTotalMB) / 1024 * 10).rounded() / 10,
+                    "storage_free_gb":
+                        (Double(report.storageFreeMB) / 1024 * 10).rounded() / 10,
+                    "storage_used_percent": report.storageTotalMB > 0
+                        ? (Double(report.storageTotalMB - report.storageFreeMB)
+                            / Double(report.storageTotalMB) * 1000).rounded() / 10 : 0,
+                ]
+                if let cpu = report.cpuPercent {
+                    resources["cpu_percent"] = (cpu * 10).rounded() / 10
+                }
+                if let gpu = report.gpuPercent {
+                    resources["gpu_percent"] = (gpu * 10).rounded() / 10
+                }
+                peer["resources"] = resources
+            }
             return peer
         }
+
+        let totalLayers = planned.values.reduce(0) { $0 + $1.layerSpan }
+        let netToBps = latestNetRates.values.reduce(0) { $0 + $1.toDeviceBps }
+        let netFromBps = latestNetRates.values.reduce(0) { $0 + $1.fromDeviceBps }
+        let totals: [String: Any] = [
+            "devices": peers.count,
+            "devices_alive": alivePeerIDs.count,
+            "layers_assigned": totalLayers,
+            "requests_served": serveStats.values.reduce(0) { $0 + $1.served },
+            "net_bytes_per_sec": netToBps + netFromBps,
+            "generation_in_flight": inFlight,
+        ]
+
         respond([
             "host": sample.asJSONObject,
             "host_note": "all mesh peers run in-process — these are "
-                + "genuinely this machine's live kernel counters",
+                + "genuinely this machine's live kernel counters (GPU% is "
+                + "the whole machine: the reference engine computes on CPU)",
             "generation_in_flight": inFlight,
             "allocation_supported": true,
             "allocation_note": "compute share re-plans the mesh: a device "
                 + "at 50% is planned as half as fast and receives "
                 + "proportionally fewer layers — watch 'assigned' change",
             "peers": peers,
+            "totals": totals,
         ])
     }
 }
@@ -911,6 +1083,12 @@ func runInferenceLoop() {
                 let report = try testbed.inferSync(
                     input: testbed.makeInput(seed: UInt64(generation)),
                     stageTimeout: 1.0)
+                // Remote serves are recorded by the peer-side engines;
+                // the coordinator's local shard only shows up here.
+                for shard in report.perShard where shard.isLocal {
+                    recordServe(peerID: shard.peerID,
+                                computeSeconds: shard.computeSeconds)
+                }
                 for (index, shard) in report.perShard.enumerated() {
                     server.updateInferenceProgress(
                         progress: Double(index + 1) / Double(max(1, stages)),

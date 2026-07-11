@@ -103,6 +103,10 @@ public final class NMPPeerShardEngine {
         }
         send(payload: NMPShardAck(shardIndex: assign.shardIndex, status: status).encode(),
              context: "shard ack")
+        // Mesh 2.3: a fresh assignment means a coordinator is looking at
+        // this peer — give its Devices panel a resource sample right away
+        // instead of waiting for the first serve.
+        if status == .ready { reportResources(force: true) }
     }
 
     private func handleMeshMessage(_ payload: Data) {
@@ -230,9 +234,31 @@ public final class NMPPeerShardEngine {
             memoryUsageMB: Self.residentMemoryMB(),
             currentLoadPercent: UInt8(clamping: Int(loadSampler.samplePercent().rounded())))
         send(payload: metrics.encode(), context: "metrics")
+        reportResources()
+    }
+
+    /// Mesh 2.3: ships THIS device's kernel counters to the coordinator,
+    /// at most one per `resourceReportInterval` (sampling is cheap, but a
+    /// hot mesh serves hundreds of stages a second). These are the numbers
+    /// behind the Devices panel's per-device cards: for a physical peer
+    /// they are that device's own RAM/CPU/GPU/storage; for an in-process
+    /// peer they describe the shared host, and the matching hostname is
+    /// how the coordinator knows to label them so.
+    private func reportResources(force: Bool = false) {
+        let now = PeerConnection.monotonicNow()
+        guard force || now - lastResourceReportAt >= resourceReportInterval else {
+            return
+        }
+        lastResourceReportAt = now
+        let report = NMPPeerResourceReport(
+            peerID: localPeerID, sample: resourceMonitor.sample())
+        send(payload: report.encode(), context: "resource report")
     }
 
     private let loadSampler = NMPCPULoadSampler()
+    private let resourceMonitor = NMPResourceMonitor()
+    private let resourceReportInterval: TimeInterval = 2
+    private var lastResourceReportAt: TimeInterval = 0
 
     private func send(payload: Data, flags: NMPFlags = [], context: String) {
         do {

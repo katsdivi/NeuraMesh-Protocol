@@ -163,6 +163,15 @@ public final class PeerConnection {
     private var shaper: NMPTrafficShaper
     private var deferTimer: DispatchSourceTimer?
 
+    // Mesh 2.3: cumulative wire traffic — every datagram handed to /
+    // received from the transport, handshake, NACKs, FEC parity and
+    // retransmits included (this is what actually crossed the link).
+    // Lock-protected: written on `queue`, read by dashboard pollers
+    // from their own queues.
+    private let trafficLock = NSLock()
+    private var sentWireBytes: UInt64 = 0
+    private var receivedWireBytes: UInt64 = 0
+
     // MARK: Init
 
     /// - Parameters:
@@ -205,6 +214,25 @@ public final class PeerConnection {
                 self?.fail(.noiseFailure("transport closed: \(String(describing: error))"))
             }
         }
+    }
+
+    // MARK: Wire traffic accounting (Mesh 2.3)
+
+    /// Total bytes this connection has put on / taken off the wire, from
+    /// any thread. The Devices panel diffs successive readings into live
+    /// per-link throughput.
+    public var trafficTotals: (sentBytes: UInt64, receivedBytes: UInt64) {
+        trafficLock.lock()
+        defer { trafficLock.unlock() }
+        return (sentWireBytes, receivedWireBytes)
+    }
+
+    /// The single choke point for outbound datagrams: counts, then sends.
+    private func transmit(_ datagram: Data) {
+        trafficLock.lock()
+        sentWireBytes &+= UInt64(datagram.count)
+        trafficLock.unlock()
+        transport.send(datagram)
     }
 
     // MARK: Lifecycle
@@ -319,7 +347,7 @@ public final class PeerConnection {
         // retransmit window, so any sequence the peer sees a gap for can be
         // refilled.
         retransmitBuffer.store(sequence: seq, datagram: datagram)
-        transport.send(datagram)
+        transmit(datagram)
         if config.awdl.enabled { awdlDetector.recordSent(at: Self.monotonicNow()) }
 
         if fecEligible,
@@ -351,7 +379,7 @@ public final class PeerConnection {
             }
             retryCount += 1 // transmission number (1 = initial send)
             state = .handshaking(attempt: retryCount)
-            transport.send(datagram)
+            transmit(datagram)
 
             // Spec backoff: wait 5s → retry, 10s → retry, 20s → retry,
             // then wait once more and give up (initial + 3 retries total).
@@ -415,7 +443,7 @@ public final class PeerConnection {
             if let digest = seenMessage1Digest, digest == Self.digest(raw),
                let cached = cachedMessage2Datagram {
                 onDiagnostic?("duplicate msg1 → resending cached msg2")
-                transport.send(cached)
+                transmit(cached)
             } else {
                 onDiagnostic?("dropped: unexpected msg1 while established")
             }
@@ -444,7 +472,7 @@ public final class PeerConnection {
             seenMessage1Digest = Self.digest(raw)
 
             retryTimer?.cancel(); retryTimer = nil
-            transport.send(datagram)
+            transmit(datagram)
             establishSession(
                 result: result,
                 remoteSeed: remoteSeed,
@@ -505,6 +533,9 @@ public final class PeerConnection {
 
     private func handleDatagram(_ datagram: Data) {
         guard state != .closed else { return }
+        trafficLock.lock()
+        receivedWireBytes &+= UInt64(datagram.count)
+        trafficLock.unlock()
         let header: NMPHeader
         do {
             header = try NMPPacketCodec.decodeHeader(datagram)
@@ -605,7 +636,7 @@ public final class PeerConnection {
             if let datagram = retransmitBuffer.datagram(for: seq) {
                 onDiagnostic?("retransmitting seq=\(seq) on NACK")
                 onPacketEvent?(.retransmitted(sequence: seq))
-                transport.send(datagram)
+                transmit(datagram)
             } else {
                 onDiagnostic?("NACK for seq=\(seq) outside retransmit window; ignored")
             }

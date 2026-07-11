@@ -30,7 +30,10 @@ code, .mono { font-family: var(--font-mono); }
 .navbar {
   background: var(--color-neutral-900);
   color: var(--color-neutral-50);
-  padding: var(--spacing-sm) var(--spacing-lg);
+  /* black-translucent standalone PWA: content draws under the iPhone
+     status bar — the navbar absorbs that inset so tabs stay reachable. */
+  padding: calc(env(safe-area-inset-top, 0px) + var(--spacing-sm))
+    var(--spacing-lg) var(--spacing-sm);
   display: flex;
   align-items: center;
   gap: var(--spacing-lg);
@@ -457,12 +460,159 @@ input[type='range'] { width: 200px; }
   to { opacity: 1; transform: translate(-50%, 0); }
 }
 
+/* The toast's resting state: a quiet green dot, top-right. */
+.connect-dot {
+  position: fixed;
+  top: calc(env(safe-area-inset-top, 0px) + 16px);
+  right: calc(env(safe-area-inset-right, 0px) + 14px);
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--color-success);
+  box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.25);
+  z-index: 100;
+  animation: nmp-dot-in 0.4s ease;
+}
+@keyframes nmp-dot-in {
+  from { transform: scale(2.2); opacity: 0.4; }
+  to { transform: scale(1); opacity: 1; }
+}
+/* Desktop: the navbar pill already shows ● hostname — hide the extra dot. */
+@media (min-width: 641px) {
+  .connect-dot { display: none; }
+}
+
+/* ── Device cards (Mesh 2.3) ────────────────────────────── */
+
+.peer-card { margin-bottom: var(--spacing-md); }
+.peer-head {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  margin-bottom: var(--spacing-md);
+  flex-wrap: wrap;
+}
+.peer-head .device-name { font-size: var(--text-h3); }
+.peer-head .badge { margin-left: 0; }
+
+.peer-sections {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: var(--spacing-md) var(--spacing-lg);
+}
+.peer-section-title {
+  font-size: var(--text-caption);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-neutral-500);
+  margin-bottom: var(--spacing-xs);
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  flex-wrap: wrap;
+}
+.fact-list {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.fact-list > div {
+  display: flex;
+  gap: var(--spacing-sm);
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+.fact-list dt {
+  font-size: var(--text-caption);
+  color: var(--color-neutral-500);
+  min-width: 84px;
+  flex: none;
+}
+.fact-list dd {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+}
+.fact-sub { color: var(--color-neutral-500); font-size: var(--text-caption); font-family: var(--font-body); }
+.fact-empty {
+  font-size: var(--text-caption);
+  color: var(--color-neutral-500);
+  line-height: 1.5;
+  margin-top: var(--spacing-sm);
+}
+.peer-resources { margin-top: var(--spacing-md); }
+
 /* ── Mobile ─────────────────────────────────────────────── */
 
 @media (max-width: 640px) {
-  .page { padding: var(--spacing-md); }
-  .navbar { padding: var(--spacing-sm) var(--spacing-md); gap: var(--spacing-sm); }
+  .page {
+    padding: var(--spacing-md);
+    padding-bottom: calc(env(safe-area-inset-bottom, 0px) + var(--spacing-lg));
+  }
+  h1 { font-size: 1.4rem; margin-bottom: var(--spacing-sm); }
+  h2 { font-size: 1.15rem; }
+
+  /* Navbar: brand + one horizontally-scrollable tab strip (no wrapping
+     into a three-deck header eating half the phone screen). */
+  .navbar {
+    padding: calc(env(safe-area-inset-top, 0px) + var(--spacing-sm))
+      var(--spacing-md) var(--spacing-xs);
+    gap: var(--spacing-xs) var(--spacing-sm);
+  }
   .navbar .mesh-pill { display: none; }
-  h1 { font-size: 1.5rem; }
-  .grid { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+  .navbar nav {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    width: 100%;
+    order: 2;
+    scrollbar-width: none;
+    margin: 0 calc(-1 * var(--spacing-md));
+    padding: 0 var(--spacing-md);
+  }
+  .navbar nav::-webkit-scrollbar { display: none; }
+  .navbar button {
+    white-space: nowrap;
+    padding: var(--spacing-xs) var(--spacing-md);
+    flex: none;
+  }
+
+  .card, .metric-card { padding: var(--spacing-md); }
+  .grid { grid-template-columns: repeat(2, 1fr); gap: var(--spacing-sm); }
+  .metric-value { font-size: 1.3rem; }
+
+  .device-name { min-width: 0; }
+  .peer-sections { grid-template-columns: 1fr; }
+  .fact-list dt { min-width: 76px; }
+
+  /* Sliders: full width, and a thumb a thumb can actually hit. */
+  .allocation-row input[type='range'],
+  .settings-row input[type='range'],
+  input[type='range'] {
+    width: 100%;
+    max-width: none;
+    min-width: 0;
+    height: 32px;
+  }
+  .allocation-row { gap: var(--spacing-xs); }
+  .allocation-row label { width: 100%; }
+
+  /* 16px inputs stop iOS Safari from zooming the page on focus. */
+  textarea, input[type='number'], input[type='text'] { font-size: 16px; }
+
+  .output-box { padding: var(--spacing-md); font-size: 0.85rem; }
+  .event-log { max-height: 160px; }
+  .resource-head { flex-wrap: nowrap; }
+  .resource-detail {
+    flex: 1;
+    min-width: 0;
+    text-align: right;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .comparison-table table { font-size: 0.85rem; }
+  .mesh-finder { padding: var(--spacing-lg); }
 }

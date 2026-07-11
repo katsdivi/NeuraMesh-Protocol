@@ -33,6 +33,26 @@ export interface HostSample {
   storage_free_gb: number;
   storage_used_percent: number;
   cpu_percent?: number;
+  /** Whole-machine GPU utilization from the accelerator driver (macOS). */
+  gpu_percent?: number;
+}
+
+/** Mesh 2.3: a peer's own kernel counters, reported over the mesh. */
+export interface PeerResources {
+  hostname: string;
+  /** True = in-process peer (or same box): it shares the host card's
+   * hardware, so per-device bars would be theater. */
+  same_host_as_coordinator: boolean;
+  age_seconds: number;
+  ram_total_mb: number;
+  ram_used_mb: number;
+  ram_used_percent: number;
+  process_footprint_mb: number;
+  storage_total_gb: number;
+  storage_free_gb: number;
+  storage_used_percent: number;
+  cpu_percent?: number;
+  gpu_percent?: number;
 }
 
 export interface PeerMetric {
@@ -45,6 +65,29 @@ export interface PeerMetric {
   computing: boolean;
   load_percent?: number;
   measured_ms_per_layer?: number;
+  // Mesh 2.3 per-device telemetry (all measured)
+  is_coordinator?: boolean;
+  link?: string;
+  requests_served?: number;
+  last_compute_ms?: number;
+  seconds_since_active?: number;
+  /** Bytes/sec into the device (coordinator → peer), live. */
+  net_in_bytes_per_sec?: number;
+  /** Bytes/sec out of the device (peer → coordinator), live. */
+  net_out_bytes_per_sec?: number;
+  /** Total MB that crossed this link since the mesh came up. */
+  wire_in_mb?: number;
+  wire_out_mb?: number;
+  resources?: PeerResources;
+}
+
+export interface MeshTotals {
+  devices: number;
+  devices_alive: number;
+  layers_assigned: number;
+  requests_served: number;
+  net_bytes_per_sec: number;
+  generation_in_flight: boolean;
 }
 
 export interface DeviceMetrics {
@@ -54,6 +97,7 @@ export interface DeviceMetrics {
   allocation_supported: boolean;
   allocation_note: string;
   peers: PeerMetric[];
+  totals?: MeshTotals;
 }
 
 export interface RaceLeg {

@@ -14,23 +14,36 @@ export function App() {
     useMesh();
 
   // PWA connection flow: "looking for your mesh" until the first /health
-  // answers, a brief "connected" toast when it does (also after any
-  // outage), then the app. Reconnects are automatic — the hook never
-  // stops polling.
+  // answers, a "connected" toast for 3 s when it does (also after any
+  // outage), then the toast shrinks to a green dot in the top-right.
+  // Reconnects are automatic — the hook never stops polling.
+  //
+  // The effect keys on `connected` ONLY: health is a fresh object every
+  // 2 s poll, and having it in the deps re-ran the effect each poll —
+  // whose cleanup cancelled the hide timer before it could fire, so the
+  // toast never went away (the installed-PWA bug).
   const connected = reachable && health !== null;
   const [toast, setToast] = useState('');
+  const [dot, setDot] = useState(false);
   const wasConnected = useRef(false);
+  const healthRef = useRef(health);
+  healthRef.current = health;
   useEffect(() => {
     if (connected && !wasConnected.current) {
       wasConnected.current = true;
-      setToast(`Connected to ${health!.hostname}`);
-      const timer = setTimeout(() => setToast(''), 3500);
+      setToast(`Connected to ${healthRef.current?.hostname ?? 'mesh'}`);
+      setDot(false);
+      const timer = setTimeout(() => {
+        setToast('');
+        setDot(true);
+      }, 3000);
       return () => clearTimeout(timer);
     }
     if (!connected && wasConnected.current) {
       wasConnected.current = false; // re-toast on recovery
+      setDot(false);
     }
-  }, [connected, health]);
+  }, [connected]);
 
   if (!connected) {
     return (
@@ -45,6 +58,13 @@ export function App() {
     <div className="app">
       <Navbar view={view} onNavigate={setView} health={health} reachable={reachable} />
       {toast && <div className="connect-toast">✓ {toast}</div>}
+      {!toast && dot && (
+        <div
+          className="connect-dot"
+          title={`Connected to ${health?.hostname ?? 'mesh'}`}
+          aria-label="connected"
+        />
+      )}
       <main className="page">
         {view === 'dashboard' && (
           <Dashboard

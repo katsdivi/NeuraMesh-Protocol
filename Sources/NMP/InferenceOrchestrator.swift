@@ -84,6 +84,10 @@ public final class NMPInferenceOrchestrator {
 
     /// Latest metrics packet from a shard peer.
     public var onPeerMetrics: ((NMPPeerMetrics) -> Void)?
+    /// Mesh 2.3: a shard peer's own host resource sample (RAM/CPU/GPU/
+    /// storage measured ON that peer). Real per-device telemetry for
+    /// physical peers; in-process peers report the shared host.
+    public var onPeerResourceReport: ((NMPPeerResourceReport) -> Void)?
     public var onDiagnostic: ((String) -> Void)?
     /// Phase 6: fires for every decrypted packet a shard peer sends us —
     /// the liveness signal `NMPPeerHealthMonitor` feeds on.
@@ -598,6 +602,10 @@ public final class NMPInferenceOrchestrator {
         case .metrics:
             if let metrics = try? NMPPeerMetrics.decode(payload) {
                 onPeerMetrics?(metrics)
+            }
+        case .resourceReport:
+            if let report = try? NMPPeerResourceReport.decode(payload) {
+                onPeerResourceReport?(report)
             }
         default:
             onDiagnostic?("orchestrator ignoring mesh message from \(peerID)")

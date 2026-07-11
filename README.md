@@ -24,7 +24,7 @@ on the Wi-Fi, real-time token streaming to every open browser, ACTUALLY-measured
 NMP-vs-TCP transport race, live device resource panel with compute-share sliders
 that re-shard the mesh, web-client tracking, benchmarking center, QR/Bonjour
 discovery; see `Docs/Mesh2_WebUI_Guide.md`)**.
-**306 tests pass, 0 failures.**
+**316 tests pass, 0 failures.**
 
 ## Requirements
 
@@ -36,7 +36,7 @@ discovery; see `Docs/Mesh2_WebUI_Guide.md`)**.
 ```bash
 cd NeuraMeshProtocol
 swift build
-swift test                             # 306 unit + loopback integration tests
+swift test                             # 316 unit + loopback integration tests
 
 swift run nmp-peer                     # compute peer (cross-device mesh)
 swift run nmp-coordinator              # coordinator + cross-device benchmark
@@ -135,6 +135,18 @@ control surface — a phone that should *contribute compute* still needs
 the native peer app; browsers can't open UDP sockets. And it installs
 from the mesh, not a public domain, because HTTPS pages can't reach
 `http://` LAN devices — see `Docs/Start_Here.md` §2.1.)
+
+Mesh 2.3 turns the Devices tab into **full per-device telemetry, all
+measured**: live network ↓/↑ per link (every datagram counted at the
+`PeerConnection` wire boundary), requests actually served per peer with
+last-stage compute time, peer-reported resources over the mesh (new
+`NMPPeerResourceReport` message — a physical peer reports its own
+RAM/CPU/GPU/storage; in-process peers are labeled as sharing the host
+rather than drawn as fake separate hardware), whole-machine GPU% from
+the accelerator driver, and mesh totals. Plus a phone-sized layout for
+the PWA (safe-area insets, scrollable tabs, full-width sliders) and the
+connected toast now shrinks to a green dot after 3 s. See
+`Docs/Mesh2_WebUI_Guide.md` §5.7.
 
 Or open the folder directly in Xcode (`File > Open…`) — SwiftPM packages open natively;
 no `.xcodeproj` is required or checked in.

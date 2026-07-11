@@ -35,6 +35,7 @@ public enum NMPMeshMessageKind: UInt8, Sendable {
     case inferResponseMeta = 0x03
     case metrics           = 0x04
     case shardAck          = 0x05
+    case resourceReport    = 0x06
 }
 
 public enum NMPShardCodecError: Error, Equatable, Sendable {
@@ -350,6 +351,117 @@ public struct NMPPeerMetrics: Equatable, Sendable {
             inferenceLatencyMicros: bytes.readBigEndianUInt32(at: 5),
             memoryUsageMB: bytes.readBigEndianUInt32(at: 9),
             currentLoadPercent: bytes[13])
+    }
+}
+
+/// Mesh 2.3: a peer's own host resource sample, sent over the mesh so the
+/// coordinator's Devices panel can show REAL per-device numbers. In-process
+/// peers report the same host the coordinator sees (they share it — the
+/// hostname match is how the UI knows to say so); a physical peer (second
+/// Mac, iPhone app) reports its own kernel counters, which is the honest
+/// per-device data this message exists for.
+///
+/// kind(u8)=0x06 ‖ version(u8) ‖ peerID(u32) ‖ ramTotalMB(u32) ‖
+/// ramUsedMB(u32) ‖ processFootprintMB(u32) ‖ storageTotalMB(u32) ‖
+/// storageFreeMB(u32) ‖ cpuPercentX10(u16) ‖ gpuPercentX10(u16) ‖
+/// hostnameLen(u8) ‖ hostname(utf8)
+///
+/// cpu/gpuPercentX10 use 0xFFFF as "unavailable" (first CPU sample has no
+/// tick delta to diff; GPU counters only exist on macOS).
+public struct NMPPeerResourceReport: Equatable, Sendable {
+    public static let version: UInt8 = 1
+    private static let unavailable: UInt16 = 0xFFFF
+
+    public var peerID: UInt32
+    public var ramTotalMB: UInt32
+    public var ramUsedMB: UInt32
+    public var processFootprintMB: UInt32
+    public var storageTotalMB: UInt32
+    public var storageFreeMB: UInt32
+    /// 0...100, nil = unavailable.
+    public var cpuPercent: Double?
+    /// 0...100, nil = unavailable (non-macOS, or no GPU counters).
+    public var gpuPercent: Double?
+    public var hostname: String
+
+    public init(peerID: UInt32, ramTotalMB: UInt32, ramUsedMB: UInt32,
+                processFootprintMB: UInt32, storageTotalMB: UInt32,
+                storageFreeMB: UInt32, cpuPercent: Double?,
+                gpuPercent: Double?, hostname: String) {
+        self.peerID = peerID
+        self.ramTotalMB = ramTotalMB
+        self.ramUsedMB = ramUsedMB
+        self.processFootprintMB = processFootprintMB
+        self.storageTotalMB = storageTotalMB
+        self.storageFreeMB = storageFreeMB
+        self.cpuPercent = cpuPercent
+        self.gpuPercent = gpuPercent
+        self.hostname = hostname
+    }
+
+    public init(peerID: UInt32, sample: NMPHostResourceSample) {
+        self.init(
+            peerID: peerID,
+            ramTotalMB: UInt32(clamping: sample.ramTotalBytes / (1 << 20)),
+            ramUsedMB: UInt32(clamping: sample.ramUsedBytes / (1 << 20)),
+            processFootprintMB: UInt32(clamping: sample.processFootprintBytes / (1 << 20)),
+            storageTotalMB: UInt32(clamping: sample.storageTotalBytes / (1 << 20)),
+            storageFreeMB: UInt32(clamping: sample.storageFreeBytes / (1 << 20)),
+            cpuPercent: sample.cpuPercent,
+            gpuPercent: sample.gpuPercent,
+            hostname: sample.hostname)
+    }
+
+    private static func packPercent(_ value: Double?) -> UInt16 {
+        guard let value else { return unavailable }
+        let scaled = UInt16(clamping: Int((value * 10).rounded()))
+        return scaled == unavailable ? unavailable - 1 : scaled
+    }
+
+    private static func unpackPercent(_ raw: UInt16) -> Double? {
+        raw == unavailable ? nil : Double(raw) / 10
+    }
+
+    public func encode() -> Data {
+        var out = Data([NMPMeshMessageKind.resourceReport.rawValue, Self.version])
+        out.appendBigEndian(peerID)
+        out.appendBigEndian(ramTotalMB)
+        out.appendBigEndian(ramUsedMB)
+        out.appendBigEndian(processFootprintMB)
+        out.appendBigEndian(storageTotalMB)
+        out.appendBigEndian(storageFreeMB)
+        out.appendBigEndian(Self.packPercent(cpuPercent))
+        out.appendBigEndian(Self.packPercent(gpuPercent))
+        let name = Data(hostname.utf8.prefix(255))
+        out.append(UInt8(name.count))
+        out.append(name)
+        return out
+    }
+
+    public static func decode(_ data: Data) throws -> NMPPeerResourceReport {
+        let bytes = try requireKind(.resourceReport, data, minLength: 31)
+        guard bytes[1] == version else {
+            throw NMPShardCodecError.unsupportedVersion(bytes[1])
+        }
+        let nameLength = Int(bytes[30])
+        guard bytes.count >= 31 + nameLength else {
+            throw NMPShardCodecError.truncated(expectedAtLeast: 31 + nameLength,
+                                               got: bytes.count)
+        }
+        guard let hostname = String(data: bytes.subdata(in: 31..<31 + nameLength),
+                                    encoding: .utf8) else {
+            throw NMPShardCodecError.invalidString
+        }
+        return NMPPeerResourceReport(
+            peerID: bytes.readBigEndianUInt32(at: 2),
+            ramTotalMB: bytes.readBigEndianUInt32(at: 6),
+            ramUsedMB: bytes.readBigEndianUInt32(at: 10),
+            processFootprintMB: bytes.readBigEndianUInt32(at: 14),
+            storageTotalMB: bytes.readBigEndianUInt32(at: 18),
+            storageFreeMB: bytes.readBigEndianUInt32(at: 22),
+            cpuPercent: unpackPercent(bytes.readBigEndianUInt16(at: 26)),
+            gpuPercent: unpackPercent(bytes.readBigEndianUInt16(at: 28)),
+            hostname: hostname)
     }
 }
 

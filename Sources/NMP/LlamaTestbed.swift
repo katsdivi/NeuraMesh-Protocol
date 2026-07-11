@@ -45,6 +45,12 @@ public final class NMPLlamaTestbed {
     /// Fires after the peer serves each request (remotePeer only).
     public var onInferenceServed: ((UInt32, Range<Int>, TimeInterval) -> Void)?
 
+    /// Mesh 2.3: coordinator-side wire totals for the link to the shard
+    /// peer (nil when .local — there is no link). sent = toward the peer.
+    public var wireTraffic: (sentBytes: UInt64, receivedBytes: UInt64)? {
+        coordinatorSide?.trafficTotals
+    }
+
     private let engine: NMPShardComputeEngine
     private let orchestratorQueue = DispatchQueue(label: "nmp.llama.testbed")
 

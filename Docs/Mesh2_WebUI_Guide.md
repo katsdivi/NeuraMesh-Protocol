@@ -313,6 +313,42 @@ both now fixed and pinned by 5 consecutive clean 306-test runs):
   long-standing `testSecondStartupUsesCachedProfileWithoutProbing`
   flake). Assembly now settles membership via `waitForMembership()`.
 
+### 5.7 Mesh 2.3 — full per-device cards (throughput, serves, resources)
+
+The Devices tab now renders one full card per mesh device, everything
+measured, with the measurement point labeled:
+
+- **Network ↓/↑ per device**: `PeerConnection` counts every datagram it
+  puts on / takes off the wire (handshake, NACKs, FEC parity and
+  retransmits included — this is what actually crossed the link). The
+  metrics handler diffs totals between polls into live bytes/sec, plus
+  cumulative MB since startup. The coordinator's own shard says "local —
+  no network hop" instead of pretending a loopback rate is a network.
+- **Computing per device**: requests actually served (counted by the
+  peer-side shard engine, not inferred), last stage compute ms, seconds
+  since last active — `computing` is now "served within 1.5 s", a real
+  activity signal instead of "is in the plan".
+- **Peer-reported resources**: every shard peer ships its own kernel
+  counters over the mesh (`NMPPeerResourceReport`, mesh message kind
+  0x06 — once on SHARD_ASSIGN, then at most every 2 s alongside
+  metrics). A **physical** peer (`swift run nmp-peer` on a second Mac,
+  the iPhone app) reports its own RAM/CPU/GPU/storage and gets real bars
+  of its own. An **in-process** peer reports this same host — the
+  hostname match is how the UI knows to say "shares the Mac's hardware"
+  instead of drawing four identical bars and calling them four devices.
+- **Host GPU%**: whole-machine utilization from the accelerator driver's
+  own counter (IOAccelerator `PerformanceStatistics` → "Device
+  Utilization %" — what Activity Monitor's GPU history reads). The
+  reference engine computes on CPU, so expect it to move under llama.cpp
+  (Metal), not under the testbed mesh. There is no public per-process
+  GPU split — the bar says "whole machine" because that is what it is.
+- **Mesh totals**: devices alive, layers assigned, live wire throughput
+  summed across links, total shard computations served.
+
+Verified live: 4-peer reference mesh under heartbeat load shows
+~13 KB/s each way per link, serve counters climbing in lockstep, and
+the 40%-share re-shard still visible on every open browser.
+
 ## 6. Web endpoint verification (from scratch)
 
 ```bash
@@ -337,5 +373,12 @@ curl -s -X POST http://<hostname>.local:3000/api/devices/2/allocate \
     -d '{"share":0.5}'          # reference mesh: watch the re-shard
 ```
 
-Full suite: **306 tests, 0 failures** (291 Mesh 2.0 + 15 new), verified
-over 5 consecutive runs.
+```bash
+swift test --filter "PeerResourceReportTests|WireTrafficTests|PeerResourceReportFlowTests|GPUSamplingTests"
+# 10 Mesh 2.3 tests: resource-report codec (incl. nil sentinels), wire
+# counters byte-exact across a lossless link, reports flowing on
+# assignment + while serving, GPU sampler bounds.
+```
+
+Full suite: **316 tests, 0 failures** (291 Mesh 2.0 + 15 Mesh 2.1 + 10
+Mesh 2.3), verified over 5 consecutive runs.

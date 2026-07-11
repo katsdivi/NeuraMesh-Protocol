@@ -24,6 +24,9 @@
 //
 
 import Foundation
+#if canImport(IOKit)
+import IOKit
+#endif
 
 /// One point-in-time reading of this host's resources.
 public struct NMPHostResourceSample: Sendable {
@@ -46,6 +49,14 @@ public struct NMPHostResourceSample: Sendable {
     /// Host CPU utilization 0...100 across all cores; nil on the first
     /// sample (tick deltas need two readings).
     public let cpuPercent: Double?
+    /// GPU utilization 0...100, whole machine, straight from the
+    /// accelerator driver's own counter ("Device Utilization %" in the
+    /// IOAccelerator performance statistics). nil where the counter does
+    /// not exist (non-macOS, or a driver that does not publish it).
+    /// NOTE: whole-GPU — there is no public per-process split; the
+    /// reference engine is pure CPU, so expect this to move only under a
+    /// Metal workload (llama.cpp) or other GPU use on the machine.
+    public let gpuPercent: Double?
     public let sampledAt: Date
 
     public var ramUsedPercent: Double {
@@ -75,6 +86,9 @@ public struct NMPHostResourceSample: Sendable {
         if let cpuPercent {
             object["cpu_percent"] = (cpuPercent * 10).rounded() / 10
         }
+        if let gpuPercent {
+            object["gpu_percent"] = (gpuPercent * 10).rounded() / 10
+        }
         return object
     }
 }
@@ -99,6 +113,7 @@ public final class NMPResourceMonitor {
             storageTotalBytes: Self.storage().total,
             storageFreeBytes: Self.storage().free,
             cpuPercent: cpuPercentLocked(),
+            gpuPercent: Self.gpuUtilizationPercent(),
             sampledAt: Date())
     }
 
@@ -151,6 +166,43 @@ public final class NMPResourceMonitor {
         // f_bavail: blocks available to non-root — what a user can use.
         return (total: UInt64(fs.f_blocks) * blockSize,
                 free: UInt64(fs.f_bavail) * blockSize)
+    }
+
+    // MARK: GPU (macOS: the accelerator driver's own utilization counter)
+
+    /// "Device Utilization %" from the IOAccelerator registry entry's
+    /// PerformanceStatistics — the same counter Activity Monitor's GPU
+    /// history reads. Whole-machine; max across accelerators on the odd
+    /// multi-GPU Mac. nil off macOS or if the driver omits the key.
+    static func gpuUtilizationPercent() -> Double? {
+        #if canImport(IOKit) && os(macOS)
+        var iterator = io_iterator_t()
+        guard IOServiceGetMatchingServices(
+            kIOMainPortDefault,
+            IOServiceMatching("IOAccelerator"),
+            &iterator) == KERN_SUCCESS else { return nil }
+        defer { IOObjectRelease(iterator) }
+
+        var utilization: Double?
+        while true {
+            let entry = IOIteratorNext(iterator)
+            guard entry != 0 else { break }
+            defer { IOObjectRelease(entry) }
+            var propertiesRef: Unmanaged<CFMutableDictionary>?
+            guard IORegistryEntryCreateCFProperties(
+                entry, &propertiesRef, kCFAllocatorDefault, 0) == KERN_SUCCESS,
+                let properties = propertiesRef?.takeRetainedValue() as? [String: Any],
+                let statistics = properties["PerformanceStatistics"] as? [String: Any]
+            else { continue }
+            if let value = statistics["Device Utilization %"] as? NSNumber {
+                utilization = Swift.max(utilization ?? 0,
+                                        Swift.min(100, Swift.max(0, value.doubleValue)))
+            }
+        }
+        return utilization
+        #else
+        return nil
+        #endif
     }
 
     // MARK: CPU (host-wide tick deltas; caller holds `lock`)
