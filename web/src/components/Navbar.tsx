@@ -1,10 +1,17 @@
 import type { MeshHealth } from '../api';
 
-export type View = 'dashboard' | 'run' | 'benchmark' | 'compare' | 'settings';
+export type View =
+  | 'dashboard'
+  | 'run'
+  | 'devices'
+  | 'benchmark'
+  | 'compare'
+  | 'settings';
 
 const TABS: { id: View; label: string }[] = [
   { id: 'dashboard', label: 'Mesh' },
   { id: 'run', label: 'Run' },
+  { id: 'devices', label: 'Devices' },
   { id: 'benchmark', label: 'Benchmark' },
   { id: 'compare', label: 'Compare' },
   { id: 'settings', label: 'Settings' },

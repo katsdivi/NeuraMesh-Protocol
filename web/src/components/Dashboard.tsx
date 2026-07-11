@@ -38,6 +38,11 @@ export function Dashboard({
           <div className="metric-sub">wire: {mesh?.wire_format ?? '—'}</div>
         </div>
         <div className="metric-card">
+          <div className="metric-label">Web Clients</div>
+          <div className="metric-value">{mesh?.web_clients ?? '—'}</div>
+          <div className="metric-sub">browsers on this UI</div>
+        </div>
+        <div className="metric-card">
           <div className="metric-label">Status</div>
           <div className={`metric-value ${reachable ? 'online' : 'offline'}`}>
             {reachable ? '✓ Online' : '✗ Offline'}

@@ -149,6 +149,56 @@ func wireBenchmark(server: NMPDashboardServer,
     }
 }
 
+/// Mesh 2.1: one host resource monitor for /api/devices/metrics. Primed
+/// immediately so the first poll already has a CPU tick baseline.
+let resourceMonitor = NMPResourceMonitor()
+_ = resourceMonitor.sample()
+
+/// Mesh 2.1: POST /api/comparison/run — one real generation, then the
+/// transport race replaying its traffic pattern (round trips × payload)
+/// over real loopback sockets: full NMP stack vs plain kernel TCP.
+func wireComparisonRun(server: NMPDashboardServer,
+                       run: @escaping (NMPDashboardServer.InferenceRequest,
+                           @escaping (Result<NMPPromptInferenceService.GenerationResult,
+                                             NMPPromptInferenceService.ServiceError>) -> Void) -> Void) {
+    server.onComparisonRunRequest = { request, respond in
+        server.reportMeshEvent("🏁 protocol race: generation, then measured "
+                               + "NMP vs TCP transport replay")
+        run(request) { result in
+            switch result {
+            case .failure(let error):
+                respond(.failure(.init("generation failed: \(error)")))
+            case .success(let generation):
+                let trips = generation.speculation?.meshRoundTrips
+                    ?? generation.perTokenSeconds.count
+                guard generation.networkPayloadBytes >= 2, trips >= 1 else {
+                    respond(.failure(.init(
+                        "this run moved no mesh traffic (local placement?) — "
+                            + "nothing to race")))
+                    return
+                }
+                NMPTransportRace.run(plan: .init(
+                    roundTrips: trips,
+                    payloadBytes: generation.networkPayloadBytes)) { raceResult in
+                    switch raceResult {
+                    case .success(let race):
+                        server.reportMeshEvent(String(
+                            format: "🏁 race done over %d trip(s) × %d B: "
+                                + "NMP %.1f ms (handshake %.2f) vs TCP %.1f ms "
+                                + "(handshake %.2f) — both measured",
+                            trips, generation.networkPayloadBytes,
+                            race.nmp.totalMs, race.nmp.handshakeMs,
+                            race.tcp.totalMs, race.tcp.handshakeMs))
+                        respond(.success(.init(generation: generation, race: race)))
+                    case .failure(let error):
+                        respond(.failure(.init("transport race failed: \(error)")))
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Serves Public/, registers the Bonjour advert, prints the banner.
 func activateWebUI(server: NMPDashboardServer, meshSummary: [String]) {
     if let publicDirectory = locatePublicDirectory() {
@@ -319,9 +369,37 @@ func runLlamaDashboard(model: NMPLlamaModel, arguments: DashboardArguments) -> N
     promptService.onProgress = reportProgress
     speculativeService?.onProgress = reportProgress
 
+    // Mesh 2.1: stream every confirmed token to every open browser.
+    let streamToken: (NMPGeneratedToken, Int, Int) -> Void = { token, count, requested in
+        server.reportGenerationToken(text: token.text, index: token.index,
+                                     count: count, requested: requested)
+    }
+    promptService.onToken = streamToken
+    speculativeService?.onToken = streamToken
+
+    // Mesh 2.1: in-flight flag for /api/devices/metrics.
+    let llamaStateQueue = DispatchQueue(label: "nmp.dashboard.llama.state")
+    var llamaGenerationRunning = false
+    var llamaLastServedAt: Date?
+    testbed.onInferenceServed = { [existing = testbed.onInferenceServed] id, layers, seconds in
+        llamaStateQueue.async { llamaLastServedAt = Date() }
+        existing?(id, layers, seconds)
+    }
+
     server.onInferenceRequest = { request, respond in
+        llamaStateQueue.async { llamaGenerationRunning = true }
+        server.reportGenerationStarted(
+            prompt: request.prompt, maxTokens: request.maxTokens,
+            speculative: (request.enableSpeculation || dashboardArguments.speculation)
+                && speculativeService != nil)
         let handleResult: (Result<NMPPromptInferenceService.GenerationResult,
                                   NMPPromptInferenceService.ServiceError>) -> Void = { result in
+            llamaStateQueue.async { llamaGenerationRunning = false }
+            if case .success(let generation) = result {
+                server.reportGenerationComplete(generation)
+            } else if case .failure(let error) = result {
+                server.reportGenerationFailed(String(describing: error))
+            }
             switch result {
             case .success(let generation):
                 var summary = String(
@@ -388,6 +466,73 @@ func runLlamaDashboard(model: NMPLlamaModel, arguments: DashboardArguments) -> N
             promptService.run(prompt: prompt, maxTokens: maxTokens,
                               completion: completion)
         }
+    }
+
+    // Mesh 2.1: measured protocol race (generation + transport replay).
+    wireComparisonRun(server: server) { request, completion in
+        if request.enableSpeculation || dashboardArguments.speculation,
+           let speculativeService {
+            speculativeService.run(prompt: request.prompt,
+                                   maxTokens: request.maxTokens,
+                                   completion: completion)
+        } else {
+            promptService.run(prompt: request.prompt,
+                              maxTokens: request.maxTokens,
+                              completion: completion)
+        }
+    }
+
+    // Mesh 2.1: live device metrics. Both mesh members are in-process,
+    // so they genuinely share this host — the payload says so instead of
+    // inventing per-peer hardware.
+    server.onDeviceMetricsRequest = { respond in
+        llamaStateQueue.async {
+            let sample = resourceMonitor.sample()
+            let computingNow = llamaGenerationRunning
+                || (llamaLastServedAt.map { Date().timeIntervalSince($0) < 1.0 } ?? false)
+            var peers: [[String: Any]] = [
+                [
+                    "id": String(testbed.coordinatorID, radix: 16),
+                    "name": "coordinator (tokenizer)",
+                    "alive": true,
+                    "assigned": placement == .local
+                        ? "layers 0-\(engine.layerCount - 1)" : "tokenizer only",
+                    "compute_share": 1.0,
+                    "computing": computingNow && placement == .local,
+                ],
+            ]
+            if placement == .remotePeer {
+                peers.append([
+                    "id": String(testbed.peerID, radix: 16),
+                    "name": "llama-peer (in-process)",
+                    "alive": true,
+                    "assigned": "layers 0-\(engine.layerCount - 1)",
+                    "compute_share": 1.0,
+                    "computing": computingNow,
+                ])
+            }
+            respond([
+                "host": sample.asJSONObject,
+                "host_note": "all mesh peers run in-process — these are "
+                    + "genuinely this machine's live kernel counters "
+                    + "(watch process_footprint_mb during a generation)",
+                "generation_in_flight": llamaGenerationRunning,
+                "allocation_supported": false,
+                "allocation_note": "a llama plan is one full-range shard "
+                    + "(llama.cpp cannot split layers), so there is nothing "
+                    + "to re-balance — compute shares apply to the "
+                    + "reference mesh",
+                "peers": peers,
+            ])
+        }
+    }
+
+    server.onAllocationRequest = { _, _, respond in
+        respond(.failure(.init(
+            "allocation needs a multi-shard mesh — a llama plan is one "
+                + "full-range shard by construction (llama.cpp cannot run "
+                + "layer sub-ranges); run the reference mesh to see "
+                + "allocation re-shard live")))
     }
 
     if dashboardArguments.ui {
@@ -587,12 +732,25 @@ promptService.onProgress = { done, total in
         progress: Double(done) / Double(max(total, 1)),
         stage: "API generation: token \(done)/\(total)")
 }
+// Mesh 2.1: stream every generated token to every open browser.
+promptService.onToken = { token, count, requested in
+    server.reportGenerationToken(text: token.text, index: token.index,
+                                 count: count, requested: requested)
+}
 
 server.onInferenceRequest = { request, respond in
     stateQueue.async { apiInferenceRunning = true }
     server.reportMeshEvent("🌐 API inference: up to \(request.maxTokens) token(s)")
+    server.reportGenerationStarted(prompt: request.prompt,
+                                   maxTokens: request.maxTokens,
+                                   speculative: false)
     promptService.run(prompt: request.prompt, maxTokens: request.maxTokens) { result in
         stateQueue.async { apiInferenceRunning = false }
+        if case .success(let generation) = result {
+            server.reportGenerationComplete(generation)
+        } else if case .failure(let error) = result {
+            server.reportGenerationFailed(String(describing: error))
+        }
         switch result {
         case .success(let generation):
             server.reportMeshEvent(String(
@@ -628,6 +786,99 @@ wireBenchmark(server: server) { prompt, maxTokens, completion in
     promptService.run(prompt: prompt, maxTokens: maxTokens) { result in
         stateQueue.async { apiInferenceRunning = false }
         completion(result)
+    }
+}
+
+// Mesh 2.1: measured protocol race. The heartbeat pauses for the whole
+// run (generation + race) so its passes pollute neither measurement.
+wireComparisonRun(server: server) { request, completion in
+    stateQueue.async { apiInferenceRunning = true }
+    promptService.run(prompt: request.prompt,
+                      maxTokens: request.maxTokens) { result in
+        // Heartbeat resumes when the API reply goes out; the race itself
+        // is loopback-only but keeping the mesh quiet keeps timings clean.
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) {
+            stateQueue.async { apiInferenceRunning = false }
+        }
+        completion(result)
+    }
+}
+
+// Mesh 2.1: live device metrics — host kernel counters plus per-peer
+// mesh facts (assignment, measured speed, compute share, liveness).
+server.onDeviceMetricsRequest = { respond in
+    stateQueue.async {
+        let sample = resourceMonitor.sample()
+        let shares = testbed.orchestrator.computeShares
+        let measured = testbed.orchestrator.measuredSecondsPerLayer
+        let inFlight = apiInferenceRunning || benchmarkRunning
+        let alivePeerIDs = Set(testbed.failover.activePeers.map(\.peerID))
+        let planned = Dictionary(uniqueKeysWithValues:
+            testbed.failover.activePlan.map { ($0.peerID, $0) })
+
+        let peers = testbed.failover.activePeers.map { caps -> [String: Any] in
+            let entry = planned[caps.peerID]
+            var peer: [String: Any] = [
+                "id": String(caps.peerID, radix: 16),
+                "name": caps.deviceName,
+                "alive": alivePeerIDs.contains(caps.peerID),
+                "assigned": entry.map {
+                    "layers \($0.startLayer)-\($0.endLayer - 1)"
+                } ?? "—",
+                "layer_span": entry?.layerSpan ?? 0,
+                "compute_share": shares[caps.peerID] ?? 1.0,
+                // The dashboard heartbeat keeps the mesh under continuous
+                // load, so "computing" = in the plan while a pass runs.
+                "computing": entry != nil,
+                "load_percent": Int(latestMetrics[caps.peerID]?.currentLoadPercent ?? 0),
+            ]
+            if let rate = measured[caps.peerID] {
+                peer["measured_ms_per_layer"] = (rate * 1000 * 100).rounded() / 100
+            }
+            return peer
+        }
+        respond([
+            "host": sample.asJSONObject,
+            "host_note": "all mesh peers run in-process — these are "
+                + "genuinely this machine's live kernel counters",
+            "generation_in_flight": inFlight,
+            "allocation_supported": true,
+            "allocation_note": "compute share re-plans the mesh: a device "
+                + "at 50% is planned as half as fast and receives "
+                + "proportionally fewer layers — watch 'assigned' change",
+            "peers": peers,
+        ])
+    }
+}
+
+// Mesh 2.1: the allocation slider. Sets the peer's compute share, then
+// re-shards the live mesh through the normal SHARD_ASSIGN round — the
+// layer spans that come back are the proof the allocation took effect.
+server.onAllocationRequest = { peerID, share, respond in
+    guard testbed.failover.activePeers.contains(where: { $0.peerID == peerID }) else {
+        respond(.failure(.init(
+            "unknown peer 0x\(String(peerID, radix: 16)) — see GET /api/devices")))
+        return
+    }
+    testbed.orchestrator.setComputeShare(share, forPeer: peerID)
+    server.reportMeshEvent(String(
+        format: "⚖️ compute share for 0x%@ → %.0f%% — re-sharding…",
+        String(peerID, radix: 16), share * 100))
+    testbed.failover.replan(reason: "compute share change") { result in
+        switch result {
+        case .failure(let error):
+            respond(.failure(.init("re-plan failed: \(error)")))
+        case .success(let plan):
+            let names = Dictionary(uniqueKeysWithValues:
+                testbed.failover.activePeers.map { ($0.peerID, $0.deviceName) })
+            let summary = plan.map {
+                "\(names[$0.peerID] ?? "0x" + String($0.peerID, radix: 16)): "
+                    + "L\($0.startLayer)-\($0.endLayer - 1)"
+            }.joined(separator: ", ")
+            server.reportMeshEvent("⚖️ re-sharded: \(summary)")
+            pushPeerStates()
+            respond(.success(summary))
+        }
     }
 }
 

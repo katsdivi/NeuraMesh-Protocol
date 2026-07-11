@@ -128,6 +128,13 @@ public final class NMPMeshTestbed {
             let peer = try makeConnectedPeer(timeout: handshakeTimeout)
             failover.registerPeer(peer.capabilities, connection: peer.coordinatorSide)
         }
+        // registerPeer is async on the failover queue; callers reading
+        // activePeers right after init (the adaptive controller does)
+        // must see the full mesh, not however many registrations had
+        // drained. This was a real intermittent bug: under load the
+        // controller saw a partial mesh, decided the profile cache was
+        // incomplete, and probed when it should not have.
+        failover.waitForMembership()
     }
 
     private static func capabilities(peerID: UInt32) -> NMPCapabilities {

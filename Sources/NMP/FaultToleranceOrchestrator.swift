@@ -51,10 +51,34 @@ public final class NMPFailoverOrchestrator {
 
     // MARK: State
 
-    /// Capabilities of every mesh member still considered alive.
-    public private(set) var activePeers: [NMPCapabilities]
-    /// The plan currently assigned across `activePeers`.
-    public private(set) var activePlan: [NMPShardPlanEntry] = []
+    /// Capabilities of every mesh member still considered alive. Mutated
+    /// only on `queue`; the lock makes cross-queue READS safe — the
+    /// Phase 9 adaptive controller, the dashboard CLI, and the Mesh 2.1
+    /// device panel all read membership from their own queues, and an
+    /// unlocked Array read racing a removeAll/append is a real crash
+    /// (seen as index-out-of-range inside Collection.map).
+    public var activePeers: [NMPCapabilities] {
+        membershipLock.lock()
+        defer { membershipLock.unlock() }
+        return storedActivePeers
+    }
+    /// The plan currently assigned across `activePeers`. Same locking
+    /// story as `activePeers`.
+    public var activePlan: [NMPShardPlanEntry] {
+        membershipLock.lock()
+        defer { membershipLock.unlock() }
+        return storedActivePlan
+    }
+    private var storedActivePeers: [NMPCapabilities]
+    private var storedActivePlan: [NMPShardPlanEntry] = []
+    private let membershipLock = NSLock()
+
+    private func mutateMembership(_ body: (inout [NMPCapabilities],
+                                           inout [NMPShardPlanEntry]) -> Void) {
+        membershipLock.lock()
+        defer { membershipLock.unlock() }
+        body(&storedActivePeers, &storedActivePlan)
+    }
     /// Wall-clock seconds the most recent re-shard took (nil before any).
     public private(set) var lastReshardSeconds: TimeInterval?
 
@@ -83,7 +107,7 @@ public final class NMPFailoverOrchestrator {
         self.orchestrator = orchestrator
         self.layerCount = layerCount
         self.localPeerID = localPeerID
-        self.activePeers = peers
+        self.storedActivePeers = peers
         self.healthMonitor = healthMonitor
         self.queue = queue
 
@@ -106,10 +130,24 @@ public final class NMPFailoverOrchestrator {
     public func registerPeer(_ capabilities: NMPCapabilities, connection: PeerConnection) {
         queue.async { [self] in
             orchestrator.attachPeer(peerID: capabilities.peerID, connection: connection)
-            activePeers.removeAll { $0.peerID == capabilities.peerID }
-            activePeers.append(capabilities)
+            mutateMembership { peers, _ in
+                peers.removeAll { $0.peerID == capabilities.peerID }
+                peers.append(capabilities)
+            }
             healthMonitor.track(peerID: capabilities.peerID)
         }
+    }
+
+    /// Blocks until membership operations enqueued so far (registerPeer)
+    /// have been applied. Mesh-assembly helper: `registerPeer` is async
+    /// on `queue`, so code that registers peers and then immediately
+    /// reads `activePeers` from ANOTHER queue (the Phase 9 adaptive
+    /// controller, testbeds) would otherwise race the registration and
+    /// see a partial mesh. Never call from `queue` itself.
+    public func waitForMembership(timeout: TimeInterval = 5) {
+        let settled = DispatchSemaphore(value: 0)
+        queue.async { settled.signal() }
+        _ = settled.wait(timeout: .now() + timeout)
     }
 
     // MARK: Initial plan
@@ -121,6 +159,25 @@ public final class NMPFailoverOrchestrator {
     ) {
         queue.async { [self] in
             reshard(reason: "initial plan", timeout: timeout, completion: completion)
+        }
+    }
+
+    /// Mesh 2.1: re-plans over the CURRENT membership and re-assigns —
+    /// how the Devices panel applies a changed compute share without a
+    /// membership event. Same machinery as failover's re-shard (one
+    /// normal SHARD_ASSIGN round); safe alongside live traffic exactly
+    /// as failover re-shards are.
+    public func replan(
+        reason: String = "allocation change",
+        timeout: TimeInterval = 10,
+        completion: @escaping (Result<[NMPShardPlanEntry], NMPFailoverError>) -> Void
+    ) {
+        queue.async { [self] in
+            guard !failoverInProgress else {
+                completion(.failure(.failoverInProgress))
+                return
+            }
+            reshard(reason: reason, timeout: timeout, completion: completion)
         }
     }
 
@@ -146,7 +203,9 @@ public final class NMPFailoverOrchestrator {
 
             onDiagnostic?("peer \(hex(deadPeerID)) lost, re-sharding across "
                           + "\(activePeers.count - 1) survivor(s)")
-            activePeers.removeAll { $0.peerID == deadPeerID }
+            mutateMembership { peers, _ in
+                peers.removeAll { $0.peerID == deadPeerID }
+            }
             healthMonitor.forget(peerID: deadPeerID)
             // Detach fails anything in flight toward the dead peer and stops
             // routing its stale packets into the orchestrator.
@@ -177,8 +236,10 @@ public final class NMPFailoverOrchestrator {
                 return
             }
             orchestrator.attachPeer(peerID: capabilities.peerID, connection: connection)
-            activePeers.removeAll { $0.peerID == capabilities.peerID }
-            activePeers.append(capabilities)
+            mutateMembership { peers, _ in
+                peers.removeAll { $0.peerID == capabilities.peerID }
+                peers.append(capabilities)
+            }
             healthMonitor.track(peerID: capabilities.peerID)
             reshard(reason: "peer \(hex(capabilities.peerID)) joined",
                     timeout: timeout, completion: completion)
@@ -234,7 +295,8 @@ public final class NMPFailoverOrchestrator {
         let newPlan = NMPModelSharder.plan(
             layerCount: layerCount,
             peers: activePeers,
-            measuredSecondsPerLayer: orchestrator.measuredSecondsPerLayer)
+            measuredSecondsPerLayer: orchestrator.measuredSecondsPerLayer,
+            computeShares: orchestrator.computeShares)
         guard !newPlan.isEmpty else {
             onAllPeersDead?()
             completion(.failure(.allPeersDead))
@@ -254,7 +316,7 @@ public final class NMPFailoverOrchestrator {
                 case .success:
                     let seconds = TimeInterval(
                         DispatchTime.now().uptimeNanoseconds - began.uptimeNanoseconds) / 1e9
-                    self.activePlan = newPlan
+                    self.mutateMembership { _, plan in plan = newPlan }
                     self.lastReshardSeconds = seconds
                     self.onDiagnostic?("re-shard (\(reason)): \(newPlan.count) shard(s) in "
                                        + String(format: "%.1f ms", seconds * 1000))

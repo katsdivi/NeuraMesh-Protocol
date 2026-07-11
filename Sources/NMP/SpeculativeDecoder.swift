@@ -194,6 +194,11 @@ public final class NMPSpeculativeGenerationService {
     /// Fires after every accepted token: (tokensDone, tokensRequested).
     public var onProgress: ((Int, Int) -> Void)?
 
+    /// Mesh 2.1: fires with each CONFIRMED token (pending or accepted
+    /// draft) — same contract as NMPPromptInferenceService.onToken, so
+    /// the dashboard streams speculative and plain runs identically.
+    public var onToken: ((NMPGeneratedToken, Int, Int) -> Void)?
+
     public static let maxTokensPerRequest = NMPPromptInferenceService.maxTokensPerRequest
     /// Recommended default (Part G answer #1).
     public static let defaultDepth = 4
@@ -409,7 +414,9 @@ public final class NMPSpeculativeGenerationService {
         if model.isEndOfGeneration(token) { return false }
         let text = (try? model.pieceBytes(for: token))
             .map { String(decoding: $0, as: UTF8.self) } ?? ""
-        state.tokens.append(NMPGeneratedToken(index: Int(token), text: text))
+        let generated = NMPGeneratedToken(index: Int(token), text: text)
+        state.tokens.append(generated)
+        onToken?(generated, state.tokens.count, state.requested)
         onProgress?(state.tokens.count, state.requested)
         return true
     }

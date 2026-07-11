@@ -18,11 +18,13 @@ only the tokenizer, weights on the peer, every token one real mesh round trip; s
 `Docs/Phase8_Design.md`)**, and **the fast mesh (Phase 9: benchmark-driven adaptive
 layer sharding with persisted device profiles, zero-trim + mixed-precision activation
 wire formats, pipeline-parallel batch execution, draft/verify speculative decoding,
-one-command auto-configuration; see `Docs/Phase9_Design.md`)**, plus **Mesh 2.0
+one-command auto-configuration; see `Docs/Phase9_Design.md`)**, plus **Mesh 2.0/2.1
 (browser UI served by the coordinator itself — same live interface on every device
-on the Wi-Fi, honest measured-vs-modeled protocol comparison, benchmarking center,
-QR/Bonjour discovery; see `Docs/Mesh2_WebUI_Guide.md`)**.
-**291 tests pass, 0 failures.**
+on the Wi-Fi, real-time token streaming to every open browser, ACTUALLY-measured
+NMP-vs-TCP transport race, live device resource panel with compute-share sliders
+that re-shard the mesh, web-client tracking, benchmarking center, QR/Bonjour
+discovery; see `Docs/Mesh2_WebUI_Guide.md`)**.
+**306 tests pass, 0 failures.**
 
 ## Requirements
 
@@ -34,7 +36,7 @@ QR/Bonjour discovery; see `Docs/Mesh2_WebUI_Guide.md`)**.
 ```bash
 cd NeuraMeshProtocol
 swift build
-swift test                             # 291 unit + loopback integration tests
+swift test                             # 306 unit + loopback integration tests
 
 swift run nmp-peer                     # compute peer (cross-device mesh)
 swift run nmp-coordinator              # coordinator + cross-device benchmark
@@ -88,7 +90,7 @@ the wire format. Speculative output is token-for-token identical to plain
 greedy output — drafts only ever save round trips, never change text.
 Guide + measured results: `Docs/Phase9_Design.md`.
 
-### Mesh 2.0: multi-device web UI
+### Mesh 2.0/2.1: multi-device web UI, live streaming, measured race
 
 ```bash
 swift run nmp-dashboard --ui           # browser UI on port 3000, all interfaces
@@ -100,11 +102,29 @@ The coordinator itself serves a React UI (prebuilt in `Public/` — npm only
 needed to edit `web/`). The startup banner prints your Mac's real
 `<hostname>.local:3000`, its LAN IPs, and a QR code; open it from Mac,
 iPhone, iPad simultaneously — every tab shows the same live mesh. Views:
-mesh dashboard, inference runner (speculation toggle, protocol comparison
-attached to the real run), benchmark center, protocol what-if explorer,
-chaos slider. The comparison is honest: the NMP row is the measured run;
-TCP/QUIC rows are that run re-priced with clearly-labeled modeled costs.
+mesh dashboard, inference runner (speculation toggle, protocol comparison),
+device panel, benchmark center, protocol comparison, chaos slider.
 Trusted LAN only (no TLS/auth). Setup guide: `Docs/Mesh2_WebUI_Guide.md`.
+
+Mesh 2.1 adds, on the same stack:
+
+- **Real-time streaming** — every confirmed token is broadcast over the
+  existing WebSocket as it is generated; a run submitted from the laptop
+  appears token-by-token on the phone (and vice versa), with identical
+  final metrics everywhere.
+- **A measured transport race** (`POST /api/comparison/run`) — runs a real
+  generation, then replays its exact traffic pattern over real loopback
+  sockets: the full NMP stack (Noise IK + AES-256-GCM + FEC over UDP) vs
+  plain kernel TCP. Both legs are wall-clock measurements; QUIC stays in
+  the clearly-labeled model (it needs a TLS identity to race honestly).
+- **Device panel** (`GET /api/devices/metrics`) — live kernel counters
+  (RAM, storage, CPU, this process's footprint) plus per-peer mesh facts,
+  and a **compute-share slider** (`POST /api/devices/:id/allocate`) that
+  actually re-shards the live mesh: cap a device at 40% and watch its
+  layer span shrink on every open browser. Reference mesh only — a llama
+  plan is one full-range shard, and the API says so.
+- **Web-client tracking** — `/health` reports `web_clients`; the phone
+  shows up the moment it opens the page (`GET /api/clients` lists them).
 
 Or open the folder directly in Xcode (`File > Open…`) — SwiftPM packages open natively;
 no `.xcodeproj` is required or checked in. Cross-device setup (Mac coordinator +
@@ -153,7 +173,9 @@ iPhone peer): see `Docs/CrossDevice_Setup_Guide.md`.
 | `SpeculativeDecoder.swift` | Phase 9: draft/verify speculative decoding — prompt-lookup + draft-model drafters |
 | `AutoConfig.swift` | Phase 9: one-command setup — membership → benchmark → balance → wire format |
 | `WebUI.swift` | Mesh 2.0: protocol comparison model (measured NMP + modeled TCP/QUIC), LAN identity, Bonjour advert, CoreImage QR banner |
-| `web/` → `Public/` | Mesh 2.0: React UI source → committed build the coordinator serves (`--ui`) |
+| `TransportRace.swift` | Mesh 2.1: MEASURED protocol race — a run's traffic pattern replayed over the real NMP UDP stack vs plain kernel TCP |
+| `ResourceMonitor.swift` | Mesh 2.1: live host resource sampling (Mach/BSD kernel counters) for the device panel |
+| `web/` → `Public/` | Mesh 2.0/2.1: React UI source → committed build the coordinator serves (`--ui`) |
 
 ## Success Criteria
 
@@ -233,6 +255,16 @@ Mesh 2.0 (validated 2026-07-10, Apple M3):
 - [x] TinyLlama-1.1B draft model measured on Llama-2-7B: natural-text acceptance 0% (prompt-lookup) → **54–72%**, round trips 32 → **10–12**, payload → ~1.4 KB, output identical; wall clock loses in-process (shared GPU) and is documented as a physical-mesh win
 - [x] Zero-dependency rule intact: no Vapor — the NWListener server grew the routes; QR via CoreImage; React toolchain isolated in `web/` with its build committed
 - [x] 0 regressions: **291 tests pass** (19 new: comparison model math, routes, CORS, SPA fallback + traversal, benchmark σ, banner + QR)
+
+Mesh 2.1 (validated 2026-07-11, Apple M3):
+
+- [x] Real-time streaming: every confirmed token broadcast over `/ws` as generated (`generation_started/token/complete/failed`); verified end-to-end — a spectator WebSocket client receives the full token stream of a run submitted over HTTP by another client, final text identical
+- [x] Measured transport race (`POST /api/comparison/run`): real generation + its traffic pattern replayed over real loopback sockets — full NMP stack (Noise IK + AES-256-GCM + FEC over UDP, chunked like mesh traffic) vs plain kernel TCP; every number wall-clock, zero modeled fields; llama zero-trim run measured at ~0.5 ms total NMP-vs-raw-TCP overhead for full encryption
+- [x] Device panel: `GET /api/devices/metrics` serves live kernel counters (host_statistics64 RAM, statfs storage, CPU tick deltas, task_info process footprint) + per-peer plan/speed/share facts; honest about in-process peers sharing the host
+- [x] Compute-share allocation actually allocates: `POST /api/devices/:id/allocate {"share":0.4}` re-plans through the normal SHARD_ASSIGN round — verified live: the capped peer's span shrank 6 → 3 layers, every browser sees the new plan + `allocation_update` push
+- [x] Web-client tracking: `/health.web_clients` + `GET /api/clients` — a phone opening the page appears immediately (WebSocket) and ages out 15 s after leaving
+- [x] Two pre-existing races found and fixed: unlocked `activePeers`/`activePlan` reads crashing under load (now lock-protected), and async `registerPeer` racing the adaptive controller's membership read (now settled via `waitForMembership`)
+- [x] 0 regressions: **306 tests pass, verified over 5 consecutive full-suite runs** (15 new: resource monitor kernel counters, transport race byte/trip accounting, token streaming order, share-driven re-planning, new routes, WS generation events)
 
 ## Design Docs
 

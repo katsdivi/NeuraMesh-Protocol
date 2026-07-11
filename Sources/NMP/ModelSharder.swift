@@ -54,6 +54,11 @@ public enum NMPModelSharder {
     ///   - peers: mesh members INCLUDING the coordinator itself.
     ///   - measuredSecondsPerLayer: optional per-peer timing probe results;
     ///     peers absent from the map fall back to class weights.
+    ///   - computeShares: Mesh 2.1 allocation caps in (0, 1]; a peer's
+    ///     speed score is multiplied by its share, so a device capped at
+    ///     50% receives ~half the layers it otherwise would. Applies to
+    ///     BOTH measured and class-weight scores (callers passing
+    ///     share-scaled measurements should not also pass shares).
     /// - Returns: contiguous, complete, non-overlapping shards in pipeline
     ///   order. Empty iff `peers` is empty or `layerCount` <= 0.
     ///   If there are more peers than layers, the fastest `layerCount`
@@ -61,7 +66,8 @@ public enum NMPModelSharder {
     public static func plan(
         layerCount: Int,
         peers: [NMPCapabilities],
-        measuredSecondsPerLayer: [UInt32: Double] = [:]
+        measuredSecondsPerLayer: [UInt32: Double] = [:],
+        computeShares: [UInt32: Double] = [:]
     ) -> [NMPShardPlanEntry] {
         guard layerCount > 0, !peers.isEmpty else { return [] }
 
@@ -76,13 +82,14 @@ public enum NMPModelSharder {
 
         // Speed score: higher = faster = more layers.
         let scores: [Double] = ordered.map { peer in
+            let share = min(1.0, max(0.05, computeShares[peer.peerID] ?? 1.0))
             if let measured = measuredSecondsPerLayer[peer.peerID], measured > 0 {
-                return 1 / measured
+                return share / measured
             }
             switch peer.computeClass {
-            case .high: return 4
-            case .medium: return 2
-            case .low: return 1
+            case .high: return 4 * share
+            case .medium: return 2 * share
+            case .low: return 1 * share
             }
         }
         let totalScore = scores.reduce(0, +)

@@ -2,8 +2,15 @@ import { useState } from 'react';
 import { useInference } from '../hooks/useInference';
 import { ProtocolComparison } from './ProtocolComparison';
 import type { MeshHealth } from '../api';
+import type { LiveGeneration } from '../hooks/useMesh';
 
-export function Inference({ health }: { health: MeshHealth | null }) {
+export function Inference({
+  health,
+  live,
+}: {
+  health: MeshHealth | null;
+  live: LiveGeneration;
+}) {
   const { submit, result, loading, error } = useInference();
   const [prompt, setPrompt] = useState('The future of AI is');
   const [maxTokens, setMaxTokens] = useState(32);
@@ -11,6 +18,13 @@ export function Inference({ health }: { health: MeshHealth | null }) {
   const [comparison, setComparison] = useState(true);
 
   const speculationAvailable = health?.mesh.speculation_available ?? false;
+  // Reference-engine tokens are bare words; llama pieces carry their own
+  // leading spaces.
+  const joiner = health?.mesh.engine === 'reference' ? ' ' : '';
+  const streaming = live.status === 'running';
+  // A finished run this tab did NOT submit still deserves its numbers.
+  const spectatorResult = !result && !loading && live.status === 'done'
+    ? live.result : undefined;
 
   return (
     <div>
@@ -84,7 +98,69 @@ export function Inference({ health }: { health: MeshHealth | null }) {
         {error && <div className="error-box">{error}</div>}
       </div>
 
-      {result && (
+      {streaming && (
+        <div>
+          <div className="note-box">
+            Live — streaming to every open browser
+            {live.prompt ? ` · “${live.prompt}”` : ''}
+            {live.speculative ? ' · speculative' : ''} ·{' '}
+            {live.tokens.length}/{live.requested || '?'} tokens
+          </div>
+          <div className="output-box streaming">
+            {live.tokens.join(joiner) || '…'}
+            <span className="cursor">▋</span>
+          </div>
+        </div>
+      )}
+
+      {live.status === 'failed' && !loading && (
+        <div className="error-box">{live.error}</div>
+      )}
+
+      {spectatorResult && (
+        <div>
+          <div className="note-box">
+            Result of the run just streamed (submitted from another device).
+          </div>
+          <div className="output-box">
+            {spectatorResult.output || '(no tokens emitted)'}
+          </div>
+          <div className="grid">
+            <div className="metric-card">
+              <div className="metric-label">Throughput</div>
+              <div className="metric-value">
+                {spectatorResult.tokens_per_sec.toFixed(1)}
+              </div>
+              <div className="metric-sub">tokens / sec</div>
+            </div>
+            <div className="metric-card">
+              <div className="metric-label">Latency</div>
+              <div className="metric-value">
+                {spectatorResult.latency_ms.toFixed(0)} ms
+              </div>
+              <div className="metric-sub">{spectatorResult.token_count} tokens</div>
+            </div>
+            <div className="metric-card">
+              <div className="metric-label">Payload</div>
+              <div className="metric-value">
+                {(spectatorResult.network_payload_bytes / 1024).toFixed(1)} KB
+              </div>
+              <div className="metric-sub">{spectatorResult.engine}</div>
+            </div>
+            <div className="metric-card">
+              <div className="metric-label">Round Trips</div>
+              <div className="metric-value">{spectatorResult.round_trips}</div>
+              <div className="metric-sub">
+                {spectatorResult.acceptance_rate !== undefined
+                  ? `${(spectatorResult.acceptance_rate * 100).toFixed(0)}% draft acceptance`
+                  : 'one per pass'}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {result && !streaming && (
         <div>
           <div className="output-box">{result.output || '(no tokens emitted)'}</div>
 

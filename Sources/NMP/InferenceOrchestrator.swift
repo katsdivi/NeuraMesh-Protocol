@@ -129,7 +129,41 @@ public final class NMPInferenceOrchestrator {
               wireFormat = newValue }
     }
 
+    // MARK: Mesh 2.1 — compute shares
+    //
+    // The Devices panel's allocation slider. A share s in (0, 1] means
+    // "this device contributes s of its compute to the mesh": the planner
+    // treats the device as 1/s slower, so a peer capped at 50% receives
+    // ~half the layers on the next (re-)plan. Shares live HERE, separate
+    // from measurements, because live traffic overwrites measurements
+    // after every stage — a cap stored inside them would wash out on the
+    // next pass.
+
+    /// Current per-peer compute shares (peers absent = 1.0).
+    public var computeShares: [UInt32: Double] {
+        measurementsLock.lock()
+        defer { measurementsLock.unlock() }
+        return shares
+    }
+
+    /// Sets a peer's mesh compute share, clamped to 0.05...1.0. Takes
+    /// effect on the next plan (call the failover orchestrator's
+    /// `replan` to apply immediately). Scaling happens inside
+    /// `NMPModelSharder.plan(computeShares:)` — the single place shares
+    /// touch planning math.
+    public func setComputeShare(_ share: Double, forPeer peerID: UInt32) {
+        measurementsLock.lock()
+        defer { measurementsLock.unlock() }
+        let clamped = min(1.0, max(0.05, share))
+        if clamped >= 1.0 {
+            shares.removeValue(forKey: peerID)
+        } else {
+            shares[peerID] = clamped
+        }
+    }
+
     private var measurements: [UInt32: Double] = [:]
+    private var shares: [UInt32: Double] = [:]
     private var wireFormat: NMPActivationWireFormat = .float32
     private let measurementsLock = NSLock()
 

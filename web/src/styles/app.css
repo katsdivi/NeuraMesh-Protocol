@@ -341,6 +341,57 @@ textarea:focus, input:focus {
 .settings-row .hint { font-size: var(--text-caption); color: var(--color-neutral-500); }
 input[type='range'] { width: 200px; }
 
+/* ── Devices (Mesh 2.1) ─────────────────────────────────── */
+
+.resource-row { margin-bottom: var(--spacing-md); }
+.resource-head {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--spacing-md);
+  margin-bottom: var(--spacing-xs);
+  flex-wrap: wrap;
+}
+.resource-label {
+  font-size: var(--text-caption);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-neutral-500);
+}
+.resource-detail { font-size: var(--text-caption); color: var(--color-neutral-500); }
+.resource-bar {
+  height: 8px;
+  border-radius: 4px;
+  background: var(--color-neutral-200);
+  overflow: hidden;
+}
+.resource-fill {
+  height: 100%;
+  border-radius: 4px;
+  background: var(--color-primary);
+  transition: width 0.6s ease;
+}
+.resource-fill.hot { background: var(--color-error); }
+
+.allocation-row {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-md);
+  margin-top: var(--spacing-md);
+  flex-wrap: wrap;
+}
+.allocation-row label { font-size: var(--text-caption); color: var(--color-neutral-500); }
+.allocation-row input[type='range'] { flex: 1; min-width: 160px; max-width: 320px; }
+
+/* ── Live streaming output (Mesh 2.1) ───────────────────── */
+
+.output-box.streaming { border-color: var(--color-primary); }
+.output-box .cursor {
+  color: var(--color-primary);
+  animation: nmp-blink 1s steps(1) infinite;
+}
+@keyframes nmp-blink { 50% { opacity: 0; } }
+
 /* ── Mobile ─────────────────────────────────────────────── */
 
 @media (max-width: 640px) {

@@ -204,6 +204,38 @@ public final class NMPDashboardServer {
         @escaping (Result<[NMPPromptInferenceService.GenerationResult],
                           BenchmarkFailure>) -> Void) -> Void)?
 
+    // MARK: Mesh 2.1 surface
+
+    /// What POST /api/comparison/run hands back: one real generation plus
+    /// the transport race that replayed its traffic pattern over real
+    /// loopback sockets (see TransportRace.swift).
+    public struct ComparisonRunOutcome {
+        public let generation: NMPPromptInferenceService.GenerationResult
+        public let race: NMPTransportRace.RaceResult
+        public init(generation: NMPPromptInferenceService.GenerationResult,
+                    race: NMPTransportRace.RaceResult) {
+            self.generation = generation
+            self.race = race
+        }
+    }
+
+    /// Handler for POST /api/comparison/run. Fires on the server's
+    /// queue; reply from any queue, exactly once.
+    public var onComparisonRunRequest: ((InferenceRequest,
+        @escaping (Result<ComparisonRunOutcome, BenchmarkFailure>) -> Void) -> Void)?
+
+    /// Handler for GET /api/devices/metrics: compose the live resource
+    /// picture (host sample + per-peer mesh facts). The server ships the
+    /// object verbatim as JSON. 503 when unwired.
+    public var onDeviceMetricsRequest: ((@escaping ([String: Any]) -> Void) -> Void)?
+
+    /// Handler for POST /api/devices/<hexID>/allocate {"share": 0...1}.
+    /// Reply with a human-readable summary of what the new share did
+    /// (e.g. the re-planned layer spans) or a failure. Fires on the
+    /// server's queue; reply from any queue, exactly once.
+    public var onAllocationRequest: ((UInt32, Double,
+        @escaping (Result<String, BenchmarkFailure>) -> Void) -> Void)?
+
     /// Static facts about the running mesh, surfaced by GET /health and
     /// the UI's dashboard. Set once by the CLI after assembly.
     public struct MeshInfo: Sendable {
@@ -243,6 +275,22 @@ public final class NMPDashboardServer {
     }
     private var peerSnapshots: [UInt32: PeerSnapshot] = [:]
 
+    /// Mesh 2.1: web clients (browsers) seen recently, keyed by
+    /// address + User-Agent. HTTP connections are one-shot (Connection:
+    /// close), so "connected" means: holding the WebSocket open, or any
+    /// HTTP request within `webClientWindow` (the UI polls every 2-3 s).
+    struct BrowserSighting {
+        var userAgent: String
+        var lastSeen: Date
+        /// Currently holding /ws open (dropped WS connections flip this
+        /// back to false and start the staleness clock).
+        var webSocketCount = 0
+    }
+    private var browserSightings: [String: BrowserSighting] = [:]
+    /// Seconds an HTTP-only client stays "connected" after its last
+    /// request. 15 s ≈ five UI polling intervals.
+    public static let webClientWindow: TimeInterval = 15
+
     /// Actual bound port (differs from the requested one when passing 0).
     public private(set) var boundPort: UInt16 = 0
     /// Currently connected WebSocket client count (for tests/CLI status).
@@ -261,7 +309,26 @@ public final class NMPDashboardServer {
         /// Parsed request head while its body is still arriving.
         var pendingHead: String?
         var pendingBodyLength = 0
+        /// Mesh 2.1: browserSightings key this client was counted under
+        /// (set once its first request head is parsed).
+        var sightingKey: String?
         init(connection: NWConnection) { self.connection = connection }
+
+        /// The remote address, for the web-clients list ("who is looking
+        /// at the dashboard"). IPv6 zone suffixes stripped for stability.
+        var remoteAddress: String {
+            guard case let .hostPort(host, _) = connection.endpoint else {
+                return "unknown"
+            }
+            let raw: String
+            switch host {
+            case .ipv4(let address): raw = "\(address)"
+            case .ipv6(let address): raw = "\(address)"
+            case .name(let name, _): raw = name
+            @unknown default: raw = "unknown"
+            }
+            return raw.split(separator: "%").first.map(String.init) ?? raw
+        }
     }
 
     public init() {}
@@ -406,6 +473,85 @@ public final class NMPDashboardServer {
         broadcast(object: ["type": "loss_rate", "rate": rate])
     }
 
+    // MARK: Mesh 2.1 broadcasts
+
+    /// A generation began (any client, any device sees it start).
+    public func reportGenerationStarted(prompt: String, maxTokens: Int,
+                                        speculative: Bool) {
+        broadcast(object: [
+            "type": "generation_started",
+            "prompt": prompt,
+            "max_tokens": maxTokens,
+            "speculative": speculative,
+        ])
+    }
+
+    /// One confirmed token, streamed live to every open browser.
+    public func reportGenerationToken(text: String, index: Int,
+                                      count: Int, requested: Int) {
+        broadcast(object: [
+            "type": "generation_token",
+            "text": text,
+            "index": index,
+            "count": count,
+            "requested": requested,
+        ])
+    }
+
+    /// The generation finished; ships the same metrics /api/inference
+    /// returns so every browser converges on identical numbers.
+    public func reportGenerationComplete(
+        _ result: NMPPromptInferenceService.GenerationResult
+    ) {
+        let tokensPerSec = result.totalSeconds > 0
+            ? Double(result.tokenCount) / result.totalSeconds : 0
+        var object: [String: Any] = [
+            "type": "generation_complete",
+            "output": result.text,
+            "token_count": result.tokenCount,
+            "latency_ms": (result.totalSeconds * 1000 * 10).rounded() / 10,
+            "tokens_per_sec": (tokensPerSec * 100).rounded() / 100,
+            "network_payload_bytes": result.networkPayloadBytes,
+            "round_trips": result.speculation?.meshRoundTrips
+                ?? result.perTokenSeconds.count,
+            "engine": result.engine,
+        ]
+        if let stats = result.speculation {
+            object["acceptance_rate"] = (stats.acceptanceRate * 1000).rounded() / 1000
+        }
+        broadcast(object: object)
+    }
+
+    public func reportGenerationFailed(_ message: String) {
+        broadcast(object: ["type": "generation_failed", "error": message])
+    }
+
+    /// A device's compute share changed (slider moved on SOME device —
+    /// every other device's slider follows).
+    public func reportAllocation(peerID: UInt32, share: Double) {
+        broadcast(object: [
+            "type": "allocation_update",
+            "peer": String(peerID, radix: 16),
+            "share": (share * 100).rounded() / 100,
+        ])
+    }
+
+    /// Web-client count changed (a browser joined or left). Deliberately
+    /// DELAYED: this fires on the accept/upgrade path, and CFNetwork's
+    /// WebSocket client (URLSessionWebSocketTask, Safari) fails the
+    /// handshake when a server frame shares a TCP segment with the 101
+    /// response — the delay gives the upgrade its own segment. A count
+    /// update is not latency-sensitive.
+    private func broadcastWebClientCount() {
+        queue.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            guard let self else { return }
+            self.broadcast(object: [
+                "type": "client_update",
+                "web_clients": self.activeWebClientsLocked().count,
+            ])
+        }
+    }
+
     // MARK: Connection handling (all on `queue`)
 
     private func accept(_ connection: NWConnection) {
@@ -423,7 +569,58 @@ public final class NMPDashboardServer {
     }
 
     private func drop(_ connection: NWConnection) {
-        clients.removeValue(forKey: ObjectIdentifier(connection))
+        guard let client = clients.removeValue(forKey: ObjectIdentifier(connection)) else {
+            return
+        }
+        // A departing WebSocket client leaves immediately (HTTP-only
+        // clients age out through the staleness window instead).
+        if client.isWebSocket, let key = client.sightingKey {
+            browserSightings[key]?.webSocketCount -= 1
+            browserSightings[key]?.lastSeen = Date()
+            broadcastWebClientCount()
+        }
+    }
+
+    // MARK: Web client tracking (all on `queue`)
+
+    private func recordSighting(client: Client, userAgent: String) {
+        let key = client.remoteAddress + "|" + String(userAgent.prefix(64))
+        let wasActive = activeWebClientsLocked().contains { $0.key == key }
+        var sighting = browserSightings[key]
+            ?? BrowserSighting(userAgent: userAgent, lastSeen: Date())
+        sighting.lastSeen = Date()
+        browserSightings[key] = sighting
+        client.sightingKey = key
+        if !wasActive { broadcastWebClientCount() }
+    }
+
+    private func markWebSocket(client: Client) {
+        guard let key = client.sightingKey else { return }
+        browserSightings[key]?.webSocketCount += 1
+        broadcastWebClientCount()
+    }
+
+    /// Currently "connected" web clients: WebSocket holders plus anyone
+    /// who made an HTTP request within the window. Also prunes entries
+    /// dead for over five minutes so the map stays bounded.
+    private func activeWebClientsLocked() -> [(key: String, sighting: BrowserSighting)] {
+        let now = Date()
+        browserSightings = browserSightings.filter {
+            $0.value.webSocketCount > 0
+                || now.timeIntervalSince($0.value.lastSeen) < 300
+        }
+        return browserSightings
+            .filter {
+                $0.value.webSocketCount > 0
+                    || now.timeIntervalSince($0.value.lastSeen) < Self.webClientWindow
+            }
+            .sorted { $0.value.lastSeen > $1.value.lastSeen }
+            .map { (key: $0.key, sighting: $0.value) }
+    }
+
+    /// Active web-client count (for tests/CLI status).
+    public var webClientCount: Int {
+        queue.sync { activeWebClientsLocked().count }
     }
 
     private func receive(on client: Client) {
@@ -529,7 +726,16 @@ public final class NMPDashboardServer {
             return
         }
 
+        // Mesh 2.1: every HTTP request marks its sender as a live web
+        // client (the "does my iPhone show up?" fix).
+        recordSighting(client: client,
+                       userAgent: headers["user-agent"] ?? "unknown")
+
         if method == "POST" {
+            if path.hasPrefix("/api/devices/") && path.hasSuffix("/allocate") {
+                handleAllocatePOST(path: path, body: body, client: client)
+                return
+            }
             switch path {
             case "/api/inference":
                 handleInferencePOST(body: body, client: client)
@@ -537,6 +743,8 @@ public final class NMPDashboardServer {
                 handleBenchmarkPOST(body: body, client: client)
             case "/api/comparison":
                 handleComparisonPOST(body: body, client: client)
+            case "/api/comparison/run":
+                handleComparisonRunPOST(body: body, client: client)
             default:
                 respond(client, status: "404 Not Found", body: "not found\n")
             }
@@ -553,6 +761,12 @@ public final class NMPDashboardServer {
             return
         case "/api/devices":
             handleDevicesGET(client)
+            return
+        case "/api/devices/metrics":
+            handleDeviceMetricsGET(client)
+            return
+        case "/api/clients":
+            handleClientsGET(client)
             return
         default:
             break
@@ -572,6 +786,7 @@ public final class NMPDashboardServer {
             client.connection.send(content: Data(response.utf8),
                                    completion: .contentProcessed { _ in })
             client.isWebSocket = true
+            markWebSocket(client: client)
             // Any frames that rode in behind the upgrade request.
             processBuffer(of: client)
             return
@@ -673,8 +888,163 @@ public final class NMPDashboardServer {
                 "speculation_available": info.speculationAvailable,
                 "peers": peerSnapshots.count,
                 "peers_alive": peerSnapshots.values.filter(\.alive).count,
+                "web_clients": activeWebClientsLocked().count,
             ],
         ])
+    }
+
+    // MARK: GET /api/clients + /api/devices/metrics (Mesh 2.1)
+
+    private func handleClientsGET(_ client: Client) {
+        let now = Date()
+        let clients = activeWebClientsLocked().map { key, sighting -> [String: Any] in
+            [
+                "address": key.split(separator: "|").first.map(String.init) ?? "unknown",
+                "user_agent": sighting.userAgent,
+                "websocket": sighting.webSocketCount > 0,
+                "seconds_since_seen":
+                    (now.timeIntervalSince(sighting.lastSeen) * 10).rounded() / 10,
+            ]
+        }
+        respondJSONArray(client, status: "200 OK", array: clients)
+    }
+
+    private func handleDeviceMetricsGET(_ client: Client) {
+        guard let handler = onDeviceMetricsRequest else {
+            respondJSON(client, status: "503 Service Unavailable",
+                        object: ["error": "no device metrics source is wired to this server"])
+            return
+        }
+        handler { [weak self, weak client] object in
+            guard let self, let client else { return }
+            self.queue.async {
+                self.respondJSON(client, status: "200 OK", object: object)
+            }
+        }
+    }
+
+    // MARK: POST /api/devices/<hexID>/allocate
+
+    private func handleAllocatePOST(path: String, body: Data, client: Client) {
+        guard let handler = onAllocationRequest else {
+            respondJSON(client, status: "503 Service Unavailable",
+                        object: ["error": "no allocation handler is wired to this server"])
+            return
+        }
+        // /api/devices/<hexID>/allocate
+        let segments = path.split(separator: "/").map(String.init)
+        guard segments.count == 4, let peerID = UInt32(segments[2], radix: 16) else {
+            respondJSON(client, status: "400 Bad Request",
+                        object: ["error": "path must be /api/devices/<hex peer id>/allocate"])
+            return
+        }
+        guard let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let share = (object["share"] as? Double)
+                ?? (object["share"] as? Int).map(Double.init),
+              share > 0, share <= 1 else {
+            respondJSON(client, status: "400 Bad Request",
+                        object: ["error": "body must be JSON with 'share' in (0, 1]"])
+            return
+        }
+        handler(peerID, share) { [weak self, weak client] result in
+            guard let self, let client else { return }
+            self.queue.async {
+                switch result {
+                case .success(let summary):
+                    self.reportAllocation(peerID: peerID, share: share)
+                    self.respondJSON(client, status: "200 OK", object: [
+                        "status": "ok",
+                        "peer": String(peerID, radix: 16),
+                        "share": share,
+                        "summary": summary,
+                    ])
+                case .failure(let failure):
+                    self.respondJSON(client, status: "500 Internal Server Error",
+                                     object: ["error": failure.message])
+                }
+            }
+        }
+    }
+
+    // MARK: POST /api/comparison/run (measured transport race)
+
+    private func handleComparisonRunPOST(body: Data, client: Client) {
+        guard let handler = onComparisonRunRequest else {
+            respondJSON(client, status: "503 Service Unavailable",
+                        object: ["error": "no comparison pipeline is wired to this server"])
+            return
+        }
+        guard let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let prompt = object["prompt"] as? String,
+              !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            respondJSON(client, status: "400 Bad Request",
+                        object: ["error": "body must be JSON with a non-empty 'prompt'"])
+            return
+        }
+        let request = InferenceRequest(
+            prompt: prompt,
+            maxTokens: (object["max_tokens"] as? Int) ?? 32,
+            enableSpeculation: (object["enable_speculation"] as? Bool) ?? false)
+
+        handler(request) { [weak self, weak client] result in
+            guard let self, let client else { return }
+            self.queue.async {
+                switch result {
+                case .failure(let failure):
+                    self.respondJSON(client, status: "500 Internal Server Error",
+                                     object: ["error": failure.message])
+                case .success(let outcome):
+                    self.respondJSON(client, status: "200 OK",
+                                     object: Self.comparisonRunJSON(outcome))
+                }
+            }
+        }
+    }
+
+    /// Serializes a comparison run: the real generation, the measured
+    /// transport race, and the "splice" projection — the generation's
+    /// wall clock with the NMP leg's measured transport time swapped for
+    /// TCP's measured transport time. Every input to the splice is a
+    /// measurement; the splice itself is arithmetic, and says so.
+    static func comparisonRunJSON(_ outcome: ComparisonRunOutcome) -> [String: Any] {
+        let generation = outcome.generation
+        let race = outcome.race
+        let generationMs = generation.totalSeconds * 1000
+        let tokensPerSec: (Double) -> Double = { totalMs in
+            totalMs > 0 ? Double(generation.tokenCount) / (totalMs / 1000) : 0
+        }
+        let splicedTCPMs = generationMs - race.nmp.totalMs + race.tcp.totalMs
+
+        return [
+            "note": "generation and both race legs are measured; the "
+                + "projection is measured-generation wall clock with NMP's "
+                + "measured transport time replaced by TCP's",
+            "generation": [
+                "output": generation.text,
+                "token_count": generation.tokenCount,
+                "latency_ms": round2(generationMs),
+                "tokens_per_sec": round2(tokensPerSec(generationMs)),
+                "network_payload_bytes": generation.networkPayloadBytes,
+                "round_trips": generation.speculation?.meshRoundTrips
+                    ?? generation.perTokenSeconds.count,
+                "engine": generation.engine,
+            ] as [String: Any],
+            "race": race.asJSONObject,
+            "projected": [
+                [
+                    "name": "NMP (the run itself)",
+                    "total_ms": round2(generationMs),
+                    "tokens_per_sec": round2(tokensPerSec(generationMs)),
+                    "basis": "measured",
+                ] as [String: Any],
+                [
+                    "name": "TCP transport splice",
+                    "total_ms": round2(splicedTCPMs),
+                    "tokens_per_sec": round2(tokensPerSec(splicedTCPMs)),
+                    "basis": "measured splice (no TLS; TLS would cost more)",
+                ] as [String: Any],
+            ],
+        ]
     }
 
     private func handleDevicesGET(_ client: Client) {

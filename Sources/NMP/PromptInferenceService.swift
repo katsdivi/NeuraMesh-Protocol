@@ -73,6 +73,13 @@ public final class NMPPromptInferenceService {
     /// Invoked on the service queue.
     public var onProgress: ((Int, Int) -> Void)?
 
+    /// Mesh 2.1: fires with each CONFIRMED token as it is generated —
+    /// (token, tokensDone, tokensRequested) — so the dashboard can stream
+    /// text to every connected browser in real time. Invoked on the
+    /// service queue; keep the handler cheap (it sits inside the token
+    /// loop between mesh passes).
+    public var onToken: ((NMPGeneratedToken, Int, Int) -> Void)?
+
     // MARK: State
 
     private let queue = DispatchQueue(label: "nmp.prompt.inference")
@@ -171,7 +178,10 @@ public final class NMPPromptInferenceService {
                         completion(.failure(.codec(String(describing: error))))
                         return
                     }
-                    if let token { state.tokens.append(token) }
+                    if let token {
+                        state.tokens.append(token)
+                        self.onToken?(token, state.tokens.count, state.requested)
+                    }
                     self.onProgress?(state.tokens.count, state.requested)
 
                     // Stop on the requested count — or early when the codec

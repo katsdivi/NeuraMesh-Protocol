@@ -1,4 +1,4 @@
-# Mesh 2.0 — Multi-Device Web UI, Protocol Comparison & Setup Guide
+# Mesh 2.0/2.1 — Multi-Device Web UI, Protocol Comparison & Setup Guide
 
 **Goal**: replace the terminal-only experience with a browser UI served
 by the coordinator itself — same interface, live, on every device on the
@@ -171,7 +171,121 @@ What this says, honestly:
   text, draft model for natural text on a physical mesh, plain Phase 9
   zero-trim when the coordinator and peer share a GPU.**
 
-## 5. Web endpoint verification (from scratch)
+## 5. Mesh 2.1 — streaming, the measured race, and the device panel
+
+Mesh 2.0 shipped a UI whose inference view was request/response, whose
+TCP/QUIC numbers were a model, and whose "peers" never included the
+browsers. Mesh 2.1 fixes all three, still on the zero-dependency stack.
+
+### 5.1 Real-time token streaming (every browser, every run)
+
+Both generation services (`NMPPromptInferenceService`,
+`NMPSpeculativeGenerationService`) now expose `onToken`, and the
+dashboard broadcasts each confirmed token over the EXISTING `/ws`:
+
+```
+{"type":"generation_started","prompt":…,"max_tokens":N,"speculative":bool}
+{"type":"generation_token","text":…,"index":…,"count":i,"requested":N}
+{"type":"generation_complete","output":…,"tokens_per_sec":…,"round_trips":…}
+{"type":"generation_failed","error":…}
+```
+
+The Run view renders the stream with a live cursor; a phone watching the
+dashboard sees the tokens of a run the laptop submitted, as they are
+produced, and both converge on identical final metrics. (This also
+covers "tokenizer state sync": there is exactly one generation state —
+the coordinator's — and everyone watches it.) No SSE endpoint was added:
+the Phase 6 WebSocket already reaches every open tab.
+
+### 5.2 The MEASURED race — `POST /api/comparison/run`
+
+The spec asked for "actual protocol comparison, no modeled numbers" and
+sketched code with `handshakeMs: 55.0 // measured` hardcoded. This repo
+does it for real (`TransportRace.swift`): run a real generation, then
+replay its exact traffic pattern — round trips × payload, chunked into
+1024-byte sends like real mesh traffic — over real loopback sockets:
+
+- **NMP leg**: production `UDPListener`/`UDPTransport` + `PeerConnection`
+  — real Noise IK handshake, AES-256-GCM on every packet, FEC parity.
+- **TCP leg**: `NWConnection` stream — real 3-way handshake, raw bytes,
+  no TLS, no framing.
+
+Every number in the response is a wall-clock measurement (`measured:
+true` on both legs, no modeled fields). The "projected" rows splice the
+measured generation with each leg's measured transport time — arithmetic
+on measurements, labeled as such. What it honestly shows (Apple M3):
+
+- Reference mesh, float32 wire (147 KB / 6 trips): plain TCP moves the
+  bytes ~44 ms faster — raw kernel TCP does no crypto and no FEC. That
+  is the real cost of NMP's security + recovery machinery on a clean
+  loopback, stated instead of hidden.
+- Llama zero-trim (3 KB / 8 trips): NMP handshake 0.98 ms, transfer
+  1.4 ms vs TCP 0.36/0.92 ms — **~0.5 ms total for full encryption**,
+  and TLS (which production TCP would need) costs more than that in
+  handshake alone.
+- QUIC is NOT raced: Network.framework QUIC requires a TLS identity
+  (a certificate) a zero-dependency LAN tool can't conjure honestly.
+  It stays in the what-if model, labeled modeled, on the Compare tab.
+
+### 5.3 Device panel — live resources + allocation that really allocates
+
+`GET /api/devices/metrics` (2 s polling in the Devices tab) serves:
+
+- **Host**: real kernel counters — RAM used (host_statistics64), storage
+  (statfs), CPU% (tick deltas), and this process's physical footprint
+  (task_info) — watch the footprint jump when a model loads and the CPU
+  bar move during generation. Honesty note included in the payload: all
+  in-process mesh peers genuinely share this host.
+- **Peers**: assigned layer range, span, measured ms/layer, compute
+  share, computing flag, liveness.
+
+`POST /api/devices/<id>/allocate {"share": 0.4}` is the slider. It is
+NOT a cosmetic knob: the share feeds `NMPModelSharder.plan` (a device at
+40% is planned as 2.5× slower) and triggers a live re-plan through the
+normal SHARD_ASSIGN round. Verified live: capping one of four peers at
+40% shrank its span 6 → 3 layers; every open browser saw the new plan
+(`allocation_update` + `peer_update` pushes) and the event-log line.
+That visible re-shard — and the host counters moving with it — is the
+verification the panel exists to provide. The llama path reports
+`allocation_supported: false` with the reason (a llama plan is one
+full-range shard; there is nothing to re-balance).
+
+RAM/storage "allocation" sliders from the spec were deliberately NOT
+built: with in-process peers there is nothing real for them to cap, and
+a slider that does nothing would be UI theater. They render as measured
+bars instead.
+
+### 5.4 Web-client tracking (the "iPhone shows up" fix)
+
+Mesh peers and browsers are different populations, tracked separately:
+`/health` now carries `web_clients`, `GET /api/clients` lists them
+(address, browser, WebSocket-live vs last-seen), and the Devices tab
+shows the list. "Connected" = holding `/ws` open, or any HTTP request
+within 15 s (the UI polls every 2–3 s). A phone opening the page bumps
+the count immediately; closing it drops the WebSocket instantly.
+
+One CFNetwork gotcha worth recording: a server-initiated WebSocket frame
+that shares a TCP segment with the 101 upgrade response makes
+URLSessionWebSocketTask/Safari fail the handshake — the `client_update`
+broadcast is therefore delayed 250 ms off the upgrade path.
+
+### 5.5 Pre-existing races found while stabilizing
+
+Full-suite hammering surfaced two latent bugs (both pre-date Mesh 2.1,
+both now fixed and pinned by 5 consecutive clean 306-test runs):
+
+- `NMPFailoverOrchestrator.activePeers`/`activePlan` were mutated on the
+  failover queue and read unlocked from other queues (adaptive
+  controller, CLI) — a racing read crashed with index-out-of-range
+  inside `Collection.map`. Both are lock-protected now.
+- `registerPeer` is async on the failover queue, and the Phase 9
+  adaptive controller read membership immediately after testbed
+  assembly — under load it saw a partial mesh, concluded the profile
+  cache was incomplete, and probed when it should not have (the
+  long-standing `testSecondStartupUsesCachedProfileWithoutProbing`
+  flake). Assembly now settles membership via `waitForMembership()`.
+
+## 6. Web endpoint verification (from scratch)
 
 ```bash
 swift test --filter "WebUIRouteTests|ProtocolComparisonModelTests|LANIdentityTests"
@@ -179,10 +293,21 @@ swift test --filter "WebUIRouteTests|ProtocolComparisonModelTests|LANIdentityTes
 # aggregation (σ pinned), comparison model math (loss widens the gap),
 # banner + QR.
 
+swift test --filter "ResourceMonitorTests|TransportRaceTests|TokenStreamingTests|ComputeShareTests|Mesh21RouteTests"
+# 15 Mesh 2.1 tests: kernel counters, race byte/trip accounting, token
+# stream ordering, share-driven re-planning, routes, WS generation events.
+
 swift run nmp-dashboard --ui   # then, from another device on the Wi-Fi:
 curl -s http://<hostname>.local:3000/health
+curl -s http://<hostname>.local:3000/api/devices/metrics
+curl -s http://<hostname>.local:3000/api/clients
 curl -s -X POST http://<hostname>.local:3000/api/inference \
     -d '{"prompt":"The future of AI is","max_tokens":16,"enable_comparison":true}'
+curl -s -X POST http://<hostname>.local:3000/api/comparison/run \
+    -d '{"prompt":"The future of AI is","max_tokens":8}'
+curl -s -X POST http://<hostname>.local:3000/api/devices/2/allocate \
+    -d '{"share":0.5}'          # reference mesh: watch the re-shard
 ```
 
-Full suite: **291 tests, 0 failures** (272 Phase 9 + 19 new).
+Full suite: **306 tests, 0 failures** (291 Mesh 2.0 + 15 new), verified
+over 5 consecutive runs.
