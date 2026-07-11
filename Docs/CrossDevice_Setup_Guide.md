@@ -127,10 +127,17 @@ port …`. The phone is now a compute node waiting for a coordinator.
 
 **Step 1.** iPhone: app open, screen on, same Wi-Fi as the Mac.
 
-**Step 2.** Mac terminal:
+**Step 2.** Mac terminal — two coordinators to choose from:
 
 ```bash
 cd NeuraMeshProtocol
+
+# The web dashboard (Mesh 2.4): discovers and joins the phone into the
+# live mesh automatically — watch it appear as a device card with its
+# own resource bars, wire throughput, and serve counter:
+swift run nmp-dashboard --ui
+
+# …or the benchmark coordinator (baseline vs mesh, BIT-EXACT verdict):
 swift run nmp-coordinator --peers 1 --wait 60
 ```
 

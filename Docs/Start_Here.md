@@ -407,3 +407,29 @@ Notes that save time:
 | `Phase1–6_Design.md` | protocol internals (crypto, reliability, FEC, discovery, sharding, failover) |
 | `NMP_Specification.md` | the wire protocol, source of truth |
 | `Benchmarks.md` | every measured number in one place |
+
+
+
+## 10. follow
+ I've cut the setup to the Apple-mandated minimum: the Xcode project is now checked 
+  into the repo (2d86c88), pre-wired and build-verified for iOS. The guide's old 10-step
+  project assembly is gone — sources, the NMP package link, and the two Info.plist keys
+  everyone forgets are all already in it.
+
+  Your setup, one time (~5 min)
+
+  open NeuraMeshPeer/NeuraMeshPeer.xcodeproj
+
+  1. Click the blue project icon → Signing & Capabilities → set Team to your Apple ID
+  (free one works; add it under Xcode → Settings → Accounts if empty).
+  2. Plug in your iPhone via USB, unlock it, tap Trust, pick the iPhone in Xcode's
+  device menu, press ⌘R.
+  3. Two one-time phone prompts: Settings → General → VPN & Device Management → Trust
+  your Apple ID (then ⌘R again), and Allow the local-network prompt when the app opens.
+
+  Every time after (~1 min, no cable, no Xcode)
+
+  Open the NeuraMeshPeer app on the phone (same Wi-Fi, screen on), then on the Mac:
+
+  swift run nmp-coordinator --peers 1 --wait 60
+

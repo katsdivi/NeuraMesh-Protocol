@@ -349,6 +349,36 @@ Verified live: 4-peer reference mesh under heartbeat load shows
 ~13 KB/s each way per link, serve counters climbing in lockstep, and
 the 40%-share re-shard still visible on every open browser.
 
+### 5.8 Mesh 2.4 — LAN peers join the web dashboard live
+
+The reference dashboard now browses for `_neuramesh._tcp` adverts and
+dials every peer it finds — the iPhone app or `swift run nmp-peer` on
+another Mac — over real UDP (Noise IK, key from the TXT record, same
+trust-on-first-use as `nmp-coordinator`), then joins it into the SAME
+failover mesh the web panel shows. No flags:
+
+```bash
+swift run nmp-dashboard --ui     # Mac
+# open the NeuraMeshPeer app on the phone (same Wi-Fi) → within ~2 s the
+# event log shows "found … dialing … joined — re-sharded", every open
+# browser sees the new layer spans, and the phone's device card shows
+# its OWN reported RAM/CPU/storage, live wire throughput, and serves.
+```
+
+To make this zero-config, the dashboard mesh now matches the peer-app
+defaults — **32 layers × 4096 hidden, model tag `nmp-reference-model`**
+(it was 24 × 1024 `testbed-ref-model`; mismatched tags made peers
+reject SHARD_ASSIGN). The phone dropping off Wi-Fi (or the app closing)
+re-shards back to the in-process peers; reopening the app rejoins.
+Reference mesh only — a llama plan is one full-range shard and the
+weights live on one device, so the llama dashboard does not dial peers.
+
+Verified live with a real iPhone: discovered and joined in ~2 s,
+assigned a real layer span by the measured-speed sharder, ~39 KB/s of
+encrypted UDP each way under heartbeat load, serve counter climbing,
+and its own kernel counters (RAM/CPU; GPU is nil — iOS exposes no
+public counter) on the device card.
+
 ## 6. Web endpoint verification (from scratch)
 
 ```bash

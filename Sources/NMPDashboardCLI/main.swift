@@ -615,12 +615,17 @@ if dashboardArguments.engine == "llamaCpp" {
 
 // MARK: - Mesh
 
-print("[nmp-dashboard] assembling mesh (coordinator + 3 peers)…")
+print("[nmp-dashboard] assembling mesh (coordinator + 3 in-process peers; "
+      + "LAN peers join live via Bonjour)…")
 let testbed: NMPMeshTestbed
 do {
     // 2 ms/layer simulated compute so stage progress is visible by eye.
+    // Mesh 2.4: the shape and tag MATCH the peer app / nmp-peer defaults
+    // (32 × 4096, 'nmp-reference-model') so a discovered LAN peer accepts
+    // the dashboard's SHARD_ASSIGN instead of rejecting on model mismatch.
     testbed = try NMPMeshTestbed(
-        layerCount: 24, hiddenSize: 1024, remotePeerCount: 3,
+        layerCount: 32, hiddenSize: 4096, remotePeerCount: 3,
+        modelTag: "nmp-reference-model",
         simulatedSecondsPerLayer: 0.002)
     let plan: [NMPShardPlanEntry]
     if dashboardArguments.autoConfig {
@@ -666,23 +671,16 @@ var latestMetrics: [UInt32: NMPPeerMetrics] = [:]
 var lossRate = 0.0
 var benchmarkRunning = false
 
-testbed.orchestrator.onPeerMetrics = { metrics in
-    stateQueue.async { latestMetrics[metrics.peerID] = metrics }
-}
-
-// Mesh 2.3: per-device telemetry, all measured.
+// Mesh 2.3/2.4: per-device telemetry, all measured.
 // - latestResources: each peer's own kernel-counter sample, shipped over
 //   the mesh (in-process peers report this same host — the hostname match
-//   tells the UI to say so instead of pretending they are separate boxes).
-// - serveStats: requests actually served per peer, straight from the
-//   peer-side shard engines — the direct "this device is computing" proof.
+//   tells the UI to say so instead of pretending they are separate boxes;
+//   a LAN peer reports its own device and gets real bars).
+// - serveStats: requests actually served per peer. Counted from the
+//   metrics message every shard engine sends after each serve — the one
+//   signal that arrives identically from in-process AND LAN peers.
 // - trafficBaselines/latestNetRates: coordinator-side wire totals per
 //   link, diffed between polls into live bytes/sec.
-var latestResources: [UInt32: (report: NMPPeerResourceReport, at: Date)] = [:]
-testbed.orchestrator.onPeerResourceReport = { report in
-    stateQueue.async { latestResources[report.peerID] = (report, Date()) }
-}
-
 var serveStats: [UInt32: (served: Int, lastComputeSeconds: Double, lastAt: Date)] = [:]
 func recordServe(peerID: UInt32, computeSeconds: Double) {
     stateQueue.async {
@@ -690,15 +688,24 @@ func recordServe(peerID: UInt32, computeSeconds: Double) {
                               computeSeconds, Date())
     }
 }
-for peer in testbed.remotePeers {
-    let peerID = peer.capabilities.peerID
-    peer.shardEngine.onInferenceServed = { _, _, seconds in
-        recordServe(peerID: peerID, computeSeconds: seconds)
-    }
+
+testbed.orchestrator.onPeerMetrics = { metrics in
+    stateQueue.async { latestMetrics[metrics.peerID] = metrics }
+    recordServe(peerID: metrics.peerID,
+                computeSeconds: Double(metrics.inferenceLatencyMicros) / 1e6)
+}
+
+var latestResources: [UInt32: (report: NMPPeerResourceReport, at: Date)] = [:]
+testbed.orchestrator.onPeerResourceReport = { report in
+    stateQueue.async { latestResources[report.peerID] = (report, Date()) }
 }
 
 var trafficBaselines: [UInt32: (sent: UInt64, received: UInt64, at: Date)] = [:]
 var latestNetRates: [UInt32: (toDeviceBps: Int, fromDeviceBps: Int)] = [:]
+
+// Mesh 2.4: coordinator-side connections to REAL LAN peers (iPhone app,
+// nmp-peer on another Mac), keyed by peerID. Mutated on stateQueue.
+var lanConnections: [UInt32: PeerConnection] = [:]
 
 func assignmentLabel(for peerID: UInt32) -> String {
     guard let entry = testbed.failover.activePlan.first(where: { $0.peerID == peerID }) else {
@@ -898,8 +905,11 @@ server.onDeviceMetricsRequest = { respond in
         let alivePeerIDs = Set(testbed.failover.activePeers.map(\.peerID))
         let planned = Dictionary(uniqueKeysWithValues:
             testbed.failover.activePlan.map { ($0.peerID, $0) })
-        let connections = Dictionary(uniqueKeysWithValues:
+        var connections = Dictionary(uniqueKeysWithValues:
             testbed.remotePeers.map { ($0.capabilities.peerID, $0.coordinatorSide) })
+        for (peerID, connection) in lanConnections {
+            connections[peerID] = connection
+        }
         let now = Date()
 
         // Refresh per-link throughput from the connections' wire totals.
@@ -939,9 +949,11 @@ server.onDeviceMetricsRequest = { respond in
                     && (secondsSinceServe.map { $0 < 1.5 } ?? false),
                 "load_percent": Int(latestMetrics[caps.peerID]?.currentLoadPercent ?? 0),
                 "is_coordinator": caps.peerID == testbed.coordinatorID,
-                "link": connections[caps.peerID] != nil
-                    ? "in-process link (full NMP stack: Noise IK, AES-GCM, FEC, NACK)"
-                    : "local shard on the coordinator — no network hop",
+                "link": lanConnections[caps.peerID] != nil
+                    ? "Wi-Fi/LAN link — real UDP (Noise IK, AES-GCM, FEC, NACK)"
+                    : connections[caps.peerID] != nil
+                        ? "in-process link (full NMP stack: Noise IK, AES-GCM, FEC, NACK)"
+                        : "local shard on the coordinator — no network hop",
             ]
             if let rate = measured[caps.peerID] {
                 peer["measured_ms_per_layer"] = (rate * 1000 * 100).rounded() / 100
@@ -1052,6 +1064,113 @@ server.onAllocationRequest = { peerID, share, respond in
             respond(.success(summary))
         }
     }
+}
+
+// MARK: - Mesh 2.4: real LAN peers join the live dashboard mesh
+//
+// The dashboard browses for _neuramesh._tcp adverts (the iPhone peer app,
+// `swift run nmp-peer` on another Mac), dials each one over REAL UDP —
+// Noise IK with the static key from the peer's TXT record, the same
+// trust-on-first-use model as nmp-coordinator — and joins it into the
+// SAME failover mesh this panel displays. The join re-shards live on
+// every open browser; the device's card shows its own reported
+// RAM/CPU/storage, wire throughput, and serve counter. No flags, no
+// configuration: open the peer app on the same Wi-Fi and watch it join.
+
+let lanQueue = DispatchQueue(label: "nmp.dashboard.lan")
+let lanStaticKeys = NoiseStaticKeyPair()
+let lanBrowser = NMPBonjourBrowser()
+let lanDiscovery = NMPPeerDiscoveryManager(
+    localCapabilities: NMPSystemCapabilityProbe.measure(peerID: testbed.coordinatorID),
+    publisher: nil, // browse-only: the dashboard dials, peers advertise
+    source: lanBrowser,
+    queue: lanQueue)
+/// Peers being dialed or already joined (lanQueue-owned) — one dial per
+/// advert, however often Bonjour re-announces it.
+var lanDialing = Set<UInt32>()
+
+func dropLANPeer(_ peerID: UInt32, reason: String) {
+    lanQueue.async { lanDialing.remove(peerID) }
+    stateQueue.async {
+        guard lanConnections.removeValue(forKey: peerID) != nil else { return }
+        guard testbed.failover.activePeers.contains(where: { $0.peerID == peerID }) else {
+            return
+        }
+        server.reportMeshEvent(
+            "📱 LAN peer 0x\(String(peerID, radix: 16)) \(reason) — re-sharding…")
+        testbed.failover.handlePeerDrop(peerID, timeout: 5) { _ in
+            pushPeerStates()
+        }
+    }
+}
+
+lanDiscovery.onPeerDiscovered = { capabilities in
+    // Runs on lanQueue.
+    let peerID = capabilities.peerID
+    guard !lanDialing.contains(peerID) else { return }
+    guard capabilities.udpPort != 0,
+          let remoteStatic = capabilities.noiseStaticPublicKey else {
+        print("[nmp-dashboard] LAN peer \(capabilities.deviceName) not dialable "
+              + "(no port/key in TXT) — skipping")
+        return
+    }
+    guard let endpoint = lanDiscovery.discoveredPeers[peerID]?.endpoint else { return }
+    lanDialing.insert(peerID)
+
+    server.reportMeshEvent("📱 found \(capabilities.deviceName) "
+        + "(\(capabilities.computeClass.label), \(capabilities.ramMB) MB RAM) — dialing…")
+    let connectionQueue = DispatchQueue(label: "nmp.dashboard.lan.\(peerID)")
+    let transport = UDPTransport(endpoint: endpoint, queue: connectionQueue)
+    do {
+        let connection = try PeerConnection(
+            role: .initiator,
+            config: PeerConnectionConfig(localPeerID: testbed.coordinatorID),
+            transport: transport,
+            localStatic: lanStaticKeys,
+            remoteStaticPublicKey: remoteStatic,
+            queue: connectionQueue)
+
+        connection.onEstablished = { _, remoteID in
+            stateQueue.async { lanConnections[remoteID] = connection }
+            server.reportMeshEvent("📱 \(capabilities.deviceName) connected "
+                + "(Noise IK over Wi-Fi) — joining the mesh…")
+            testbed.failover.handlePeerJoin(capabilities, connection: connection) { result in
+                switch result {
+                case .success(let plan):
+                    server.reportMeshEvent("📱 \(capabilities.deviceName) joined — "
+                        + "re-sharded to \(plan.count) shard(s)")
+                    pushPeerStates()
+                case .failure(let error):
+                    server.reportMeshEvent("📱 \(capabilities.deviceName) join failed: \(error)")
+                    stateQueue.async { lanConnections.removeValue(forKey: remoteID) }
+                    lanQueue.async { lanDialing.remove(peerID) }
+                    connection.close()
+                }
+            }
+        }
+        connection.onFailed = { error in
+            server.reportMeshEvent("📱 \(capabilities.deviceName): \(error)")
+            dropLANPeer(peerID, reason: "connection failed")
+        }
+        connection.start()
+    } catch {
+        lanDialing.remove(peerID)
+        print("[nmp-dashboard] failed to dial \(capabilities.deviceName): \(error)")
+    }
+}
+
+// The advert vanishing (app closed / left the Wi-Fi) is the discovery-
+// level drop signal; the health monitor catches silent deaths too.
+lanDiscovery.onPeerRemoved = { peerID in
+    dropLANPeer(peerID, reason: "left the network")
+}
+
+do {
+    try lanQueue.sync { try lanDiscovery.start() }
+    print("[nmp-dashboard] browsing for LAN peers (_neuramesh._tcp) — "
+          + "open the NeuraMeshPeer app or `swift run nmp-peer` to join one")
+} catch {
+    print("[nmp-dashboard] ⚠️ LAN peer discovery unavailable: \(error)")
 }
 
 if dashboardArguments.ui {

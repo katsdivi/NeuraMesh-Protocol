@@ -148,6 +148,13 @@ the PWA (safe-area insets, scrollable tabs, full-width sliders) and the
 connected toast now shrinks to a green dot after 3 s. See
 `Docs/Mesh2_WebUI_Guide.md` §5.7.
 
+Mesh 2.4: **LAN peers join the web dashboard live** — the reference
+dashboard browses Bonjour and dials the iPhone peer app (or `nmp-peer`
+on another Mac) over real UDP, joins it into the web-visible mesh, and
+re-shards on every open browser. Open the app on the phone, watch its
+device card appear with its own resource bars and serve counter. See
+`Docs/Mesh2_WebUI_Guide.md` §5.8.
+
 Or open the folder directly in Xcode (`File > Open…`) — SwiftPM packages open natively;
 no `.xcodeproj` is required or checked in.
 
