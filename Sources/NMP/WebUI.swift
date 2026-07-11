@@ -173,7 +173,10 @@ public enum NMPLANIdentity {
     /// fallback: on DHCP networks it can be the bare IP ("192.168.1.90"),
     /// which must not get ".local" glued onto it.
     public static func localHostname() -> String {
-        #if canImport(SystemConfiguration)
+        // SCDynamicStore is macOS-only: SystemConfiguration exists on iOS
+        // but ships without this API, so canImport alone is not enough
+        // (found by the first iOS build of the package since Mesh 2.2).
+        #if canImport(SystemConfiguration) && os(macOS)
         if let name = SCDynamicStoreCopyLocalHostName(nil) as String?,
            !name.isEmpty {
             return name + ".local"

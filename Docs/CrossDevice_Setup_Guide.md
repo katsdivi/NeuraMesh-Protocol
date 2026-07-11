@@ -10,7 +10,8 @@
 
 Follow this top to bottom. Every step says exactly what to click or type,
 what you should see, and what to do if you don't see it. Total time:
-**~15 minutes** the first run, ~1 minute after that.
+**~5 minutes** the first run (the Xcode project is checked in — your
+part is signing + one USB install), ~1 minute after that.
 
 There are three levels. Each one is a complete, working checkpoint —
 finish Level 1 before touching a phone.
@@ -18,7 +19,7 @@ finish Level 1 before touching a phone.
 | Level | Hardware | Time |
 |---|---|---|
 | 1. Loopback mesh | Mac only | 2 min |
-| 2. Mac + iPhone mesh | Mac + iPhone + USB cable (first install only) | ~15 min |
+| 2. Mac + iPhone mesh | Mac + iPhone + USB cable (first install only) | ~5 min |
 | 3. Third device | + iPad or second iPhone/Mac | ~5 min |
 
 **Requirements**: macOS 13+, Xcode 15+ (for Level 2), iPhone/iPad on iOS 16+,
@@ -66,55 +67,31 @@ Everything past here is just putting a peer on another device.
 
 ## Level 2 — Mac + iPhone mesh
 
-### Part A: Put the peer app on your iPhone (~10 min, once)
+### Part A: Put the peer app on your iPhone (~5 min, once)
 
-**Step 1 — Create the project.**
-1. Open Xcode → **File → New → Project…**
-2. Pick **iOS → App** → Next.
-3. Product Name: `NeuraMeshPeer`. Interface: **SwiftUI**. Language:
-   **Swift**. Uncheck tests. → Next.
-4. Save it **anywhere except inside the NeuraMeshProtocol folder**
-   (e.g. `~/Projects/NeuraMeshPeer`). Nesting it inside the package
-   confuses SwiftPM.
+The Xcode project is checked in, ready to run —
+`NeuraMeshPeer/NeuraMeshPeer.xcodeproj` already references the three app
+sources, the NMP package (local reference to the repo root), and an
+Info.plist with the two mandatory network keys
+(`NSLocalNetworkUsageDescription` + `NSBonjourServices`, without which
+iOS silently blocks Bonjour). Your part is only what Apple requires of
+every developer: signing and one USB install.
 
-**Step 2 — Add the NMP package.**
-1. In Xcode: **File → Add Package Dependencies…**
-2. Click **Add Local…** (bottom-left).
-3. Select your `NeuraMeshProtocol` folder → **Add Package**.
-4. In the "Choose Package Products" sheet, check product **NMP** for
-   target NeuraMeshPeer → **Add Package**.
+**Step 1 — Open the project.**
 
-**Step 3 — Drop in the app sources.**
-1. In Finder, open `NeuraMeshProtocol/NeuraMeshPeer/Sources/` — it has
-   3 files: `NeuraMeshPeerApp.swift`, `PeerViewModel.swift`,
-   `PeerStatusView.swift`.
-2. Drag all 3 into the Xcode project navigator, onto the `NeuraMeshPeer`
-   folder (the one containing `ContentView.swift`).
-3. In the dialog: check **Copy items if needed** and the NeuraMeshPeer
-   target → Finish.
-4. **Delete** Xcode's generated `NeuraMeshPeerApp.swift` duplicate (the
-   original from the template — it clashes with ours; keep the one you
-   just added) and delete `ContentView.swift`. "Move to Trash" for both.
+```bash
+open NeuraMeshPeer/NeuraMeshPeer.xcodeproj
+```
 
-**Step 4 — The two Info.plist keys (the step everyone forgets).**
-Without these, iOS silently blocks Bonjour and nothing ever connects.
-1. Click the project (blue icon) → target **NeuraMeshPeer** → **Info** tab.
-2. Hover any row, click **+**, and add:
-   - Key `NSLocalNetworkUsageDescription` (shown as *"Privacy — Local
-     Network Usage Description"*), type String, value:
-     `NeuraMesh discovers and connects to nearby devices to run distributed AI inference on your local network.`
-   - Key `NSBonjourServices` (*"Bonjour services"*), type Array, with one
-     item, String, value: `_neuramesh._tcp`
-   (Reference copy: `NeuraMeshPeer/Info-additions.plist`.)
-
-**Step 5 — Signing (free Apple ID works).**
-1. Target **NeuraMeshPeer** → **Signing & Capabilities** tab.
-2. Check **Automatically manage signing**; Team: pick your Apple ID
+**Step 2 — Signing (free Apple ID works, ~1 min).**
+1. Click the blue project icon → target **NeuraMeshPeer** →
+   **Signing & Capabilities** tab.
+2. **Automatically manage signing** is on; set Team: pick your Apple ID
    (add one via Xcode → Settings → Accounts if the menu is empty).
-3. If "Failed to register bundle identifier": make the Bundle Identifier
-   unique, e.g. `com.YOURNAME.NeuraMeshPeer`.
+3. If "Failed to register bundle identifier": change the Bundle
+   Identifier to something unique, e.g. `com.YOURNAME.NeuraMeshPeer`.
 
-**Step 6 — Run it on the phone.**
+**Step 3 — Run it on the phone.**
 1. Plug the iPhone in via USB. Unlock it. Tap **Trust** on the phone.
 2. In Xcode's device menu (top bar) pick your iPhone (not a simulator).
 3. Press **⌘R**.
@@ -125,6 +102,22 @@ Without these, iOS silently blocks Bonjour and nothing ever connects.
    connect to devices on your local network"* → **Allow**. (This prompt
    is one-shot; if you denied it: iPhone Settings → Privacy & Security →
    Local Network → enable NeuraMeshPeer.)
+
+Free-Apple-ID caveat: the install expires after **7 days** — the app
+icon stays but refuses to launch; plug in and ⌘R again to re-sign
+(sources unchanged, ~30 s). A paid developer account extends this to a
+year.
+
+<details>
+<summary>Building the project by hand instead (the old Part A)</summary>
+
+If you ever need to recreate the project from scratch: iOS App template
+(SwiftUI), save it OUTSIDE this folder, add the NeuraMeshProtocol
+package as a local dependency (product **NMP**), replace the template
+sources with the 3 files in `NeuraMeshPeer/Sources/`, and add the two
+Info.plist keys from `NeuraMeshPeer/Info-additions.plist`. The checked-in
+project does exactly this.
+</details>
 
 **You should see** on the phone: a "NeuraMesh Peer" screen with a Peer ID,
 a UDP port number, and the log line `advertising NeuraMesh-… on UDP
