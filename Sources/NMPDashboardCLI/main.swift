@@ -182,13 +182,14 @@ func wireComparisonRun(server: NMPDashboardServer,
                     payloadBytes: generation.networkPayloadBytes)) { raceResult in
                     switch raceResult {
                     case .success(let race):
-                        server.reportMeshEvent(String(
-                            format: "🏁 race done over %d trip(s) × %d B: "
-                                + "NMP %.1f ms (handshake %.2f) vs TCP %.1f ms "
-                                + "(handshake %.2f) — both measured",
-                            trips, generation.networkPayloadBytes,
-                            race.nmp.totalMs, race.nmp.handshakeMs,
-                            race.tcp.totalMs, race.tcp.handshakeMs))
+                        let legs = race.legs
+                            .map { String(format: "%@ %.1f ms (handshake %.2f)",
+                                          $0.name, $0.totalMs, $0.handshakeMs) }
+                            .joined(separator: " vs ")
+                        server.reportMeshEvent(
+                            "🏁 race done over \(trips) trip(s) × "
+                            + "\(generation.networkPayloadBytes) B: \(legs) "
+                            + "— all measured")
                         respond(.success(.init(generation: generation, race: race)))
                     case .failure(let error):
                         respond(.failure(.init("transport race failed: \(error)")))
@@ -737,9 +738,13 @@ func pushPeerStates() {
                 alive: true)
         }
         for (peerID, metrics) in latestMetrics where !livePeerIDs.contains(peerID) {
+            // A dropped LAN peer keeps its real device name ("iPhone 17
+            // Pro"), not a synthetic testbed label — the card is how the
+            // user recognizes which physical device left.
             server.updatePeerState(
                 peerID: peerID,
-                name: "testbed-\(String(peerID, radix: 16))",
+                name: knownPeerNames[peerID]
+                    ?? "testbed-\(String(peerID, radix: 16))",
                 latencyMS: Int(Double(metrics.inferenceLatencyMicros) / 1000),
                 loadPercent: 0, assigned: "—", alive: false)
         }

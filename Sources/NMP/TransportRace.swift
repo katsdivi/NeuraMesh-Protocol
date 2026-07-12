@@ -18,21 +18,29 @@
 //             handshake, real kernel TCP, raw bytes (no framing, no
 //             encryption).
 //
+//    TLS leg (Mesh 2.5): kernel TCP + real TLS 1.3, using an ephemeral
+//             self-signed P-256 identity generated in-process
+//             (TLSIdentity.swift); the client pins the exact cert.
+//
+//    QUIC leg (Mesh 2.5): Network.framework QUIC (TLS 1.3 built in),
+//             same pinned identity. What Mesh 2.1 called impossible
+//             without dependencies just needed hand-rolled X.509.
+//
 //  Each round trip sends half the trip's bytes and waits for the far
 //  side to echo them back — request out, response in, exactly the shape
 //  of a mesh inference pass. Every number in the result is a wall-clock
 //  measurement of real sockets on this machine.
 //
 //  WHAT THIS DOES AND DOESN'T CLAIM (stated in the API response too):
-//  - Both legs run over loopback, so radio time is absent from BOTH —
+//  - All legs run over loopback, so radio time is absent from ALL —
 //    the race isolates protocol/stack cost, not Wi-Fi.
-//  - The TCP leg is PLAIN TCP. A production alternative would add TLS,
-//    which costs more (handshake + per-byte crypto); racing plain TCP
-//    is the conservative comparison — NMP is doing per-packet AEAD and
-//    FEC while TCP does nothing, and still has to win.
-//  - QUIC is NOT raced: Network.framework's QUIC requires a TLS
-//    identity (a certificate), which a zero-dependency LAN tool can't
-//    conjure honestly. QUIC stays in the labeled comparison MODEL.
+//  - The plain-TCP leg stays in the race as the floor: NMP does
+//    per-packet AEAD and FEC while plain TCP does nothing, and still
+//    has to win. TLS 1.3 is the like-for-like encrypted comparison.
+//  - Loss recovery is NOT modeled here: every leg binds in the
+//    20000..<40000 band so scripts/loss_lab.sh (root, dummynet/pf) can
+//    inject REAL loss on loopback — rerun the race under it and the
+//    recovery cost shows up in measured transfer time.
 //
 //  Threading: callback style on private queues; `run` completion fires
 //  exactly once (success or timeout). Legs run sequentially so they
@@ -100,15 +108,31 @@ public enum NMPTransportRace {
     }
 
     public struct RaceResult: Sendable {
-        public let nmp: LegResult
-        public let tcp: LegResult
-        public let note = "both legs measured over loopback sockets on this "
-            + "machine — same trip count and bytes; NMP carries Noise IK + "
-            + "AES-256-GCM + FEC, the TCP leg is plain kernel TCP (no TLS). "
-            + "QUIC is not raced (needs a TLS identity) and stays modeled."
+        /// Every leg that ran, in race order (NMP always first). Every
+        /// number in every leg is a wall-clock measurement.
+        public let legs: [LegResult]
+        public let note: String
+
+        public var nmp: LegResult { legs[0] }
+
+        public init(legs: [LegResult], skippedLegs: String? = nil) {
+            self.legs = legs
+            var note = "all legs measured over loopback sockets on this "
+                + "machine — same trip count and bytes per leg; NMP carries "
+                + "Noise IK + AES-256-GCM + FEC; the TLS 1.3 and QUIC legs "
+                + "use an ephemeral self-signed P-256 identity generated "
+                + "in-process (the client pins the exact certificate). "
+                + "Loopback isolates protocol/stack cost — radio time is "
+                + "absent from every leg. For measured loss recovery, shape "
+                + "the race ports first: scripts/loss_lab.sh."
+            if let skippedLegs {
+                note += " SKIPPED: \(skippedLegs)"
+            }
+            self.note = note
+        }
 
         public var asJSONObject: [String: Any] {
-            ["note": note, "legs": [nmp.asJSONObject, tcp.asJSONObject]]
+            ["note": note, "legs": legs.map(\.asJSONObject)]
         }
     }
 
@@ -119,7 +143,11 @@ public enum NMPTransportRace {
 
     // MARK: Entry
 
-    /// Runs the NMP leg, then the TCP leg. Completion fires exactly once
+    /// Runs the legs sequentially: NMP, plain TCP, TCP+TLS 1.3, QUIC.
+    /// The TLS and QUIC legs need the ephemeral identity; if the keychain
+    /// refuses to stage one (locked keychain, headless session) the race
+    /// still returns NMP + TCP with the skip reason in the note — a
+    /// partial measurement beats a model. Completion fires exactly once
     /// on an arbitrary queue.
     public static func run(
         plan: Plan, timeout: TimeInterval = 20,
@@ -127,9 +155,27 @@ public enum NMPTransportRace {
     ) {
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                let nmp = try runNMPLeg(plan: plan, timeout: timeout)
-                let tcp = try runTCPLeg(plan: plan, timeout: timeout)
-                completion(.success(RaceResult(nmp: nmp, tcp: tcp)))
+                var legs = [try runNMPLeg(plan: plan, timeout: timeout),
+                            try runTCPLeg(plan: plan, timeout: timeout)]
+                var skipped: String?
+                #if os(macOS)
+                do {
+                    let identity = try NMPEphemeralTLSIdentity()
+                    defer { identity.cleanup() }
+                    legs.append(try runTLSLeg(plan: plan, timeout: timeout,
+                                              identity: identity))
+                    legs.append(try runQUICLeg(plan: plan, timeout: timeout,
+                                               identity: identity))
+                } catch {
+                    skipped = "TLS 1.3 and QUIC legs — could not stage an "
+                        + "ephemeral TLS identity or complete the leg "
+                        + "(\(error)); nothing is modeled in their place."
+                }
+                #else
+                skipped = "TLS 1.3 and QUIC legs — the race only runs them "
+                    + "on macOS (the dashboard host)."
+                #endif
+                completion(.success(RaceResult(legs: legs, skippedLegs: skipped)))
             } catch let error as RaceError {
                 completion(.failure(error))
             } catch {
@@ -158,7 +204,21 @@ public enum NMPTransportRace {
 
     static func runNMPLeg(plan: Plan, timeout: TimeInterval) throws -> LegResult {
         let listenerQueue = DispatchQueue(label: "nmp.race.udp.listener")
-        let listener = try UDPListener(port: 0, queue: listenerQueue)
+        // Bind inside the race band (20000..<40000) so loss_lab.sh can
+        // shape every leg with one port-range rule; fall back to an
+        // ephemeral port rather than fail the leg.
+        var boundListener: UDPListener?
+        for _ in 0..<8 {
+            let candidate = NWEndpoint.Port(
+                rawValue: UInt16.random(in: 20000..<40000))!
+            if let bound = try? UDPListener(port: candidate,
+                                            queue: listenerQueue) {
+                boundListener = bound
+                break
+            }
+        }
+        let listener = try boundListener
+            ?? UDPListener(port: 0, queue: listenerQueue)
 
         let initiatorStatic = NoiseStaticKeyPair()
         let responderStatic = NoiseStaticKeyPair()
@@ -269,10 +329,102 @@ public enum NMPTransportRace {
             bytesMoved: perDirection * 2 * plan.roundTrips)
     }
 
-    // MARK: TCP leg (blocking; runs on the global queue from `run`)
+    // MARK: Stream legs (blocking; run on the global queue from `run`)
 
     static func runTCPLeg(plan: Plan, timeout: TimeInterval) throws -> LegResult {
-        let serverQueue = DispatchQueue(label: "nmp.race.tcp.server")
+        let parameters = { () -> NWParameters in
+            let parameters = NWParameters.tcp
+            parameters.allowLocalEndpointReuse = true
+            return parameters
+        }
+        return try runStreamLeg(
+            plan: plan, timeout: timeout, name: "TCP",
+            transportDescription: "kernel TCP stream, no TLS, no framing "
+                + "(loopback)",
+            listenerParameters: parameters,
+            clientParameters: { NWParameters.tcp })
+    }
+
+    #if os(macOS)
+    static func runTLSLeg(plan: Plan, timeout: TimeInterval,
+                          identity: NMPEphemeralTLSIdentity) throws -> LegResult {
+        try runStreamLeg(
+            plan: plan, timeout: timeout, name: "TCP+TLS 1.3",
+            transportDescription: "kernel TCP + TLS 1.3, ephemeral "
+                + "self-signed P-256 identity, certificate pinned (loopback)",
+            listenerParameters: {
+                let tls = NWProtocolTLS.Options()
+                Self.configureServer(tls.securityProtocolOptions,
+                                     identity: identity)
+                let parameters = NWParameters(tls: tls)
+                parameters.allowLocalEndpointReuse = true
+                return parameters
+            },
+            clientParameters: {
+                let tls = NWProtocolTLS.Options()
+                Self.configureClient(tls.securityProtocolOptions,
+                                     pinnedDER: identity.certificateDER)
+                return NWParameters(tls: tls)
+            })
+    }
+
+    static func runQUICLeg(plan: Plan, timeout: TimeInterval,
+                           identity: NMPEphemeralTLSIdentity) throws -> LegResult {
+        try runStreamLeg(
+            plan: plan, timeout: timeout, name: "QUIC",
+            transportDescription: "Network.framework QUIC (TLS 1.3 built "
+                + "in, ALPN nmp-race), same pinned identity (loopback)",
+            listenerParameters: {
+                let quic = NWProtocolQUIC.Options(alpn: ["nmp-race"])
+                Self.configureServer(quic.securityProtocolOptions,
+                                     identity: identity)
+                return NWParameters(quic: quic)
+            },
+            clientParameters: {
+                let quic = NWProtocolQUIC.Options(alpn: ["nmp-race"])
+                Self.configureClient(quic.securityProtocolOptions,
+                                     pinnedDER: identity.certificateDER)
+                return NWParameters(quic: quic)
+            })
+    }
+
+    private static func configureServer(_ options: sec_protocol_options_t,
+                                        identity: NMPEphemeralTLSIdentity) {
+        sec_protocol_options_set_min_tls_protocol_version(options, .TLSv13)
+        if let secIdentity = sec_identity_create(identity.identity) {
+            sec_protocol_options_set_local_identity(options, secIdentity)
+        }
+    }
+
+    /// Pin the exact generated certificate — byte equality, no policy
+    /// evaluation. Nothing outside this process ever trusts this cert.
+    private static func configureClient(_ options: sec_protocol_options_t,
+                                        pinnedDER: Data) {
+        sec_protocol_options_set_min_tls_protocol_version(options, .TLSv13)
+        sec_protocol_options_set_verify_block(options, { _, secTrust, complete in
+            let trust = sec_trust_copy_ref(secTrust).takeRetainedValue()
+            var matches = false
+            if let chain = SecTrustCopyCertificateChain(trust)
+                as? [SecCertificate],
+               let leaf = chain.first {
+                matches = SecCertificateCopyData(leaf) as Data == pinnedDER
+            }
+            complete(matches)
+        }, DispatchQueue(label: "nmp.race.tls.verify"))
+    }
+    #endif
+
+    /// One echo leg over an NWListener/NWConnection pair — TCP, TCP+TLS,
+    /// and QUIC all reduce to this: bind in the race band, connect,
+    /// measure start → .ready as the handshake, then replay the plan's
+    /// round trips and measure the transfer.
+    static func runStreamLeg(
+        plan: Plan, timeout: TimeInterval, name: String,
+        transportDescription: String,
+        listenerParameters: () -> NWParameters,
+        clientParameters: () -> NWParameters
+    ) throws -> LegResult {
+        let serverQueue = DispatchQueue(label: "nmp.race.stream.server")
         // Bind BELOW the kernel's ephemeral range (49152+). An ephemeral
         // listener port lands where this process's earlier loopback
         // connections left TIME_WAIT four-tuples, and connects to such a
@@ -281,22 +433,25 @@ public enum NMPTransportRace {
         // construction; retry a few times in case one is genuinely taken.
         var listener: NWListener?
         for _ in 0..<8 {
-            let parameters = NWParameters.tcp
-            parameters.allowLocalEndpointReuse = true
             let candidate = NWEndpoint.Port(
                 rawValue: UInt16.random(in: 20000..<40000))!
-            if let bound = try? NWListener(using: parameters, on: candidate) {
+            if let bound = try? NWListener(using: listenerParameters(),
+                                           on: candidate) {
                 listener = bound
                 break
             }
         }
         guard let listener else {
             throw RaceError.setupFailed(
-                "TCP listener: no bindable port in 20000..<40000")
+                "\(name) listener: no bindable port in 20000..<40000")
         }
 
-        // Echo server: stream every received byte straight back.
-        var serverSide: NWConnection?
+        // Echo server: stream every received byte straight back. Accept
+        // and pump EVERY inbound connection — QUIC hands the listener two
+        // (the connection plus the client's stream); cancelling the
+        // "extra" one kills the stream that carries the data.
+        let serverLock = NSLock()
+        var serverSides: [NWConnection] = []
         func pump(_ connection: NWConnection) {
             connection.receive(minimumIncompleteLength: 1,
                                maximumLength: 256 << 10) { data, _, isComplete, error in
@@ -309,11 +464,9 @@ public enum NMPTransportRace {
             }
         }
         listener.newConnectionHandler = { connection in
-            guard serverSide == nil else {
-                connection.cancel()
-                return
-            }
-            serverSide = connection
+            serverLock.lock()
+            serverSides.append(connection)
+            serverLock.unlock()
             connection.start(queue: serverQueue)
             pump(connection)
         }
@@ -326,10 +479,13 @@ public enum NMPTransportRace {
         guard listenerReady.wait(timeout: .now() + timeout) == .success,
               let port = listener.port else {
             listener.cancel()
-            throw RaceError.setupFailed("TCP listener never became ready")
+            throw RaceError.setupFailed("\(name) listener never became ready")
         }
         defer {
-            serverSide?.cancel()
+            serverLock.lock()
+            let connections = serverSides
+            serverLock.unlock()
+            connections.forEach { $0.cancel() }
             listener.cancel()
         }
 
@@ -348,7 +504,8 @@ public enum NMPTransportRace {
         var lastProblem = "no state change seen"
         let attempts = 4
         for attempt in 1...attempts {
-            let candidate = NWConnection(host: "127.0.0.1", port: port, using: .tcp)
+            let candidate = NWConnection(host: "127.0.0.1", port: port,
+                                         using: clientParameters())
             let ready = DispatchSemaphore(value: 0)
             let stateLock = NSLock()
             var problem: String?
@@ -372,7 +529,7 @@ public enum NMPTransportRace {
                 }
             }
             let began = DispatchTime.now()
-            candidate.start(queue: DispatchQueue(label: "nmp.race.tcp.client"))
+            candidate.start(queue: DispatchQueue(label: "nmp.race.stream.client"))
             let attemptWindow = attempt < attempts ? min(timeout, 2.0) : timeout
             let outcome = ready.wait(timeout: .now() + attemptWindow)
 
@@ -389,7 +546,7 @@ public enum NMPTransportRace {
         }
         guard let client else {
             throw RaceError.timedOut(
-                "TCP connect to 127.0.0.1:\(port) after \(attempts) "
+                "\(name) connect to 127.0.0.1:\(port) after \(attempts) "
                     + "attempts — \(lastProblem)")
         }
         defer { client.cancel() }
@@ -428,15 +585,14 @@ public enum NMPTransportRace {
             client.send(content: payload, completion: .contentProcessed { _ in })
             guard tripDone.wait(timeout: .now() + timeout) == .success else {
                 throw RaceError.timedOut(
-                    "TCP echo round trip (\(perDirection) B/direction)")
+                    "\(name) echo round trip (\(perDirection) B/direction)")
             }
         }
         let transferMs = elapsedMs(since: transferBegan)
 
         return LegResult(
-            name: "TCP",
-            transportDescription: "kernel TCP stream, no TLS, no framing "
-                + "(loopback)",
+            name: name,
+            transportDescription: transportDescription,
             handshakeMs: handshakeMs,
             transferMs: transferMs,
             roundTrips: plan.roundTrips,

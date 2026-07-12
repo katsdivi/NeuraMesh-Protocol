@@ -67,7 +67,10 @@ final class TransportRaceTests: XCTestCase {
         let plan = NMPTransportRace.Plan(roundTrips: 6, payloadBytes: 24_000)
         let result = try NMPTransportRace.runSync(plan: plan, timeout: 15)
 
-        for leg in [result.nmp, result.tcp] {
+        // Mesh 2.5 grew the race to four legs; the original two are
+        // still the anchors (leg 0 = NMP, leg 1 = plain TCP).
+        XCTAssertGreaterThanOrEqual(result.legs.count, 2)
+        for leg in result.legs {
             XCTAssertGreaterThan(leg.handshakeMs, 0, "\(leg.name) handshake")
             XCTAssertGreaterThan(leg.transferMs, 0, "\(leg.name) transfer")
             XCTAssertEqual(leg.roundTrips, 6)
@@ -76,8 +79,8 @@ final class TransportRaceTests: XCTestCase {
             XCTAssertEqual(leg.asJSONObject["measured"] as? Bool, true)
         }
         XCTAssertTrue(result.nmp.transportDescription.contains("AES-256-GCM"))
-        XCTAssertTrue(result.tcp.transportDescription.contains("no TLS"))
-        XCTAssertTrue(result.note.contains("QUIC is not raced"))
+        XCTAssertTrue(result.legs[1].transportDescription.contains("no TLS"))
+        XCTAssertTrue(result.note.contains("measured"))
     }
 
     /// A single big trip exercises the chunked NMP send path (payload
@@ -85,8 +88,9 @@ final class TransportRaceTests: XCTestCase {
     func testChunkedTripReassemblesFullByteCount() throws {
         let plan = NMPTransportRace.Plan(roundTrips: 1, payloadBytes: 40_000)
         let result = try NMPTransportRace.runSync(plan: plan, timeout: 15)
-        XCTAssertEqual(result.nmp.bytesMoved, 20_000 * 2)
-        XCTAssertEqual(result.tcp.bytesMoved, 20_000 * 2)
+        for leg in result.legs {
+            XCTAssertEqual(leg.bytesMoved, 20_000 * 2, leg.name)
+        }
     }
 }
 
@@ -342,7 +346,7 @@ final class Mesh21RouteTests: XCTestCase {
             XCTAssertEqual(request.prompt, "race me")
             respond(.success(.init(
                 generation: generation,
-                race: NMPTransportRace.RaceResult(nmp: nmp, tcp: tcp))))
+                race: NMPTransportRace.RaceResult(legs: [nmp, tcp]))))
         }
 
         let (status, data) = try request(

@@ -24,7 +24,7 @@ on the Wi-Fi, real-time token streaming to every open browser, ACTUALLY-measured
 NMP-vs-TCP transport race, live device resource panel with compute-share sliders
 that re-shard the mesh, web-client tracking, benchmarking center, QR/Bonjour
 discovery; see `Docs/Mesh2_WebUI_Guide.md`)**.
-**316 tests pass, 0 failures.**
+**326 tests pass, 0 failures.**
 
 ## Requirements
 
@@ -36,7 +36,7 @@ discovery; see `Docs/Mesh2_WebUI_Guide.md`)**.
 ```bash
 cd NeuraMeshProtocol
 swift build
-swift test                             # 316 unit + loopback integration tests
+swift test                             # 326 unit + loopback integration tests
 
 swift run nmp-peer                     # compute peer (cross-device mesh)
 swift run nmp-coordinator              # coordinator + cross-device benchmark

@@ -1005,10 +1005,11 @@ public final class NMPDashboardServer {
     }
 
     /// Serializes a comparison run: the real generation, the measured
-    /// transport race, and the "splice" projection — the generation's
-    /// wall clock with the NMP leg's measured transport time swapped for
-    /// TCP's measured transport time. Every input to the splice is a
-    /// measurement; the splice itself is arithmetic, and says so.
+    /// transport race, and one "splice" projection per raced transport —
+    /// the generation's wall clock with the NMP leg's measured transport
+    /// time swapped for that leg's measured transport time. Every input
+    /// to a splice is a measurement; the splice itself is arithmetic,
+    /// and says so.
     static func comparisonRunJSON(_ outcome: ComparisonRunOutcome) -> [String: Any] {
         let generation = outcome.generation
         let race = outcome.race
@@ -1016,12 +1017,14 @@ public final class NMPDashboardServer {
         let tokensPerSec: (Double) -> Double = { totalMs in
             totalMs > 0 ? Double(generation.tokenCount) / (totalMs / 1000) : 0
         }
-        let splicedTCPMs = generationMs - race.nmp.totalMs + race.tcp.totalMs
+
+        let projected = projectedJSON(race: race, generationMs: generationMs,
+                                      tokenCount: generation.tokenCount)
 
         return [
-            "note": "generation and both race legs are measured; the "
-                + "projection is measured-generation wall clock with NMP's "
-                + "measured transport time replaced by TCP's",
+            "note": "generation and every race leg are measured; each "
+                + "projection is the measured generation wall clock with "
+                + "NMP's measured transport time replaced by that leg's",
             "generation": [
                 "output": generation.text,
                 "token_count": generation.tokenCount,
@@ -1033,21 +1036,33 @@ public final class NMPDashboardServer {
                 "engine": generation.engine,
             ] as [String: Any],
             "race": race.asJSONObject,
-            "projected": [
-                [
-                    "name": "NMP (the run itself)",
-                    "total_ms": round2(generationMs),
-                    "tokens_per_sec": round2(tokensPerSec(generationMs)),
-                    "basis": "measured",
-                ] as [String: Any],
-                [
-                    "name": "TCP transport splice",
-                    "total_ms": round2(splicedTCPMs),
-                    "tokens_per_sec": round2(tokensPerSec(splicedTCPMs)),
-                    "basis": "measured splice (no TLS; TLS would cost more)",
-                ] as [String: Any],
-            ],
+            "projected": projected,
         ]
+    }
+
+    /// Whole-generation totals per raced transport: element 0 is the
+    /// measured run; the rest swap NMP's measured transport time for
+    /// each leg's measured transport time (arithmetic on measurements).
+    static func projectedJSON(race: NMPTransportRace.RaceResult,
+                              generationMs: Double,
+                              tokenCount: Int) -> [[String: Any]] {
+        let tokensPerSec: (Double) -> Double = { totalMs in
+            totalMs > 0 ? Double(tokenCount) / (totalMs / 1000) : 0
+        }
+        return [[
+            "name": "NMP (the run itself)",
+            "total_ms": round2(generationMs),
+            "tokens_per_sec": round2(tokensPerSec(generationMs)),
+            "basis": "measured",
+        ]] + race.legs.dropFirst().map { leg in
+            let splicedMs = generationMs - race.nmp.totalMs + leg.totalMs
+            return [
+                "name": "\(leg.name) transport splice",
+                "total_ms": round2(splicedMs),
+                "tokens_per_sec": round2(tokensPerSec(splicedMs)),
+                "basis": "measured splice",
+            ]
+        }
     }
 
     private func handleDevicesGET(_ client: Client) {
@@ -1202,17 +1217,6 @@ public final class NMPDashboardServer {
                         "round_trips": roundTrips,
                         "wire_format": self.storedMeshInfo.wireFormat,
                     ]
-                    if enableComparison, result.tokenCount > 0, result.totalSeconds > 0 {
-                        object["protocol_comparison"] = [
-                            "note": "NMP row measured; TCP/QUIC modeled from it",
-                            "protocols": NMPProtocolComparisonModel.compare(.init(
-                                tokens: result.tokenCount,
-                                payloadBytes: result.networkPayloadBytes,
-                                roundTrips: roundTrips,
-                                measuredTotalSeconds: result.totalSeconds))
-                                .map(\.asJSONObject),
-                        ] as [String: Any]
-                    }
                     if let stats = result.speculation {
                         object["speculation"] = [
                             "drafter": stats.drafterName,
@@ -1227,7 +1231,40 @@ public final class NMPDashboardServer {
                                  * 100).rounded() / 100,
                         ]
                     }
-                    self.respondJSON(client, status: "200 OK", object: object)
+                    // Mesh 2.5: "Compare protocols" runs the MEASURED
+                    // transport race on the generation's real traffic
+                    // pattern — the modeled re-pricing is gone from this
+                    // path (it survives only in the labeled what-if
+                    // explorer, POST /api/comparison).
+                    guard enableComparison, result.tokenCount > 0,
+                          result.totalSeconds > 0 else {
+                        self.respondJSON(client, status: "200 OK", object: object)
+                        return
+                    }
+                    let plan = NMPTransportRace.Plan(
+                        roundTrips: roundTrips,
+                        payloadBytes: result.networkPayloadBytes)
+                    NMPTransportRace.run(plan: plan) { [weak self, weak client] raced in
+                        guard let self, let client else { return }
+                        self.queue.async {
+                            var object = object
+                            switch raced {
+                            case .success(let race):
+                                object["transport_race"] = [
+                                    "race": race.asJSONObject,
+                                    "projected": Self.projectedJSON(
+                                        race: race,
+                                        generationMs: result.totalSeconds * 1000,
+                                        tokenCount: result.tokenCount),
+                                ] as [String: Any]
+                            case .failure(let error):
+                                object["transport_race_error"] =
+                                    String(describing: error)
+                            }
+                            self.respondJSON(client, status: "200 OK",
+                                             object: object)
+                        }
+                    }
                 case .failure(let status, let message):
                     self.respondJSON(
                         client,

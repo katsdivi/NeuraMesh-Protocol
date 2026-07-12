@@ -6,6 +6,7 @@ export type View =
   | 'devices'
   | 'benchmark'
   | 'compare'
+  | 'pressure'
   | 'settings';
 
 const TABS: { id: View; label: string }[] = [
@@ -14,6 +15,7 @@ const TABS: { id: View; label: string }[] = [
   { id: 'devices', label: 'Devices' },
   { id: 'benchmark', label: 'Benchmark' },
   { id: 'compare', label: 'Compare' },
+  { id: 'pressure', label: 'Pressure' },
   { id: 'settings', label: 'Settings' },
 ];
 

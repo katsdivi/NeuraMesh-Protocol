@@ -379,6 +379,45 @@ encrypted UDP each way under heartbeat load, serve counter climbing,
 and its own kernel counters (RAM/CPU; GPU is nil — iOS exposes no
 public counter) on the device card.
 
+### 5.9 Mesh 2.5 — nothing modeled: TLS 1.3 + QUIC raced, pressure lab in the UI
+
+Mesh 2.1's race stopped at plain TCP because Network.framework's TLS
+and QUIC need a certificate identity and "a zero-dependency tool can't
+conjure one". Mesh 2.5 conjures one honestly: `TLSIdentity.swift`
+hand-rolls a self-signed X.509 (P-256, ecdsa-with-SHA256, DER by hand)
+with the key born in the legacy keychain, stages the cert next to it,
+uses the resulting `SecIdentity` for the race, and deletes everything
+after. The client leg never "trusts" the cert — it pins the exact DER
+bytes generated in-process.
+
+The race is now four measured legs — NMP (full stack), plain TCP (the
+floor), TCP+TLS 1.3 (the like-for-like encrypted comparison), QUIC —
+same trip count and bytes per leg, wall-clock only. `enable_comparison`
+on `POST /api/inference` runs this race on the generation's real traffic
+pattern and attaches it as `transport_race`; the modeled re-pricing
+survives only in the Compare tab's what-if explorer, labeled as such.
+Loss recovery is measured too, not constant-driven: every leg binds in
+20000..<40000 and `sudo scripts/loss_lab.sh start 5 10` shapes exactly
+that band with dummynet/pf — race clean, race shaped, diff the transfer
+times.
+
+The Pressure tab puts the terminal hammer scripts in the browser: soak
+(N sequential generations, latency table + drop detection via before/
+after peer snapshots), burst (M simultaneous requests — the coordinator
+serializes generations and sheds overload with 429s, which the tab
+counts as correct behavior), and max-payload (128-token runs). Peer
+drops mid-phase are named in the verdict. What stays outside the
+browser: the loss lab (root) and the phone's Network Link Conditioner
+(Settings ▸ Developer on the device) — `Docs/Pressure_Test_Guide.md`
+covers both plus Instruments profiling of the phone app.
+
+Also in 2.5: device cards show marketing names for known hardware ids
+("iPhone 17 Pro (iPhone18,1)" — the id really is one generation off the
+name), dropped LAN peers keep their device name instead of decaying to
+a testbed label, and reference-engine output is labeled as placeholder
+vocabulary in the Run tab (it exercises the protocol; it does not speak
+English — that's llama's job).
+
 ## 6. Web endpoint verification (from scratch)
 
 ```bash

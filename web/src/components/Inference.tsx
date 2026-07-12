@@ -1,8 +1,26 @@
 import { useState } from 'react';
 import { useInference } from '../hooks/useInference';
-import { ProtocolComparison } from './ProtocolComparison';
+import { RaceResults } from './ProtocolComparison';
 import type { MeshHealth } from '../api';
 import type { LiveGeneration } from '../hooks/useMesh';
+
+/**
+ * The reference engine is a protocol testbed, not a trained language
+ * model — its tokens are deterministic placeholder vocabulary. Saying so
+ * next to the output beats letting anyone read the word salad as a bug
+ * (or worse, as real inference quality).
+ */
+function ReferenceOutputNote({ engine }: { engine?: string }) {
+  if (engine !== 'reference') return null;
+  return (
+    <div className="note-box">
+      Reference-engine output is deterministic placeholder vocabulary —
+      the mesh moves real tensors through real shards, but this engine
+      exists to exercise the protocol, not to speak English. For real
+      text, launch with <code>--engine llamaCpp</code> and a GGUF model.
+    </div>
+  );
+}
 
 export function Inference({
   health,
@@ -62,7 +80,7 @@ export function Inference({
               onChange={(event) => setComparison(event.target.checked)}
             />
             <label htmlFor="comparison" style={{ textTransform: 'none', margin: 0 }}>
-              Compare protocols
+              Race transports (measured)
             </label>
           </div>
           <div className="form-group checkbox-group">
@@ -113,6 +131,7 @@ export function Inference({
             {live.tokens.join(joiner) || '…'}
             <span className="cursor">▋</span>
           </div>
+          <ReferenceOutputNote engine={health?.mesh.engine} />
         </div>
       )}
 
@@ -128,6 +147,7 @@ export function Inference({
           <div className="output-box">
             {spectatorResult.output || '(no tokens emitted)'}
           </div>
+          <ReferenceOutputNote engine={health?.mesh.engine} />
           <div className="grid">
             <div className="metric-card">
               <div className="metric-label">Throughput</div>
@@ -166,6 +186,7 @@ export function Inference({
       {result && !streaming && (
         <div>
           <div className="output-box">{result.output || '(no tokens emitted)'}</div>
+          <ReferenceOutputNote engine={result.engine} />
 
           <div className="grid">
             <div className="metric-card">
@@ -206,11 +227,18 @@ export function Inference({
             </div>
           )}
 
-          {result.protocol_comparison && (
-            <ProtocolComparison
-              protocols={result.protocol_comparison.protocols}
-              note={result.protocol_comparison.note}
+          {result.transport_race && (
+            <RaceResults
+              race={result.transport_race.race}
+              projected={result.transport_race.projected}
             />
+          )}
+          {result.transport_race_error && (
+            <div className="note-box">
+              Transport race failed: {result.transport_race_error} — the
+              generation numbers above are unaffected; nothing modeled was
+              substituted.
+            </div>
           )}
         </div>
       )}

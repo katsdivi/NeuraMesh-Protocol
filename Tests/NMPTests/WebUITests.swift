@@ -249,7 +249,10 @@ final class WebUIRouteTests: XCTestCase {
 
     // MARK: /api/inference comparison attachment
 
-    func testInferenceAttachesProtocolComparisonWhenAsked() throws {
+    /// Mesh 2.5: enable_comparison attaches the MEASURED transport race
+    /// (real sockets on the generation's traffic pattern); the modeled
+    /// protocol_comparison no longer rides on inference responses.
+    func testInferenceAttachesMeasuredRaceWhenAsked() throws {
         server.onInferenceRequest = { request, respond in
             XCTAssertTrue(request.enableComparison)
             respond(.success(.init(
@@ -263,8 +266,14 @@ final class WebUIRouteTests: XCTestCase {
         XCTAssertEqual(status, 200)
         let object = try json(data)
         XCTAssertEqual(object["round_trips"] as? Int, 4)
-        let comparison = try XCTUnwrap(object["protocol_comparison"] as? [String: Any])
-        XCTAssertEqual((comparison["protocols"] as? [[String: Any]])?.count, 3)
+        XCTAssertNil(object["protocol_comparison"],
+                     "modeled numbers must not ride on inference anymore")
+        let transportRace = try XCTUnwrap(
+            object["transport_race"] as? [String: Any],
+            "error: \(object["transport_race_error"] ?? "none")")
+        let race = try XCTUnwrap(transportRace["race"] as? [String: Any])
+        XCTAssertGreaterThanOrEqual(
+            try XCTUnwrap(race["legs"] as? [[String: Any]]).count, 2)
     }
 
     // MARK: CORS

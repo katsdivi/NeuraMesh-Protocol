@@ -5,6 +5,7 @@ import { Inference } from './components/Inference';
 import { Devices } from './components/Devices';
 import { Benchmarking } from './components/Benchmarking';
 import { Compare } from './components/Compare';
+import { Pressure } from './components/Pressure';
 import { Settings } from './components/Settings';
 import { useMesh } from './hooks/useMesh';
 
@@ -78,6 +79,7 @@ export function App() {
         {view === 'devices' && <Devices />}
         {view === 'benchmark' && <Benchmarking />}
         {view === 'compare' && <Compare />}
+        {view === 'pressure' && <Pressure />}
         {view === 'settings' && <Settings health={health} sendControl={sendControl} />}
       </main>
     </div>

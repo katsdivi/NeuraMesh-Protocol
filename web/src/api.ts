@@ -112,6 +112,18 @@ export interface RaceLeg {
   bytes_moved: number;
 }
 
+export interface RaceProjection {
+  name: string;
+  total_ms: number;
+  tokens_per_sec: number;
+  basis: string;
+}
+
+export interface TransportRace {
+  race: { note: string; legs: RaceLeg[] };
+  projected: RaceProjection[];
+}
+
 export interface ComparisonRun {
   note: string;
   generation: {
@@ -124,12 +136,7 @@ export interface ComparisonRun {
     engine: string;
   };
   race: { note: string; legs: RaceLeg[] };
-  projected: {
-    name: string;
-    total_ms: number;
-    tokens_per_sec: number;
-    basis: string;
-  }[];
+  projected: RaceProjection[];
 }
 
 export interface Device {
@@ -173,7 +180,10 @@ export interface InferenceResult {
   round_trips: number;
   wire_format: string;
   speculation?: SpeculationStats;
-  protocol_comparison?: { note: string; protocols: ProtocolEstimate[] };
+  /** Mesh 2.5: "Compare protocols" runs the MEASURED transport race on
+   *  the generation's real traffic pattern — no modeled numbers here. */
+  transport_race?: TransportRace;
+  transport_race_error?: string;
 }
 
 export interface BenchmarkRun {

@@ -376,10 +376,30 @@ public enum NMPSystemCapabilityProbe {
             var buffer = [CChar](repeating: 0, count: size)
             guard sysctlbyname(key, &buffer, &size, nil, 0) == 0 else { continue }
             let model = String(cString: buffer)
-            if !model.isEmpty { return model }
+            if !model.isEmpty { return displayName(forHardwareIdentifier: model) }
         }
         #endif
         return ProcessInfo.processInfo.hostName
+    }
+
+    /// Apple's hardware identifiers are one generation off the marketing
+    /// names people know — "iPhone18,1" IS the iPhone 17 Pro, "iPhone17,1"
+    /// the iPhone 16 Pro. Map the identifiers we're sure of and keep the
+    /// raw id in parentheses; an identifier not in the table is shown
+    /// verbatim rather than guessed (a wrong name is worse than a code).
+    public static func displayName(forHardwareIdentifier identifier: String) -> String {
+        let known: [String: String] = [
+            "iPhone14,7": "iPhone 14", "iPhone14,8": "iPhone 14 Plus",
+            "iPhone15,2": "iPhone 14 Pro", "iPhone15,3": "iPhone 14 Pro Max",
+            "iPhone15,4": "iPhone 15", "iPhone15,5": "iPhone 15 Plus",
+            "iPhone16,1": "iPhone 15 Pro", "iPhone16,2": "iPhone 15 Pro Max",
+            "iPhone17,3": "iPhone 16", "iPhone17,4": "iPhone 16 Plus",
+            "iPhone17,1": "iPhone 16 Pro", "iPhone17,2": "iPhone 16 Pro Max",
+            "iPhone17,5": "iPhone 16e",
+            "iPhone18,1": "iPhone 17 Pro", "iPhone18,2": "iPhone 17 Pro Max",
+        ]
+        guard let name = known[identifier] else { return identifier }
+        return "\(name) (\(identifier))"
     }
 
     /// RAM-based tier estimate. Apple Silicon Macs and iPhone Pro devices

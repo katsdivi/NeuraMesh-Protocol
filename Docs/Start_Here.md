@@ -23,7 +23,7 @@ network — those block mDNS discovery).
 ```bash
 cd ~/neuramesh/NeuraMeshProtocol
 
-# 1. Build + prove everything works (316 tests, ~20 s):
+# 1. Build + prove everything works (326 tests, ~20 s):
 swift build && swift test
 
 # 2. (Only for real-LLM mode) build the llama.cpp shim:
@@ -184,7 +184,7 @@ updates live on **all** of them (WebSocket pushes + 2–3 s polling).
 ### 5.0 The full suite
 
 ```bash
-swift test          # 316 tests, 0 failures expected, ~20 s
+swift test          # 326 tests, 0 failures expected, ~20 s
 ```
 
 Llama-backed tests skip automatically unless the shim + a model exist;
