@@ -238,6 +238,29 @@ function PeerCard({
   const hasNetwork =
     peer.net_in_bytes_per_sec !== undefined ||
     peer.wire_in_mb !== undefined;
+  // iOS gethostname() says "localhost" — the peer's advertised name is
+  // the useful label there.
+  const resourcesLabel =
+    resources && resources.hostname.startsWith('localhost')
+      ? peer.name
+      : resources?.hostname;
+
+  if (!peer.alive) {
+    return (
+      <div className="card peer-card">
+        <div className="peer-head">
+          <div className="device-dot dead" />
+          <div className="device-name">{peer.name}</div>
+          <span className="badge modeled">dropped</span>
+        </div>
+        <div className="fact-empty">
+          Dropped from the mesh (closed, backgrounded, or silent past the
+          health timeout) — the mesh re-sharded around it. It rejoins
+          automatically when it reappears on the network.
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="card peer-card">
@@ -326,7 +349,7 @@ function PeerCard({
       {remoteHardware && resources && (
         <div className="peer-resources">
           <div className="peer-section-title">
-            Resources on {resources.hostname}
+            Resources on {resourcesLabel}
             <span className="badge measured">measured on device</span>
           </div>
           <ResourceBar

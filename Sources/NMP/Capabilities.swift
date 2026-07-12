@@ -358,9 +358,19 @@ public enum NMPSystemCapabilityProbe {
 
     /// Hardware model string ("Mac14,9", "iPhone16,1"), falling back to the
     /// host name where sysctl is unavailable.
+    ///
+    /// Key order is platform-specific: on iOS `hw.model` is the BOARD id
+    /// ("V53AP") — `hw.machine` is the recognizable "iPhone17,1". On macOS
+    /// it's the reverse: `hw.machine` is just "arm64" and `hw.model` is
+    /// the "Mac15,12" people can look up.
     public static func deviceModel() -> String {
         #if canImport(Darwin)
-        for key in ["hw.model", "hw.machine"] {
+        #if os(iOS) || os(tvOS) || os(watchOS)
+        let keys = ["hw.machine", "hw.model"]
+        #else
+        let keys = ["hw.model", "hw.machine"]
+        #endif
+        for key in keys {
             var size = 0
             guard sysctlbyname(key, nil, &size, nil, 0) == 0, size > 0 else { continue }
             var buffer = [CChar](repeating: 0, count: size)

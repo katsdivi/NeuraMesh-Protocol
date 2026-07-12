@@ -36,6 +36,8 @@ public enum NMPMeshMessageKind: UInt8, Sendable {
     case metrics           = 0x04
     case shardAck          = 0x05
     case resourceReport    = 0x06
+    case ping              = 0x07
+    case pong              = 0x08
 }
 
 public enum NMPShardCodecError: Error, Equatable, Sendable {
@@ -462,6 +464,43 @@ public struct NMPPeerResourceReport: Equatable, Sendable {
             cpuPercent: unpackPercent(bytes.readBigEndianUInt16(at: 26)),
             gpuPercent: unpackPercent(bytes.readBigEndianUInt16(at: 28)),
             hostname: hostname)
+    }
+}
+
+/// Mesh 2.4: coordinator → peer keepalive. The activity-based health
+/// monitor reads silence as death, but a pipeline stalled on ONE slow
+/// stage (a backgrounded iPhone, a Wi-Fi hiccup) leaves every OTHER peer
+/// silent too — pinging idle peers lets the alive ones answer instead of
+/// being dropped for someone else's stall. The pong echoes the nonce;
+/// receiving ANY authenticated packet already counts as activity, so the
+/// pong needs no handling beyond arriving. Peers older than Mesh 2.4
+/// ignore pings (unknown-kind diagnostic) and keep working — they just
+/// stay droppable when idle, exactly as before.
+///
+/// kind(u8)=0x07/0x08 ‖ nonce(u64)
+public struct NMPPeerPing: Equatable, Sendable {
+    public var nonce: UInt64
+
+    public init(nonce: UInt64 = UInt64.random(in: UInt64.min...UInt64.max)) {
+        self.nonce = nonce
+    }
+
+    public func encode() -> Data {
+        var out = Data([NMPMeshMessageKind.ping.rawValue])
+        out.appendBigEndian(nonce)
+        return out
+    }
+
+    public static func decode(_ data: Data) throws -> NMPPeerPing {
+        let bytes = try requireKind(.ping, data, minLength: 9)
+        return NMPPeerPing(nonce: bytes.readBigEndianUInt64(at: 1))
+    }
+
+    /// The echo a peer sends back.
+    public func pongPayload() -> Data {
+        var out = Data([NMPMeshMessageKind.pong.rawValue])
+        out.appendBigEndian(nonce)
+        return out
     }
 }
 

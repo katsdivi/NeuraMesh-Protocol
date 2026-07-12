@@ -227,6 +227,18 @@ public final class NMPInferenceOrchestrator {
         }
     }
 
+    /// Mesh 2.4: tiny encrypted keepalive the peer echoes back. The echo
+    /// counts as packet activity, letting the health monitor distinguish
+    /// "idle because another stage is slow" from "dead". No-op for peers
+    /// we hold no connection to (the local shard).
+    public func sendKeepalivePing(to peerID: UInt32) {
+        queue.async { [self] in
+            guard let connection = connections[peerID] else { return }
+            connection.sendAsync(priority: .critical,
+                                 payload: NMPPeerPing().encode())
+        }
+    }
+
     public func detachPeer(peerID: UInt32) {
         queue.async { [self] in
             connections.removeValue(forKey: peerID)
@@ -607,6 +619,10 @@ public final class NMPInferenceOrchestrator {
             if let report = try? NMPPeerResourceReport.decode(payload) {
                 onPeerResourceReport?(report)
             }
+        case .pong:
+            // Keepalive echo — its arrival already fired onPeerActivity
+            // (every authenticated packet does), which is its whole job.
+            break
         default:
             onDiagnostic?("orchestrator ignoring mesh message from \(peerID)")
         }

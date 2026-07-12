@@ -160,6 +160,20 @@ public final class NMPResourceMonitor {
     // MARK: Storage
 
     static func storage() -> (total: UInt64, free: UInt64) {
+        // volumeAvailableCapacityForImportantUsage counts purgeable space
+        // the system frees on demand (caches, offloadable content) — the
+        // number Settings/Finder show as "available". Raw statfs f_bavail
+        // excludes it, which read as "wrong free storage" next to
+        // Settings (an iPhone reporting 21 GB free vs Settings' ~40).
+        let home = URL(fileURLWithPath: NSHomeDirectory())
+        if let values = try? home.resourceValues(forKeys: [
+                .volumeTotalCapacityKey,
+                .volumeAvailableCapacityForImportantUsageKey]),
+           let total = values.volumeTotalCapacity,
+           let free = values.volumeAvailableCapacityForImportantUsage,
+           total > 0, free > 0 {
+            return (total: UInt64(total), free: UInt64(free))
+        }
         var fs = statfs()
         guard statfs(NSHomeDirectory(), &fs) == 0 else { return (0, 0) }
         let blockSize = UInt64(fs.f_bsize)

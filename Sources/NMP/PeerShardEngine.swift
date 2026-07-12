@@ -139,6 +139,12 @@ public final class NMPPeerShardEngine {
             } catch {
                 onDiagnostic?("bad tensor chunk: \(error)")
             }
+        case .ping:
+            // Keepalive echo: proves "idle, not dead" to the coordinator's
+            // health monitor (see NMPPeerPing).
+            if let ping = try? NMPPeerPing.decode(payload) {
+                send(payload: ping.pongPayload(), context: "pong")
+            }
         default:
             onDiagnostic?("peer engine ignoring mesh message kind "
                           + "\(payload.first.map(String.init) ?? "<empty>")")

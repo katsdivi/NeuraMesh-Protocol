@@ -40,7 +40,11 @@ export function Settings({
         <div className="settings-row">
           <div>
             <div className="label">Speculative decoding</div>
-            <div className="hint">needs a Phase 9 shim; drafter via --draft-model</div>
+            <div className="hint">
+              {mesh?.engine === 'llamaCpp'
+                ? 'needs a Phase 9 shim (scripts/setup_llama.sh); drafter via --draft-model'
+                : 'llama engine only — the reference engine has no draft/verify loop'}
+            </div>
           </div>
           <code>{mesh?.speculation_available ? 'available' : 'unavailable'}</code>
         </div>

@@ -180,6 +180,44 @@ final class PeerResourceReportFlowTests: XCTestCase {
     }
 }
 
+// MARK: - Keepalive pings (Mesh 2.4)
+
+final class KeepalivePingTests: XCTestCase {
+
+    func testPingCodecRoundTripsAndPongEchoesNonce() throws {
+        let ping = NMPPeerPing(nonce: 0xDEAD_BEEF_CAFE_F00D)
+        XCTAssertEqual(try NMPPeerPing.decode(ping.encode()), ping)
+        let pong = ping.pongPayload()
+        XCTAssertEqual(pong.first, NMPMeshMessageKind.pong.rawValue)
+        XCTAssertEqual(Data(pong).readBigEndianUInt64(at: 1), ping.nonce)
+    }
+
+    /// The whole point of the ping: an idle-but-alive peer's activity
+    /// clock advances because it echoed, so the health monitor will not
+    /// read a stalled pipeline as that peer's death.
+    func testPingEchoAdvancesTheActivityClock() throws {
+        let testbed = try NMPMeshTestbed(
+            layerCount: 6, hiddenSize: 64, remotePeerCount: 1)
+        _ = try testbed.startSync()
+        let peerID = try XCTUnwrap(testbed.remotePeers.first).capabilities.peerID
+        let monitor = testbed.failover.healthMonitor
+
+        // Let the post-assignment traffic settle, then take a baseline.
+        Thread.sleep(forTimeInterval: 0.3)
+        let baseline = try XCTUnwrap(monitor.lastActivityDate(peerID: peerID))
+
+        testbed.orchestrator.sendKeepalivePing(to: peerID)
+        var advanced: Date?
+        for _ in 0..<20 where advanced == nil {
+            Thread.sleep(forTimeInterval: 0.1)
+            if let now = monitor.lastActivityDate(peerID: peerID), now > baseline {
+                advanced = now
+            }
+        }
+        XCTAssertNotNil(advanced, "pong never arrived — activity clock stuck")
+    }
+}
+
 // MARK: - GPU sampling
 
 final class GPUSamplingTests: XCTestCase {

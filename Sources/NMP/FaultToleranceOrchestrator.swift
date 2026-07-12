@@ -273,6 +273,19 @@ public final class NMPFailoverOrchestrator {
 
     private func runHealthCheck() {
         guard !failoverInProgress else { return }
+        // Mesh 2.4 keepalive: activity-based liveness reads silence as
+        // death, but a pipeline stalled on ONE slow stage (backgrounded
+        // iPhone, Wi-Fi hiccup) leaves every OTHER peer silent too. Ping
+        // peers idle past a third of the timeout — the alive ones echo
+        // (any authenticated packet is activity) and survive; a dead one
+        // stays silent and is dropped on the same schedule as before.
+        let pingAfterIdle = healthMonitor.heartbeatTimeout / 3
+        for peerID in healthMonitor.trackedPeers where peerID != localPeerID {
+            if let last = healthMonitor.lastActivityDate(peerID: peerID),
+               Date().timeIntervalSince(last) > pingAfterIdle {
+                orchestrator.sendKeepalivePing(to: peerID)
+            }
+        }
         guard let dead = healthMonitor.checkHealth().first else { return }
         handlePeerDrop(dead) { [weak self] result in
             if case .failure(let error) = result, error != .allPeersDead {

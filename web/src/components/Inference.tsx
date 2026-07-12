@@ -75,7 +75,10 @@ export function Inference({
             />
             <label htmlFor="speculation" style={{ textTransform: 'none', margin: 0 }}>
               Speculative decoding
-              {!speculationAvailable && ' (unavailable on this mesh)'}
+              {!speculationAvailable &&
+                (health?.mesh.engine === 'llamaCpp'
+                  ? ' (needs the Phase 9 shim — rerun scripts/setup_llama.sh)'
+                  : ' (llama only — the reference engine has no drafts to verify)')}
             </label>
           </div>
         </div>

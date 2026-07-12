@@ -623,10 +623,15 @@ do {
     // Mesh 2.4: the shape and tag MATCH the peer app / nmp-peer defaults
     // (32 × 4096, 'nmp-reference-model') so a discovered LAN peer accepts
     // the dashboard's SHARD_ASSIGN instead of rejecting on model mismatch.
+    // heartbeatTimeout 12 s (not the 5 s default): with a phone in the
+    // mesh, one slow Wi-Fi stage or a briefly backgrounded app must not
+    // read as everyone else's death. Keepalive pings (Mesh 2.4) answer
+    // for idle-but-alive peers within that window.
     testbed = try NMPMeshTestbed(
         layerCount: 32, hiddenSize: 4096, remotePeerCount: 3,
         modelTag: "nmp-reference-model",
-        simulatedSecondsPerLayer: 0.002)
+        simulatedSecondsPerLayer: 0.002,
+        heartbeatTimeout: 12)
     let plan: [NMPShardPlanEntry]
     if dashboardArguments.autoConfig {
         // Phase 9: benchmark-driven balanced shards + optimized wire format.
@@ -706,6 +711,10 @@ var latestNetRates: [UInt32: (toDeviceBps: Int, fromDeviceBps: Int)] = [:]
 // Mesh 2.4: coordinator-side connections to REAL LAN peers (iPhone app,
 // nmp-peer on another Mac), keyed by peerID. Mutated on stateQueue.
 var lanConnections: [UInt32: PeerConnection] = [:]
+
+// Names of every peer ever seen, so a dropped peer can stay visible in
+// the panel (greyed out) instead of vanishing without explanation.
+var knownPeerNames: [UInt32: String] = [:]
 
 func assignmentLabel(for peerID: UInt32) -> String {
     guard let entry = testbed.failover.activePlan.first(where: { $0.peerID == peerID }) else {
@@ -930,7 +939,8 @@ server.onDeviceMetricsRequest = { respond in
             trafficBaselines[peerID] = (totals.sentBytes, totals.receivedBytes, now)
         }
 
-        let peers = testbed.failover.activePeers.map { caps -> [String: Any] in
+        var peers = testbed.failover.activePeers.map { caps -> [String: Any] in
+            knownPeerNames[caps.peerID] = caps.deviceName
             let entry = planned[caps.peerID]
             let stats = serveStats[caps.peerID]
             let secondsSinceServe = stats.map { now.timeIntervalSince($0.lastAt) }
@@ -1005,6 +1015,23 @@ server.onDeviceMetricsRequest = { respond in
                 peer["resources"] = resources
             }
             return peer
+        }
+
+        // Dropped peers stay visible (greyed out) instead of silently
+        // vanishing — a peer the health monitor removed mid-session is a
+        // fact the panel should show, not hide.
+        for (peerID, name) in knownPeerNames where !alivePeerIDs.contains(peerID) {
+            peers.append([
+                "id": String(peerID, radix: 16),
+                "name": name,
+                "alive": false,
+                "assigned": "dropped from the mesh",
+                "layer_span": 0,
+                "compute_share": 1.0,
+                "computing": false,
+                "is_coordinator": false,
+                "link": "rejoins automatically when it reappears on the network",
+            ])
         }
 
         let totalLayers = planned.values.reduce(0) { $0 + $1.layerSpan }
@@ -1088,24 +1115,15 @@ let lanDiscovery = NMPPeerDiscoveryManager(
 /// Peers being dialed or already joined (lanQueue-owned) — one dial per
 /// advert, however often Bonjour re-announces it.
 var lanDialing = Set<UInt32>()
+/// Per-peer re-dial backoff (lanQueue-owned). Doubles on every drop and
+/// resets on a successful join: a transient drop recovers in seconds,
+/// while TWO coordinators fighting over one peer (each steal fails the
+/// other's session — the peer keeps one coordinator) back off instead of
+/// stealing it back and forth every few seconds forever.
+var lanRedialDelay: [UInt32: TimeInterval] = [:]
 
-func dropLANPeer(_ peerID: UInt32, reason: String) {
-    lanQueue.async { lanDialing.remove(peerID) }
-    stateQueue.async {
-        guard lanConnections.removeValue(forKey: peerID) != nil else { return }
-        guard testbed.failover.activePeers.contains(where: { $0.peerID == peerID }) else {
-            return
-        }
-        server.reportMeshEvent(
-            "📱 LAN peer 0x\(String(peerID, radix: 16)) \(reason) — re-sharding…")
-        testbed.failover.handlePeerDrop(peerID, timeout: 5) { _ in
-            pushPeerStates()
-        }
-    }
-}
-
-lanDiscovery.onPeerDiscovered = { capabilities in
-    // Runs on lanQueue.
+/// Dials one discovered peer. Runs on lanQueue.
+func dialLANPeer(_ capabilities: NMPCapabilities) {
     let peerID = capabilities.peerID
     guard !lanDialing.contains(peerID) else { return }
     guard capabilities.udpPort != 0,
@@ -1139,6 +1157,7 @@ lanDiscovery.onPeerDiscovered = { capabilities in
                 case .success(let plan):
                     server.reportMeshEvent("📱 \(capabilities.deviceName) joined — "
                         + "re-sharded to \(plan.count) shard(s)")
+                    lanQueue.async { lanRedialDelay[peerID] = nil }
                     pushPeerStates()
                 case .failure(let error):
                     server.reportMeshEvent("📱 \(capabilities.deviceName) join failed: \(error)")
@@ -1157,6 +1176,39 @@ lanDiscovery.onPeerDiscovered = { capabilities in
         lanDialing.remove(peerID)
         print("[nmp-dashboard] failed to dial \(capabilities.deviceName): \(error)")
     }
+}
+
+func dropLANPeer(_ peerID: UInt32, reason: String) {
+    lanQueue.async {
+        lanDialing.remove(peerID)
+        // Re-dial: the session can die while the advert lives on (another
+        // coordinator stole the peer — one coordinator per peer, last
+        // dial wins — or a transient Wi-Fi drop). If it is still
+        // advertised, dial it again after a backoff instead of ignoring
+        // it until the next Bonjour announcement.
+        let delay = min(60, lanRedialDelay[peerID] ?? 4)
+        lanRedialDelay[peerID] = delay * 2
+        lanQueue.asyncAfter(deadline: .now() + delay) {
+            if let capabilities = lanDiscovery.discoveredPeers[peerID]?.capabilities {
+                dialLANPeer(capabilities)
+            }
+        }
+    }
+    stateQueue.async {
+        guard lanConnections.removeValue(forKey: peerID) != nil else { return }
+        guard testbed.failover.activePeers.contains(where: { $0.peerID == peerID }) else {
+            return
+        }
+        server.reportMeshEvent(
+            "📱 LAN peer 0x\(String(peerID, radix: 16)) \(reason) — re-sharding…")
+        testbed.failover.handlePeerDrop(peerID, timeout: 5) { _ in
+            pushPeerStates()
+        }
+    }
+}
+
+lanDiscovery.onPeerDiscovered = { capabilities in
+    dialLANPeer(capabilities) // already on lanQueue
 }
 
 // The advert vanishing (app closed / left the Wi-Fi) is the discovery-

@@ -148,6 +148,13 @@ public final class NMPPromptInferenceService {
         var perTokenSeconds: [TimeInterval] = []
         var networkPayloadBytes = 0
         var shardCount = 0
+        /// Mesh 2.4: a failover re-shard mid-generation fails the pass in
+        /// flight (its stage metas were built from the outgoing plan — the
+        /// peer rejects the stale range). The pass is idempotent (same
+        /// activations in, same tensor out), so retrying against the NEW
+        /// plan continues the generation instead of killing it. Budgeted:
+        /// a mesh failing for real must still fail the request.
+        var passRetriesRemaining = 2
         init(activations: [Float], requested: Int, began: DispatchTime) {
             self.activations = activations
             self.requested = requested
@@ -162,8 +169,18 @@ public final class NMPPromptInferenceService {
             self.queue.async {
                 switch result {
                 case .failure(let error):
-                    self.busy = false
-                    completion(.failure(.orchestration(error)))
+                    guard state.passRetriesRemaining > 0 else {
+                        self.busy = false
+                        completion(.failure(.orchestration(error)))
+                        return
+                    }
+                    state.passRetriesRemaining -= 1
+                    // Brief pause lets an in-progress re-shard finish
+                    // (SHARD_ASSIGN round is sub-ms in-process, one RTT
+                    // per peer over Wi-Fi).
+                    self.queue.asyncAfter(deadline: .now() + 0.3) {
+                        self.step(state, completion: completion)
+                    }
                 case .success(let report):
                     state.perTokenSeconds.append(report.totalSeconds)
                     state.networkPayloadBytes += report.networkPayloadBytes
