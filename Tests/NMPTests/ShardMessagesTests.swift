@@ -208,4 +208,92 @@ final class ModelSharderTests: XCTestCase {
         XCTAssertTrue(NMPModelSharder.plan(layerCount: 0, peers: [caps(1, .high)]).isEmpty)
         XCTAssertTrue(NMPModelSharder.plan(layerCount: 32, peers: []).isEmpty)
     }
+
+    // MARK: Capacity-aware planning (Mesh 2.8)
+
+    private func caps(_ peerID: UInt32, _ cc: NMPComputeClass, ramMB: UInt32) -> NMPCapabilities {
+        NMPCapabilities(peerID: peerID, deviceName: "p\(peerID)", ramMB: ramMB, computeClass: cc)
+    }
+
+    func testUnboundedCapacityMatchesLegacySplit() {
+        // No ceilings → identical to the Phase 5 speed-weighted split.
+        let peers = [caps(0x01, .high), caps(0x02, .medium), caps(0x03, .low)]
+        let detailed = NMPModelSharder.planDetailed(layerCount: 32, peers: peers)
+        XCTAssertEqual(detailed.entries.map(\.layerSpan), [18, 9, 5])
+        XCTAssertTrue(detailed.exclusions.isEmpty)
+        XCTAssertEqual(detailed.capacityShortfall, 0)
+    }
+
+    func testCapacityForcesDistributionWhenModelTooBig() {
+        // 32 layers, fast Mac can hold only 20, slower phone holds 12 →
+        // the phone MUST take 12 even though it's slower. This is the goal.
+        let mac = caps(0x01, .high), phone = caps(0x02, .medium)
+        let plan = NMPModelSharder.planDetailed(
+            layerCount: 32, peers: [mac, phone],
+            measuredSecondsPerLayer: [0x01: 0.010, 0x02: 0.040],
+            layerCapacities: [0x01: 20, 0x02: 12])
+        XCTAssertEqual(plan.capacityShortfall, 0)
+        let byPeer = Dictionary(uniqueKeysWithValues:
+            plan.entries.map { ($0.peerID, $0.layerSpan) })
+        XCTAssertEqual(byPeer[0x01], 20, "Mac capped at its ceiling")
+        XCTAssertEqual(byPeer[0x02], 12, "phone forced to hold the overflow")
+        XCTAssertTrue(plan.exclusions.isEmpty)
+    }
+
+    func testSpeedModePacksFastestAndExcludesUnneededPeer() {
+        // Model fits on the Mac alone → Pure Speed puts it all on the Mac,
+        // the phone gets 0 with a reason (no capacity need for a hop).
+        let mac = caps(0x01, .high), phone = caps(0x02, .medium)
+        let plan = NMPModelSharder.planDetailed(
+            layerCount: 32, peers: [mac, phone],
+            measuredSecondsPerLayer: [0x01: 0.010, 0x02: 0.040],
+            layerCapacities: [0x01: 64, 0x02: 64],
+            objective: .speed)
+        XCTAssertEqual(plan.entries.count, 1)
+        XCTAssertEqual(plan.entries.first?.peerID, 0x01)
+        XCTAssertEqual(plan.entries.first?.layerSpan, 32)
+        XCTAssertEqual(plan.exclusions.map(\.peerID), [0x02])
+        XCTAssertTrue(plan.exclusions.first!.reason.contains("0 shards"))
+    }
+
+    func testCapacityThenSpeedStillSpreadsWhenModelFits() {
+        // Same fits-on-Mac model, DEFAULT objective → the mesh is used, the
+        // phone still gets a speed-weighted share (fixes "Mac does it all").
+        let mac = caps(0x01, .high), phone = caps(0x02, .medium)
+        let plan = NMPModelSharder.planDetailed(
+            layerCount: 32, peers: [mac, phone],
+            measuredSecondsPerLayer: [0x01: 0.010, 0x02: 0.040],
+            layerCapacities: [0x01: 64, 0x02: 64])
+        XCTAssertEqual(plan.entries.count, 2, "both devices work in the default mode")
+        XCTAssertTrue(plan.exclusions.isEmpty)
+    }
+
+    func testZeroCapacityDeviceExcludedAsSpare() {
+        let mac = caps(0x01, .high), tiny = caps(0x02, .low)
+        let plan = NMPModelSharder.planDetailed(
+            layerCount: 8, peers: [mac, tiny],
+            layerCapacities: [0x01: 32, 0x02: 0])
+        XCTAssertEqual(plan.entries.map(\.peerID), [0x01])
+        XCTAssertEqual(plan.exclusions.map(\.peerID), [0x02])
+        XCTAssertTrue(plan.exclusions.first!.reason.lowercased().contains("out of memory"))
+    }
+
+    func testCapacityShortfallReportedWhenMeshTooSmall() {
+        // 32 layers, two devices holding 10 + 8 = 18 → 14 fit nowhere.
+        let plan = NMPModelSharder.planDetailed(
+            layerCount: 32, peers: [caps(0x01, .high), caps(0x02, .medium)],
+            layerCapacities: [0x01: 10, 0x02: 8])
+        XCTAssertEqual(plan.capacityShortfall, 14)
+        XCTAssertEqual(plan.entries.reduce(0) { $0 + $1.layerSpan }, 18,
+                       "assigns everything that fits, best effort")
+    }
+
+    func testLayerCapacityFromRAM() {
+        // 8 GB, 0.5 GB/layer, 60% headroom → floor(8*0.6/0.5) = 9 layers.
+        let cap = NMPModelSharder.layerCapacity(
+            ramMB: 8192, bytesPerLayer: 512 * 1_048_576, headroom: 0.6)
+        XCTAssertEqual(cap, 9)
+        // Unknown footprint → unbounded.
+        XCTAssertEqual(NMPModelSharder.layerCapacity(ramMB: 8192, bytesPerLayer: 0), Int.max)
+    }
 }

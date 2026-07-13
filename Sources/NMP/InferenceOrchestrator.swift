@@ -254,10 +254,14 @@ public final class NMPInferenceOrchestrator {
     // MARK: Shard assignment
 
     /// Broadcasts SHARD_ASSIGN for every remote entry in `newPlan` and
-    /// waits for all acks. Local entries need no ack. Completion fires on
-    /// the orchestrator queue.
+    /// waits for all acks. Local entries need no ack. `idlePeers` are mesh
+    /// members that hold 0 layers this plan — they get a fire-and-forget
+    /// zero-layer SHARD_ASSIGN (not ack-tracked) so their UI shows
+    /// "standing by" instead of hanging on "waiting for coordinator".
+    /// Completion fires on the orchestrator queue.
     public func assignShards(
         _ newPlan: [NMPShardPlanEntry],
+        idlePeers: [UInt32] = [],
         timeout: TimeInterval = 10,
         completion: @escaping (Result<Void, NMPOrchestrationError>) -> Void
     ) {
@@ -270,6 +274,18 @@ public final class NMPInferenceOrchestrator {
             for entry in remote where connections[entry.peerID] == nil {
                 completion(.failure(.peerNotConnected(entry.peerID)))
                 return
+            }
+
+            // Notify standby members (fire-and-forget; never blocks the round).
+            let idle = NMPShardAssign(
+                shardIndex: 0, pipelineLength: UInt16(newPlan.count),
+                startLayer: 0, endLayer: 0,
+                totalLayers: UInt16(engine.layerCount),
+                hiddenSize: UInt32(engine.hiddenSize), modelTag: modelTag)
+            for peerID in idlePeers where peerID != localPeerID {
+                connections[peerID]?.sendAsync(
+                    packetType: .shardAssign, priority: .critical,
+                    payload: idle.encode())
             }
 
             plan = newPlan

@@ -83,6 +83,60 @@ final class FaultToleranceTests: XCTestCase {
         XCTAssertEqual(testbed.failover.activePlan, newPlan)
     }
 
+    func testStandbyPeersReceiveZeroAssignmentInsteadOfHanging() throws {
+        // Pure Speed with the weightless reference engine (unbounded
+        // capacity) packs everything onto the single fastest device — the
+        // coordinator. The remotes hold 0 layers, but must be TOLD so
+        // (a standby assignment), not left waiting on "waiting for
+        // coordinator". This is the exact hang the phone hit.
+        let testbed = try NMPMeshTestbed(layerCount: 12, hiddenSize: 96,
+                                         remotePeerCount: 2)
+        _ = try testbed.startSync()
+
+        testbed.failover.shardingObjective = .speed
+        let plan = try replanSync(testbed.failover)
+        XCTAssertEqual(plan.count, 1, "Pure Speed packs the fastest device")
+        XCTAssertEqual(plan.first?.peerID, testbed.coordinatorID)
+
+        // Both remotes must accept a zero-layer standby assignment. It is
+        // sent fire-and-forget (never blocks the assignment round), so it
+        // lands just after replan completes — poll briefly for it.
+        for remote in testbed.remotePeers {
+            let deadline = Date().addingTimeInterval(2)
+            while Date() < deadline,
+                  remote.shardEngine.assignment?.startLayer
+                    != remote.shardEngine.assignment?.endLayer {
+                Thread.sleep(forTimeInterval: 0.02)
+            }
+            let assignment = remote.shardEngine.assignment
+            XCTAssertNotNil(assignment, "standby peer must be assigned, not left waiting")
+            XCTAssertEqual(assignment?.startLayer, assignment?.endLayer,
+                           "standby = a zero-layer assignment")
+        }
+        // The failover reports WHY each is idle, for the UI.
+        XCTAssertEqual(testbed.failover.activeExclusions.count, 2)
+        XCTAssertTrue(testbed.failover.activeExclusions.allSatisfy {
+            $0.reason.contains("0 shards")
+        })
+
+        // Flipping back to the default re-engages every device.
+        testbed.failover.shardingObjective = .capacityThenSpeed
+        let spread = try replanSync(testbed.failover)
+        XCTAssertEqual(spread.count, 3, "default spreads across the whole mesh")
+        XCTAssertTrue(testbed.failover.activeExclusions.isEmpty)
+    }
+
+    private func replanSync(_ failover: NMPFailoverOrchestrator) throws -> [NMPShardPlanEntry] {
+        let done = expectation(description: "replan")
+        var outcome: Result<[NMPShardPlanEntry], NMPFailoverError>?
+        failover.replan { outcome = $0; done.fulfill() }
+        wait(for: [done], timeout: 5)
+        switch try XCTUnwrap(outcome) {
+        case .success(let plan): return plan
+        case .failure(let error): throw error
+        }
+    }
+
     func testInferenceRemainsBitExactAfterFailover() throws {
         let testbed = try NMPMeshTestbed(layerCount: 12, hiddenSize: 96,
                                          remotePeerCount: 2)

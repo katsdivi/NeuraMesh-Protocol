@@ -496,3 +496,67 @@ final class ChatRouteTests: XCTestCase {
         XCTAssertEqual(status, 503)
     }
 }
+
+// MARK: - /api/mesh/objective route (Mesh 2.8)
+
+final class ObjectiveRouteTests: XCTestCase {
+
+    private var server: NMPDashboardServer!
+
+    override func setUpWithError() throws {
+        server = NMPDashboardServer()
+        try server.start(port: 0)
+    }
+    override func tearDown() { server.stop(); server = nil }
+
+    private func post(_ body: [String: Any]) throws -> (Int, [String: Any]) {
+        var request = URLRequest(url: URL(string:
+            "http://127.0.0.1:\(server.boundPort)/api/mesh/objective")!)
+        request.httpMethod = "POST"
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let done = expectation(description: "post")
+        var outcome: (Int, [String: Any])?
+        URLSession.shared.dataTask(with: request) { data, response, _ in
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let object = (data.flatMap {
+                try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]) ?? [:]
+            outcome = (status, object)
+            done.fulfill()
+        }.resume()
+        wait(for: [done], timeout: 10)
+        return try XCTUnwrap(outcome)
+    }
+
+    func testObjectiveSwitchReachesHandler() throws {
+        var seen: String?
+        server.onObjectiveRequest = { objective, respond in
+            seen = objective
+            respond(.success("switched to \(objective)"))
+        }
+        let (status, object) = try post(["objective": "speed"])
+        XCTAssertEqual(status, 200)
+        XCTAssertEqual(seen, "speed")
+        XCTAssertEqual(object["objective"] as? String, "speed")
+        XCTAssertEqual(object["status"] as? String, "ok")
+    }
+
+    func testObjectiveRejectsUnknownValue() throws {
+        server.onObjectiveRequest = { _, respond in
+            respond(.failure(.init("unknown objective 'turbo'")))
+        }
+        let (status, object) = try post(["objective": "turbo"])
+        XCTAssertEqual(status, 400)
+        XCTAssertNotNil(object["error"])
+    }
+
+    func testObjectiveMissingFieldIs400() throws {
+        server.onObjectiveRequest = { _, _ in XCTFail("must not reach handler") }
+        let (status, _) = try post([:])
+        XCTAssertEqual(status, 400)
+    }
+
+    func testObjectiveWithoutHandlerIs503() throws {
+        let (status, _) = try post(["objective": "speed"])
+        XCTAssertEqual(status, 503)
+    }
+}

@@ -68,6 +68,10 @@ export interface PeerMetric {
   // Mesh 2.3 per-device telemetry (all measured)
   is_coordinator?: boolean;
   link?: string;
+  /** Mesh 2.8: this device holds 0 layers under the current plan. */
+  excluded?: boolean;
+  /** Mesh 2.8: specific reason it holds 0 layers (capacity / speed). */
+  exclusion_reason?: string;
   requests_served?: number;
   last_compute_ms?: number;
   seconds_since_active?: number;
@@ -90,6 +94,11 @@ export interface MeshTotals {
   generation_in_flight: boolean;
 }
 
+export interface ShardingObjective {
+  value: string;
+  label: string;
+}
+
 export interface DeviceMetrics {
   host: HostSample;
   host_note: string;
@@ -98,6 +107,12 @@ export interface DeviceMetrics {
   allocation_note: string;
   peers: PeerMetric[];
   totals?: MeshTotals;
+  // Mesh 2.8: live layer-distribution strategy.
+  sharding_objective?: string;
+  sharding_objective_label?: string;
+  sharding_objectives?: ShardingObjective[];
+  capacity_shortfall?: number;
+  capacity_note?: string;
 }
 
 export interface RaceLeg {
@@ -281,6 +296,12 @@ export const api = {
     share: number,
   ): Promise<{ status: string; summary: string }> =>
     post(`/api/devices/${peerId}/allocate`, { share }),
+
+  /** Mesh 2.8: switch the sharding objective (re-shards the mesh). */
+  setObjective: (
+    objective: string,
+  ): Promise<{ status: string; objective: string; summary: string }> =>
+    post('/api/mesh/objective', { objective }),
 };
 
 /** Live event stream (the Phase 6 dashboard WebSocket). */

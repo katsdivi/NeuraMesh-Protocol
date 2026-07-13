@@ -23,8 +23,17 @@ struct PeerStatusView: View {
                 }
 
                 Section("Shard") {
-                    Text(model.shardDescription)
-                        .font(.callout.monospaced())
+                    HStack(alignment: .top, spacing: 8) {
+                        Circle()
+                            .fill(model.holdingLayers ? Color.green
+                                  : (model.shardDescription.hasPrefix("0 shards")
+                                     ? Color.orange : Color.secondary))
+                            .frame(width: 8, height: 8)
+                            .padding(.top, 5)
+                        Text(model.shardDescription)
+                            .font(.callout.monospaced())
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
 
                 Section("Inference") {

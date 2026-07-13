@@ -54,6 +54,21 @@ export function Devices() {
     return () => clearInterval(timer);
   }, [refresh]);
 
+  const [objectiveBusy, setObjectiveBusy] = useState(false);
+  const switchObjective = async (objective: string) => {
+    setObjectiveBusy(true);
+    setError('');
+    try {
+      const response = await api.setObjective(objective);
+      setLastAction(`Re-sharded: ${response.summary}`);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setObjectiveBusy(false);
+    }
+  };
+
   const commitShare = async (peerId: string, share: number) => {
     setBusyPeer(peerId);
     setError('');
@@ -168,6 +183,55 @@ export function Devices() {
         </>
       )}
 
+      {metrics?.sharding_objectives && metrics.sharding_objectives.length > 0 && (
+        <div className="card objective-card">
+          <div className="objective-head">
+            <div>
+              <div className="peer-section-title">Sharding strategy</div>
+              <div className="objective-explain">
+                How the coordinator splits the model's layers across the mesh.
+              </div>
+            </div>
+            <div className="objective-toggle">
+              {metrics.sharding_objectives.map((option) => (
+                <button
+                  key={option.value}
+                  className={
+                    option.value === metrics.sharding_objective ? 'active' : ''
+                  }
+                  disabled={objectiveBusy}
+                  onClick={() => switchObjective(option.value)}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="objective-explain">
+            {metrics.sharding_objective === 'speed' ? (
+              <>
+                <strong>Pure Speed:</strong> pack the fastest device and route
+                around slower ones — lowest latency. A device that would only
+                add a Wi-Fi hop gets 0 shards (shown below with the reason).
+              </>
+            ) : (
+              <>
+                <strong>Capacity + Speed:</strong> spread across the whole mesh,
+                balanced by measured speed, so every device pulls its weight and
+                models too big for one device still run. Capacity is always a
+                hard ceiling.
+              </>
+            )}
+          </div>
+          {objectiveBusy && <div className="objective-explain">re-sharding…</div>}
+        </div>
+      )}
+
+      {metrics?.capacity_shortfall !== undefined &&
+        metrics.capacity_shortfall > 0 && (
+          <div className="error-box">{metrics.capacity_note}</div>
+        )}
+
       <h2>Mesh peers</h2>
       {metrics && !metrics.allocation_supported && (
         <div className="note-box">{metrics.allocation_note}</div>
@@ -269,7 +333,14 @@ function PeerCard({
         <div className="device-name">{peer.name}</div>
         {peer.is_coordinator && <span className="badge modeled">coordinator</span>}
         {peer.computing && <span className="badge measured">computing</span>}
+        {peer.excluded && <span className="badge standby">0 shards · standby</span>}
       </div>
+
+      {peer.excluded && peer.exclusion_reason && (
+        <div className="standby-reason">
+          <strong>0 shards on this device.</strong> {peer.exclusion_reason}
+        </div>
+      )}
 
       <div className="peer-sections">
         <div className="peer-section">

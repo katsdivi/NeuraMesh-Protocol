@@ -32,6 +32,8 @@ final class PeerViewModel: ObservableObject {
     @Published var peerIDHex = "—"
     @Published var port: String = "—"
     @Published var shardDescription = "waiting for coordinator"
+    /// True once the coordinator assigns ≥1 layer; false while standing by.
+    @Published var holdingLayers = false
     @Published var servedCount = 0
     @Published var lastServed: ServedRecord?
     @Published var memoryMB: UInt32 = 0
@@ -56,9 +58,21 @@ final class PeerViewModel: ObservableObject {
         }
         node.onAssigned = { [weak self] assign in
             Task { @MainActor in
-                self?.shardDescription = "shard \(assign.shardIndex) of "
-                    + "\(assign.pipelineLength): layers \(assign.startLayer)–"
-                    + "\(assign.endLayer - 1) of \(assign.totalLayers)"
+                if assign.startLayer == assign.endLayer {
+                    // Mesh 2.8 standby: the coordinator holds this device in
+                    // reserve for this plan (the model fits without it, or
+                    // Pure Speed routed around it). It's connected and ready
+                    // — NOT stuck waiting — and takes layers the moment the
+                    // model grows or the mode changes.
+                    self?.shardDescription = "0 shards — standing by "
+                        + "(joined & ready; not used by the current plan)"
+                    self?.holdingLayers = false
+                } else {
+                    self?.shardDescription = "shard \(assign.shardIndex) of "
+                        + "\(assign.pipelineLength): layers \(assign.startLayer)–"
+                        + "\(assign.endLayer - 1) of \(assign.totalLayers)"
+                    self?.holdingLayers = true
+                }
             }
         }
         node.onServed = { [weak self] requestID, layers, seconds in

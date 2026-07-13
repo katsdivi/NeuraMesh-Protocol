@@ -58,6 +58,16 @@ struct DashboardArguments {
     var draftModelPath: String?
     /// Probe passes for --auto-config benchmarking.
     var probePasses = 3
+    // Mesh 2.8
+    /// In-process simulated peers to seed the mesh with (demo). Real LAN
+    /// peers (the iPhone app) auto-retire these when they join, so the
+    /// mesh becomes genuinely cross-device.
+    var simPeers = 3
+    /// Declared model size in GB. The reference engine is weightless, so
+    /// this is the *modeled* memory footprint used for capacity-aware
+    /// sharding — set it to your target model (e.g. 9 for Qwen3-14B q4) to
+    /// see layers forced across devices. 0 = unbounded (no capacity limit).
+    var modelGB = 0.0
 
     static func parse() -> DashboardArguments {
         var arguments = DashboardArguments()
@@ -77,6 +87,10 @@ struct DashboardArguments {
             case "--draft-model": arguments.draftModelPath = value()
             case "--probe-passes":
                 arguments.probePasses = value().flatMap(Int.init) ?? arguments.probePasses
+            case "--sim-peers":
+                arguments.simPeers = value().flatMap(Int.init) ?? arguments.simPeers
+            case "--model-gb":
+                arguments.modelGB = value().flatMap(Double.init) ?? arguments.modelGB
             case "--ui": arguments.ui = true
             case "--help", "-h":
                 print("""
@@ -616,8 +630,9 @@ if dashboardArguments.engine == "llamaCpp" {
 
 // MARK: - Mesh
 
-print("[nmp-dashboard] assembling mesh (coordinator + 3 in-process peers; "
-      + "LAN peers join live via Bonjour)…")
+print("[nmp-dashboard] assembling mesh (coordinator + \(dashboardArguments.simPeers) "
+      + "in-process peer(s); LAN peers join live via Bonjour and retire the "
+      + "simulated ones)…")
 let testbed: NMPMeshTestbed
 do {
     // 2 ms/layer simulated compute so stage progress is visible by eye.
@@ -629,10 +644,21 @@ do {
     // read as everyone else's death. Keepalive pings (Mesh 2.4) answer
     // for idle-but-alive peers within that window.
     testbed = try NMPMeshTestbed(
-        layerCount: 32, hiddenSize: 4096, remotePeerCount: 3,
+        layerCount: 32, hiddenSize: 4096, remotePeerCount: dashboardArguments.simPeers,
         modelTag: "nmp-reference-model",
         simulatedSecondsPerLayer: 0.002,
         heartbeatTimeout: 12)
+    // Mesh 2.8: capacity-aware sharding. The reference engine is weightless,
+    // so --model-gb declares a MODELED per-layer footprint (labeled as such)
+    // — set it to your target model to see layers forced across devices.
+    if dashboardArguments.modelGB > 0 {
+        let bytesPerLayer = Int(dashboardArguments.modelGB * 1_000_000_000
+                                / Double(testbed.layerCount))
+        testbed.failover.bytesPerLayer = bytesPerLayer
+        print(String(format: "[nmp-dashboard] modeled model footprint: %.1f GB "
+                     + "(%d MB/layer) — capacity-aware sharding active",
+                     dashboardArguments.modelGB, bytesPerLayer / 1_048_576))
+    }
     let plan: [NMPShardPlanEntry]
     if dashboardArguments.autoConfig {
         // Phase 9: benchmark-driven balanced shards + optimized wire format.
@@ -919,6 +945,9 @@ server.onDeviceMetricsRequest = { respond in
         let alivePeerIDs = Set(testbed.failover.activePeers.map(\.peerID))
         let planned = Dictionary(uniqueKeysWithValues:
             testbed.failover.activePlan.map { ($0.peerID, $0) })
+        // Mesh 2.8: why each 0-layer device holds nothing, for the UI.
+        let exclusionReasons = Dictionary(uniqueKeysWithValues:
+            testbed.failover.activeExclusions.map { ($0.peerID, $0.reason) })
         var connections = Dictionary(uniqueKeysWithValues:
             testbed.remotePeers.map { ($0.capabilities.peerID, $0.coordinatorSide) })
         for (peerID, connection) in lanConnections {
@@ -955,8 +984,13 @@ server.onDeviceMetricsRequest = { respond in
                 "alive": alivePeerIDs.contains(caps.peerID),
                 "assigned": entry.map {
                     "layers \($0.startLayer)-\($0.endLayer - 1)"
-                } ?? "—",
+                } ?? "0 shards — standing by",
                 "layer_span": entry?.layerSpan ?? 0,
+                "excluded": entry == nil,
+                "exclusion_reason": entry == nil
+                    ? (exclusionReasons[caps.peerID]
+                        ?? "0 shards: not used by the current plan.")
+                    : "",
                 "compute_share": shares[caps.peerID] ?? 1.0,
                 // Served a request in the last 1.5 s (the heartbeat runs a
                 // pass every ~0.4 s, so an assigned live peer stays hot).
@@ -1051,6 +1085,8 @@ server.onDeviceMetricsRequest = { respond in
             "generation_in_flight": inFlight,
         ]
 
+        let objective = testbed.failover.shardingObjective
+        let shortfall = testbed.failover.activeShortfall
         respond([
             "host": sample.asJSONObject,
             "host_note": "all mesh peers run in-process — these are "
@@ -1061,6 +1097,17 @@ server.onDeviceMetricsRequest = { respond in
             "allocation_note": "compute share re-plans the mesh: a device "
                 + "at 50% is planned as half as fast and receives "
                 + "proportionally fewer layers — watch 'assigned' change",
+            // Mesh 2.8: the layer-distribution strategy, switchable live.
+            "sharding_objective": objective.rawValue,
+            "sharding_objective_label": objective.label,
+            "sharding_objectives": NMPShardingObjective.allCases.map {
+                ["value": $0.rawValue, "label": $0.label] as [String: Any]
+            },
+            "capacity_shortfall": shortfall,
+            "capacity_note": shortfall > 0
+                ? "⚠️ \(shortfall) layer(s) fit on no device — the model is "
+                    + "too big for this mesh. Add a device or a smaller model."
+                : "",
             "peers": peers,
             "totals": totals,
         ])
@@ -1098,6 +1145,32 @@ server.onAllocationRequest = { peerID, share, respond in
     }
 }
 
+// Mesh 2.8: switch the layer-distribution strategy live from the Devices
+// tab. Capacity + Speed (default) spreads across the mesh; Pure Speed
+// packs the fastest device (others stand by). Either way it re-shards
+// through the normal SHARD_ASSIGN round.
+server.onObjectiveRequest = { raw, respond in
+    guard let objective = NMPShardingObjective(rawValue: raw) else {
+        respond(.failure(.init("unknown objective '\(raw)' — expected one of: "
+            + NMPShardingObjective.allCases.map(\.rawValue).joined(separator: ", "))))
+        return
+    }
+    testbed.failover.shardingObjective = objective
+    server.reportMeshEvent("⚖️ sharding objective → \(objective.label) — re-sharding…")
+    testbed.failover.replan(reason: "objective change") { result in
+        switch result {
+        case .failure(let error):
+            respond(.failure(.init("re-plan failed: \(error)")))
+        case .success(let plan):
+            let excluded = testbed.failover.activeExclusions.count
+            var summary = "\(objective.label): \(plan.count) shard(s)"
+            if excluded > 0 { summary += ", \(excluded) standing by" }
+            pushPeerStates()
+            respond(.success(summary))
+        }
+    }
+}
+
 // MARK: - Mesh 2.4: real LAN peers join the live dashboard mesh
 //
 // The dashboard browses for _neuramesh._tcp adverts (the iPhone peer app,
@@ -1120,6 +1193,28 @@ let lanDiscovery = NMPPeerDiscoveryManager(
 /// Peers being dialed or already joined (lanQueue-owned) — one dial per
 /// advert, however often Bonjour re-announces it.
 var lanDialing = Set<UInt32>()
+/// Mesh 2.8: the moment a REAL device joins, retire the in-process
+/// simulated peers so the mesh is genuinely cross-device (the phone
+/// becomes a true ~50% member instead of competing with fast Mac-local
+/// phantoms). One-shot, guarded by stateQueue.
+var simulatedPeersRetired = false
+func retireSimulatedPeersOnce() {
+    stateQueue.async {
+        guard !simulatedPeersRetired else { return }
+        simulatedPeersRetired = true
+        let victims = testbed.remotePeers.map(\.capabilities.peerID)
+        guard !victims.isEmpty else { return }
+        server.reportMeshEvent("🖥️ real device joined — retiring "
+            + "\(victims.count) simulated in-process peer(s); the mesh is now "
+            + "genuinely cross-device")
+        DispatchQueue.global(qos: .userInitiated).async {
+            for victim in victims {
+                _ = try? testbed.dropPeerSync(victim)
+            }
+            pushPeerStates()
+        }
+    }
+}
 /// Per-peer re-dial backoff (lanQueue-owned). Doubles on every drop and
 /// resets on a successful join: a transient drop recovers in seconds,
 /// while TWO coordinators fighting over one peer (each steal fails the
@@ -1163,6 +1258,7 @@ func dialLANPeer(_ capabilities: NMPCapabilities) {
                     server.reportMeshEvent("📱 \(capabilities.deviceName) joined — "
                         + "re-sharded to \(plan.count) shard(s)")
                     lanQueue.async { lanRedialDelay[peerID] = nil }
+                    retireSimulatedPeersOnce()
                     pushPeerStates()
                 case .failure(let error):
                     server.reportMeshEvent("📱 \(capabilities.deviceName) join failed: \(error)")

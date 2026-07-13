@@ -90,7 +90,17 @@ public final class NMPPeerShardEngine {
         if assign.modelTag != modelTag {
             status = .rejectedModelMismatch
             onDiagnostic?("SHARD_ASSIGN for model '\(assign.modelTag)' but loaded '\(modelTag)'")
-        } else if assign.startLayer >= assign.endLayer
+        } else if assign.startLayer == assign.endLayer {
+            // Mesh 2.8 standby assignment: the coordinator explicitly told
+            // this peer it holds 0 layers this plan (the model fits without
+            // it, Pure Speed routed around it, or it can't hold a layer).
+            // Accept it — this is what stops a joined peer from hanging on
+            // "waiting for coordinator" — but serve nothing.
+            status = .ready
+            assignment = assign
+            onDiagnostic?("SHARD_ASSIGN: 0 layers — standing by as a spare")
+            onAssigned?(assign)
+        } else if assign.startLayer > assign.endLayer
                     || Int(assign.endLayer) > engine.layerCount
                     || Int(assign.hiddenSize) != engine.hiddenSize {
             status = .rejectedBadRange

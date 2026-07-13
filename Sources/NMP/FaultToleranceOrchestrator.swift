@@ -71,7 +71,37 @@ public final class NMPFailoverOrchestrator {
     }
     private var storedActivePeers: [NMPCapabilities]
     private var storedActivePlan: [NMPShardPlanEntry] = []
+    private var storedExclusions: [NMPShardExclusion] = []
+    private var storedShortfall = 0
     private let membershipLock = NSLock()
+
+    /// Mesh 2.8: how the current plan split layers. Read cross-queue (UI).
+    public var shardingObjective: NMPShardingObjective {
+        get { membershipLock.lock(); defer { membershipLock.unlock() }; return storedObjective }
+        set { membershipLock.lock(); storedObjective = newValue; membershipLock.unlock() }
+    }
+    private var storedObjective: NMPShardingObjective = .capacityThenSpeed
+
+    /// Weight bytes per transformer layer, for RAM→capacity. 0 = unbounded
+    /// (weightless reference engine): capacity never binds, behavior is the
+    /// classic speed-weighted split. Set by the CLI from the model size.
+    public var bytesPerLayer: Int {
+        get { membershipLock.lock(); defer { membershipLock.unlock() }; return storedBytesPerLayer }
+        set { membershipLock.lock(); storedBytesPerLayer = max(0, newValue); membershipLock.unlock() }
+    }
+    private var storedBytesPerLayer = 0
+
+    /// Devices holding 0 layers under the current plan, with the reason.
+    public var activeExclusions: [NMPShardExclusion] {
+        membershipLock.lock(); defer { membershipLock.unlock() }
+        return storedExclusions
+    }
+    /// Layers that fit on no device under the current plan (> 0 ⇒ the mesh
+    /// is too small for the model). Read cross-queue by the UI.
+    public var activeShortfall: Int {
+        membershipLock.lock(); defer { membershipLock.unlock() }
+        return storedShortfall
+    }
 
     private func mutateMembership(_ body: (inout [NMPCapabilities],
                                            inout [NMPShardPlanEntry]) -> Void) {
@@ -305,19 +335,45 @@ public final class NMPFailoverOrchestrator {
         completion: @escaping (Result<[NMPShardPlanEntry], NMPFailoverError>) -> Void
     ) {
         let began = DispatchTime.now()
-        let newPlan = NMPModelSharder.plan(
+        let peers = activePeers
+        // Per-peer capacity ceiling from RAM + the model's per-layer weight
+        // footprint. bytesPerLayer == 0 (reference engine) ⇒ unbounded ⇒
+        // capacity never binds and this is the classic speed-weighted split.
+        let bpl = bytesPerLayer
+        var capacities: [UInt32: Int] = [:]
+        if bpl > 0 {
+            for peer in peers {
+                capacities[peer.peerID] = NMPModelSharder.layerCapacity(
+                    ramMB: peer.ramMB, bytesPerLayer: bpl)
+            }
+        }
+        let detailed = NMPModelSharder.planDetailed(
             layerCount: layerCount,
-            peers: activePeers,
+            peers: peers,
             measuredSecondsPerLayer: orchestrator.measuredSecondsPerLayer,
-            computeShares: orchestrator.computeShares)
+            computeShares: orchestrator.computeShares,
+            layerCapacities: capacities,
+            objective: shardingObjective)
+        let newPlan = detailed.entries
         guard !newPlan.isEmpty else {
+            // No device can hold even one layer — record the exclusions so
+            // the UI can explain it, then surface the honest failure.
+            self.mutateMembership { _, _ in }
+            membershipLock.lock()
+            storedExclusions = detailed.exclusions
+            storedShortfall = detailed.capacityShortfall
+            membershipLock.unlock()
             onAllPeersDead?()
             completion(.failure(.allPeersDead))
             return
         }
 
+        // Members holding 0 layers get a standby assignment so they never
+        // hang on "waiting for coordinator".
+        let idlePeers = detailed.exclusions.map(\.peerID)
+
         failoverInProgress = true
-        orchestrator.assignShards(newPlan, timeout: timeout) { [weak self] result in
+        orchestrator.assignShards(newPlan, idlePeers: idlePeers, timeout: timeout) { [weak self] result in
             // Fires on the orchestrator queue; hop home.
             self?.queue.async {
                 guard let self else { return }
@@ -330,9 +386,20 @@ public final class NMPFailoverOrchestrator {
                     let seconds = TimeInterval(
                         DispatchTime.now().uptimeNanoseconds - began.uptimeNanoseconds) / 1e9
                     self.mutateMembership { _, plan in plan = newPlan }
+                    self.membershipLock.lock()
+                    self.storedExclusions = detailed.exclusions
+                    self.storedShortfall = detailed.capacityShortfall
+                    self.membershipLock.unlock()
                     self.lastReshardSeconds = seconds
-                    self.onDiagnostic?("re-shard (\(reason)): \(newPlan.count) shard(s) in "
-                                       + String(format: "%.1f ms", seconds * 1000))
+                    var note = "re-shard (\(reason)): \(newPlan.count) shard(s) in "
+                        + String(format: "%.1f ms", seconds * 1000)
+                    if !detailed.exclusions.isEmpty {
+                        note += ", \(detailed.exclusions.count) standing by"
+                    }
+                    if detailed.capacityShortfall > 0 {
+                        note += " — ⚠️ \(detailed.capacityShortfall) layer(s) fit nowhere"
+                    }
+                    self.onDiagnostic?(note)
                     self.onResharded?(newPlan, seconds)
                     completion(.success(newPlan))
                 }

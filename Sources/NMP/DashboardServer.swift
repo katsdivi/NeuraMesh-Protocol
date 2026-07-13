@@ -236,6 +236,12 @@ public final class NMPDashboardServer {
     public var onAllocationRequest: ((UInt32, Double,
         @escaping (Result<String, BenchmarkFailure>) -> Void) -> Void)?
 
+    /// Handler for POST /api/mesh/objective {"objective": "..."}. Switches
+    /// the sharding strategy and re-shards the live mesh; reply with a
+    /// human summary. Fires on the server's queue; reply from any queue.
+    public var onObjectiveRequest: ((String,
+        @escaping (Result<String, BenchmarkFailure>) -> Void) -> Void)?
+
     /// Static facts about the running mesh, surfaced by GET /health and
     /// the UI's dashboard. Set once by the CLI after assembly.
     public struct MeshInfo: Sendable {
@@ -741,6 +747,8 @@ public final class NMPDashboardServer {
                 handleInferencePOST(body: body, client: client)
             case "/api/chat":
                 handleChatPOST(body: body, client: client)
+            case "/api/mesh/objective":
+                handleObjectivePOST(body: body, client: client)
             case "/api/benchmark/run":
                 handleBenchmarkPOST(body: body, client: client)
             case "/api/comparison":
@@ -929,6 +937,37 @@ public final class NMPDashboardServer {
     }
 
     // MARK: POST /api/devices/<hexID>/allocate
+
+    private func handleObjectivePOST(body: Data, client: Client) {
+        guard let handler = onObjectiveRequest else {
+            respondJSON(client, status: "503 Service Unavailable",
+                        object: ["error": "no objective handler is wired to this server"])
+            return
+        }
+        guard let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let objective = object["objective"] as? String,
+              !objective.isEmpty else {
+            respondJSON(client, status: "400 Bad Request",
+                        object: ["error": "body must be JSON with a non-empty 'objective'"])
+            return
+        }
+        handler(objective) { [weak self, weak client] result in
+            guard let self, let client else { return }
+            self.queue.async {
+                switch result {
+                case .success(let summary):
+                    self.respondJSON(client, status: "200 OK", object: [
+                        "status": "ok",
+                        "objective": objective,
+                        "summary": summary,
+                    ])
+                case .failure(let failure):
+                    self.respondJSON(client, status: "400 Bad Request",
+                                     object: ["error": failure.message])
+                }
+            }
+        }
+    }
 
     private func handleAllocatePOST(path: String, body: Data, client: Client) {
         guard let handler = onAllocationRequest else {
