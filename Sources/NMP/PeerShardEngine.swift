@@ -101,12 +101,15 @@ public final class NMPPeerShardEngine {
             onDiagnostic?("SHARD_ASSIGN: 0 layers — standing by as a spare")
             onAssigned?(assign)
         } else if assign.startLayer > assign.endLayer
-                    || Int(assign.endLayer) > engine.layerCount
+                    || Int(assign.endLayer - assign.startLayer) > engine.layerCount
                     || Int(assign.hiddenSize) != engine.hiddenSize {
             status = .rejectedBadRange
             onDiagnostic?("SHARD_ASSIGN rejected: layers \(assign.startLayer)..<\(assign.endLayer) "
                           + "of \(engine.layerCount), hidden \(assign.hiddenSize) vs \(engine.hiddenSize)")
         } else {
+            if let llamaEngine = engine as? NMPLlamaComputeEngine {
+                llamaEngine.globalLayerCount = Int(assign.totalLayers)
+            }
             status = .ready
             assignment = assign
             onAssigned?(assign)

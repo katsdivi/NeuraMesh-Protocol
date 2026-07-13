@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# setup_llama.sh — Phase 8: build the llama.cpp shim (libnmpllama.dylib)
+# setup_llama.sh — Phase 8+10: build the llama.cpp shim (libnmpllama.dylib)
 #
 # NeuraMeshProtocol never links llama.cpp at build time (the package stays
 # dependency-free); instead the Swift runtime dlopens the shim built here.

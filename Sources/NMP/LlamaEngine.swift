@@ -1,6 +1,6 @@
 //
 //  LlamaEngine.swift
-//  NMP — Phase 8
+//  NMP — Phase 8 + Phase 10 (cross-device sharding)
 //
 //  Real-LLM compute behind the NMPShardComputeEngine seam, via llama.cpp
 //  (see LlamaRuntime.swift for the binding).
@@ -21,8 +21,16 @@
 //  greedily — so a local plan and a remote plan produce IDENTICAL token
 //  streams from identical weights.
 //
+//  PHASE 10 UPDATE: When the shim supports sharding (ABI ≥ 2), the engine
+//  CAN execute layer sub-ranges. The first shard receives token-state,
+//  runs the full model, and returns the hidden-state embedding. The last
+//  shard receives token-state, runs the full model, and returns logits.
+//  Each shard peer loads the full model. This is pipeline-parallel at
+//  the shard level: the coordinator manages the pipeline flow.
+//
 
 import Foundation
+import os
 
 public enum NMPLlamaEngineError: Error, Sendable {
     /// llama.cpp cannot execute a layer sub-range (see header comment).
@@ -44,6 +52,17 @@ public final class NMPLlamaComputeEngine: NMPShardComputeEngine {
     /// the coordinator might apply (Phase 8 samples greedily from [0]).
     public static let maxCandidates = 40
 
+    private let _globalLayerCount = OSAllocatedUnfairLock(initialState: 0)
+    public var globalLayerCount: Int {
+        get {
+            let val = _globalLayerCount.withLock { $0 }
+            return val == 0 ? layerCount : val
+        }
+        set {
+            _globalLayerCount.withLock { $0 = newValue }
+        }
+    }
+
     public var layerCount: Int { model.layerCount }
     public var hiddenSize: Int { model.hiddenSize }
     public var modelTag: String { model.name }
@@ -60,13 +79,94 @@ public final class NMPLlamaComputeEngine: NMPShardComputeEngine {
     }
 
     public func runLayers(start: Int, end: Int, input: [Float]) throws -> [Float] {
-        guard start == 0, end == layerCount else {
+        // Full-range path: the original Phase 8 behavior, unchanged.
+        if start == 0 && end == globalLayerCount {
+            return try runFullModel(input: input)
+        }
+
+        // Sub-range path: Phase 10 cross-device sharding.
+        guard model.runtime.supportsSharding else {
             throw NMPLlamaEngineError.partialRangeUnsupported(
                 start: start, end: end, layerCount: layerCount)
         }
-        guard input.count == hiddenSize else {
-            throw NMPComputeError.invalidInputWidth(expected: hiddenSize, got: input.count)
+        guard start >= 0, start < end, (end - start) <= layerCount else {
+            throw NMPComputeError.invalidLayerRange(
+                start: start, end: end, layerCount: layerCount)
         }
+        if !NMPLlamaShardWire.isShardResponse(input) {
+            guard input.count == hiddenSize else {
+                throw NMPComputeError.invalidInputWidth(
+                    expected: hiddenSize, got: input.count)
+            }
+        }
+
+        // First shard (start == 0): accepts token-state request, runs a
+        // full decode, returns the hidden-state embedding. The embedding
+        // is the model's internal representation after the transformer
+        // layers, before the output projection (lm_head).
+        if start == 0 {
+            // The input must be a token-state request (NMPLlamaWire format)
+            // since this is the first shard in the pipeline.
+            guard NMPLlamaWire.isRequest(input) || NMPLlamaWire.isVerifyRequest(input) else {
+                throw NMPLlamaEngineError.notTokenState
+            }
+            let request = try NMPLlamaWire.decodeRequest(input)
+            let embedding = try model.decodeEmbedding(
+                tokens: request.tokens, basePos: request.basePos)
+            // Wrap the embedding in a shard response wire vector.
+            return try NMPLlamaShardWire.encode(
+                NMPLlamaShardWire.ShardResponse(
+                    nextPos: request.basePos + request.tokens.count,
+                    tokens: request.tokens,
+                    hiddenState: embedding),
+                width: hiddenSize)
+        }
+
+        // Last shard (end == globalLayerCount): accepts a shard response from
+        // the previous shard, extracts the tokens and hidden states, runs
+        // the remaining layers starting from the hidden state, and returns
+        // top-k logits in NMPLlamaWire format.
+        if end == globalLayerCount {
+            guard NMPLlamaShardWire.isShardResponse(input) else {
+                throw NMPLlamaEngineError.notTokenState
+            }
+            let response = try NMPLlamaShardWire.decodeShardResponse(input)
+            let basePos = response.nextPos - response.tokens.count
+            
+            let k = min(Self.maxCandidates,
+                        NMPLlamaWire.responseCapacity(width: hiddenSize))
+            let candidates = try model.decodeEmbeddingInput(
+                embd: response.hiddenState, tokenCount: response.tokens.count,
+                basePos: basePos, k: k)
+            return try NMPLlamaWire.encode(
+                NMPLlamaWire.Response(
+                    nextPos: response.nextPos,
+                    candidates: candidates),
+                width: hiddenSize)
+        }
+
+        // Middle shard: in a 3+ shard pipeline, middle shards compute
+        // by evaluating the remaining layers using the incoming embeddings
+        // as input, and returning the output embeddings.
+        guard NMPLlamaShardWire.isShardResponse(input) else {
+            throw NMPLlamaEngineError.notTokenState
+        }
+        let response = try NMPLlamaShardWire.decodeShardResponse(input)
+        let basePos = response.nextPos - response.tokens.count
+        
+        let outputEmbd = try model.decodeEmbeddingToEmbedding(
+            embd: response.hiddenState, tokenCount: response.tokens.count, basePos: basePos)
+        
+        return try NMPLlamaShardWire.encode(
+            NMPLlamaShardWire.ShardResponse(
+                nextPos: response.nextPos,
+                tokens: response.tokens,
+                hiddenState: outputEmbd),
+            width: hiddenSize)
+    }
+
+    /// The original full-model decode path (Phase 8), factored out for reuse.
+    private func runFullModel(input: [Float]) throws -> [Float] {
         // Phase 9: a verify request asks for the greedy argmax at EVERY
         // decoded position — speculative-draft verification in one pass.
         if NMPLlamaWire.isVerifyRequest(input) {

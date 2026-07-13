@@ -79,8 +79,17 @@ struct DashboardArguments {
             case "--model": arguments.modelPath = value()
             case "--gpu-layers": arguments.gpuLayers = value().flatMap(Int32.init) ?? -1
             case "--placement":
-                arguments.placement = value().flatMap {
-                    NMPLlamaTestbed.Placement(rawValue: $0 == "remote" ? "remotePeer" : $0)
+                arguments.placement = value().flatMap { val in
+                    if val == "local" {
+                        return .local
+                    } else if val == "remote" || val == "remotePeer" {
+                        return .remotePeer
+                    } else if val == "sharded" {
+                        return .sharded(shardCount: 2)
+                    } else if val.hasPrefix("sharded:"), let count = Int(val.dropFirst(8)) {
+                        return .sharded(shardCount: count)
+                    }
+                    return nil
                 } ?? arguments.placement
             case "--auto-config": arguments.autoConfig = true
             case "--speculation": arguments.speculation = true
@@ -270,12 +279,21 @@ func runLlamaDashboard(model: NMPLlamaModel, arguments: DashboardArguments) -> N
     let testbed: NMPLlamaTestbed
     do {
         testbed = try NMPLlamaTestbed(
-            engine: engine, modelTag: model.name, placement: placement)
+            engine: engine, modelTag: model.name, placement: placement,
+            engineFactory: {
+                guard let path = arguments.modelPath else {
+                    throw NMPLlamaRuntimeError.weightsNotLoaded
+                }
+                let m = try NMPLlamaModel(modelPath: path)
+                return NMPLlamaComputeEngine(model: m)
+            }
+        )
         let plan = try testbed.startSync()
-        let shard = plan[0]
-        print("[nmp-dashboard] llama mesh live: layers "
-              + "\(shard.startLayer)..<\(shard.endLayer) on "
-              + (placement == .local ? "coordinator (local)" : "in-process peer (full stack)"))
+        print("[nmp-dashboard] llama mesh live: \(plan.count) shard(s) active")
+        for entry in plan {
+            let desc = entry.peerID == testbed.coordinatorID ? "coordinator (local)" : "in-process peer-\(entry.shardIndex) (full stack)"
+            print("  - shard \(entry.shardIndex): layers \(entry.startLayer)..<\(entry.endLayer) on \(desc)")
+        }
     } catch {
         fatalError("llama mesh assembly failed: \(error)")
     }
@@ -333,9 +351,10 @@ func runLlamaDashboard(model: NMPLlamaModel, arguments: DashboardArguments) -> N
     testbed.onPacketEvent = { event in
         server.reportPacketEvent(event, peerID: testbed.peerID)
     }
-    testbed.onInferenceServed = { _, layers, seconds in
+    testbed.onInferenceServed = { peerID, layers, seconds in
+        let name = peerID == testbed.coordinatorID ? "coordinator (local)" : "llama-peer-\(peerID) (in-process)"
         server.updatePeerState(
-            peerID: testbed.peerID, name: "llama-peer (in-process)",
+            peerID: peerID, name: name,
             latencyMS: Int(seconds * 1000), loadPercent: 0,
             assigned: "layers \(layers.lowerBound)-\(layers.upperBound - 1)",
             alive: true)
@@ -343,13 +362,15 @@ func runLlamaDashboard(model: NMPLlamaModel, arguments: DashboardArguments) -> N
     server.updatePeerState(
         peerID: testbed.coordinatorID, name: "coordinator (tokenizer)",
         latencyMS: 0, loadPercent: 0,
-        assigned: placement == .local ? "layers 0-\(engine.layerCount - 1)" : "—",
+        assigned: "—",
         alive: true)
-    if placement == .remotePeer {
+    for entry in testbed.plan {
+        let name = entry.peerID == testbed.coordinatorID ? "coordinator (tokenizer + local compute)" : "llama-peer-\(entry.shardIndex) (in-process)"
         server.updatePeerState(
-            peerID: testbed.peerID, name: "llama-peer (in-process)",
+            peerID: entry.peerID, name: name,
             latencyMS: 0, loadPercent: 0,
-            assigned: "layers 0-\(engine.layerCount - 1)", alive: true)
+            assigned: "layers \(entry.startLayer)-\(entry.endLayer - 1)",
+            alive: true)
     }
 
     server.onControl = { control in

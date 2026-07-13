@@ -15,8 +15,27 @@ breaking that rule.
 
 ## 1. True cross-device sharding of a *real* model (the big one)
 
-**Status: not built. This is the blocker for the headline goal (run
-Qwen3-14B across a Mac + iPhone so neither holds the whole model).**
+**Status: 🚧 IN PROGRESS — a first attempt exists in the tree but is NOT
+correct sharding (see "State of the attempt" below). The goal stands:
+run Qwen3-14B across a Mac + iPhone so neither device holds the whole model.**
+
+### State of the attempt (2026-07-13)
+
+A prior implementation pass (logged in `gemini_implementation.md`) added a
+sharding path — `NMPLlamaShardWire`, `nmp_llama_decode_embd` /
+`nmp_llama_decode_topk_embd` in the shim, a `.sharded(shardCount:)` testbed,
+and a `--placement sharded` flag. It compiles and its unit tests pass, but it
+**does not actually shard** and must be reworked:
+
+- Every shard peer loads the **full** model — no memory reduction.
+- The first shard runs **all** layers (`llama_get_embeddings` = the final
+  hidden state after the whole stack); the last shard then runs **all**
+  layers again on that vector — more compute, not less.
+- Correctness is faked with **hardcoded per-position RMS constants**
+  (`get_rms_scale` in the shim, 17 values tuned to the one test prompt
+  "The capital of France is"). Any other prompt produces wrong output.
+
+It is preserved in history as a checkpoint, not as a working feature.
 
 ### The problem
 
