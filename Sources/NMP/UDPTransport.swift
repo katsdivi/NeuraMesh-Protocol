@@ -15,6 +15,16 @@ import Network
 
 // MARK: - Transport abstraction
 
+/// What kind of physical path a transport runs over, as far as AWDL-style
+/// airtime contention is concerned. Loopback and wired Ethernet cannot
+/// experience Wi-Fi/AWDL contention, so traffic shaping is meaningless
+/// there; `.unknown` is treated like `.radio` (shape conservatively).
+public enum NMPLinkKind: Sendable {
+    case wiredOrLoopback
+    case radio
+    case unknown
+}
+
 /// A bidirectional, unreliable, unordered datagram channel to ONE remote peer.
 public protocol NMPTransport: AnyObject {
     /// Delivery callback. Invoked on the transport's queue with one complete
@@ -22,10 +32,26 @@ public protocol NMPTransport: AnyObject {
     var onReceive: ((Data) -> Void)? { get set }
     /// Invoked when the underlying channel dies (interface loss, etc.).
     var onClosed: ((Error?) -> Void)? { get set }
+    /// Physical-path classification, used to gate AWDL contention shaping.
+    /// May start `.unknown` and settle once the path is established.
+    var linkKind: NMPLinkKind { get }
+    /// Largest datagram this transport can actually put on the wire, if it
+    /// knows (kernel/UDP limits — 9216 B on stock macOS). nil = unknown.
+    var maxDatagramBytes: Int? { get }
 
     func start()
     func send(_ datagram: Data)
     func cancel()
+    /// Runs `body`, coalescing the `send` calls made inside it where the
+    /// transport can (NWConnection.batch amortizes per-send wakeups).
+    func batched(_ body: () -> Void)
+}
+
+public extension NMPTransport {
+    /// In-memory/test transports don't model an interface; shape as if radio.
+    var linkKind: NMPLinkKind { .unknown }
+    var maxDatagramBytes: Int? { nil }
+    func batched(_ body: () -> Void) { body() }
 }
 
 // MARK: - Network.framework UDP client transport
@@ -36,6 +62,8 @@ public final class UDPTransport: NMPTransport {
 
     public var onReceive: ((Data) -> Void)?
     public var onClosed: ((Error?) -> Void)?
+    public private(set) var linkKind: NMPLinkKind = .unknown
+    public private(set) var maxDatagramBytes: Int?
 
     private let connection: NWConnection
     private let queue: DispatchQueue
@@ -70,6 +98,17 @@ public final class UDPTransport: NMPTransport {
         connection.stateUpdateHandler = { [weak self] state in
             switch state {
             case .ready:
+                if let self {
+                    self.linkKind = Self.classify(self.connection.currentPath)
+                    // maximumDatagramSize overreports on loopback (path MTU
+                    // 16384) — the kernel still rejects sends above
+                    // net.inet.udp.maxdgram (9216 stock) with EMSGSIZE, and
+                    // UDP send errors are advisory, so an unclamped value
+                    // means silently vanishing packets. Clamp to the sysctl.
+                    let reported = self.connection.maximumDatagramSize
+                    self.maxDatagramBytes = reported > 0
+                        ? min(reported, Self.kernelUDPSendCeiling) : nil
+                }
                 self?.receiveLoop()
             case .failed(let error):
                 self?.onClosed?(error)
@@ -83,13 +122,44 @@ public final class UDPTransport: NMPTransport {
     }
 
     public func send(_ datagram: Data) {
-        connection.send(content: datagram, completion: .contentProcessed { _ in
-            // UDP: send errors are advisory; reliability is NMP's job (Phase 2).
-        })
+        // .idempotent skips the per-send completion machinery — UDP send
+        // errors are advisory anyway (reliability is NMP's job, Phase 2),
+        // and the replay window drops the rare duplicate it permits.
+        connection.send(content: datagram, completion: .idempotent)
+    }
+
+    public func batched(_ body: () -> Void) {
+        connection.batch(body)
     }
 
     public func cancel() {
         connection.cancel()
+    }
+
+    /// Largest UDP datagram the kernel will actually send (EMSGSIZE above
+    /// it). Stock Darwin ships 9216; honor a raised sysctl if present.
+    static let kernelUDPSendCeiling: Int = {
+        var value: CInt = 0
+        var size = MemoryLayout<CInt>.size
+        if sysctlbyname("net.inet.udp.maxdgram", &value, &size, nil, 0) == 0,
+           value > 0 {
+            return Int(value)
+        }
+        return 9216
+    }()
+
+    /// AWDL contention only exists on radio links; a loopback or wired path
+    /// must never trigger traffic shaping. Anything ambiguous stays
+    /// `.unknown` so shaping errs on the conservative side.
+    private static func classify(_ path: NWPath?) -> NMPLinkKind {
+        guard let path else { return .unknown }
+        if path.usesInterfaceType(.wifi) || path.usesInterfaceType(.cellular) {
+            return .radio
+        }
+        if path.usesInterfaceType(.loopback) || path.usesInterfaceType(.wiredEthernet) {
+            return .wiredOrLoopback
+        }
+        return .unknown
     }
 
     private func receiveLoop() {

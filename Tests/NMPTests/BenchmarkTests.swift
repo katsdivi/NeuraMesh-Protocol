@@ -78,13 +78,15 @@ final class BenchmarkTests: XCTestCase {
 
     func testThroughputDeclinesUnderHeavyLoss() throws {
         // 4 KB tensors → 4 chunks per direction per stage. Measured
-        // behavior of this stack: at ≤10% loss FEC + flush-expedited NACKs
-        // recover essentially for free (no p50 movement — that is the
-        // protocol working as designed, verified by the recovery-event
-        // counters below). Degradation becomes unambiguous at 15%, where
-        // NACK rounds start getting lost themselves: ~25% throughput drop
-        // and a 4-5× p95 tail on this hardware. The assertions use half
-        // those margins.
+        // behavior of this stack: at ≤15% loss FEC + flush-expedited NACKs
+        // recover essentially for free (no reliable p50/p95 movement — that
+        // is the protocol working as designed, verified by the
+        // recovery-event counters below; burst sending tightened recovery
+        // enough that the old 15% margins went stale). Degradation becomes
+        // unambiguous at 20%, where NACK rounds start getting lost
+        // themselves: ~25% throughput drop and a ~1.9-2.2× p95 tail on this
+        // hardware (8 paired runs). At 25% inference starts timing out
+        // outright. The assertions use half the 20% margins.
         let testbed = try NMPMeshTestbed(layerCount: 8, hiddenSize: 1024,
                                          remotePeerCount: 1)
         _ = try testbed.startSync()
@@ -105,17 +107,17 @@ final class BenchmarkTests: XCTestCase {
                                         lossRate: 0)
         XCTAssertFalse(sawRecoveries, "clean run must need no recoveries")
 
-        let lossy = try suite.benchmark(name: "15% loss", generations: 12, tokens: 4,
-                                        lossRate: 0.15)
+        let lossy = try suite.benchmark(name: "20% loss", generations: 12, tokens: 4,
+                                        lossRate: 0.20)
 
         XCTAssertTrue(sawRecoveries,
-                      "15% loss must exercise the FEC/NACK recovery path")
+                      "20% loss must exercise the FEC/NACK recovery path")
         XCTAssertLessThan(lossy.throughputTokensPerSecond,
-                          clean.throughputTokensPerSecond * 0.92,
-                          "throughput must decline under 15% loss: clean "
+                          clean.throughputTokensPerSecond * 0.875,
+                          "throughput must decline under 20% loss: clean "
                           + "\(clean.throughputTokensPerSecond) vs lossy "
                           + "\(lossy.throughputTokensPerSecond) tokens/s")
-        XCTAssertGreaterThan(lossy.stats.p95, clean.stats.p95 * 1.5,
+        XCTAssertGreaterThan(lossy.stats.p95, clean.stats.p95 * 1.4,
                              "loss must show up in the latency tail: clean p95 "
                              + "\(clean.stats.p95 * 1000) ms vs lossy p95 "
                              + "\(lossy.stats.p95 * 1000) ms")

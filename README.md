@@ -23,8 +23,17 @@ one-command auto-configuration; see `Docs/Phase9_Design.md`)**, plus **Mesh 2.0/
 on the Wi-Fi, real-time token streaming to every open browser, ACTUALLY-measured
 NMP-vs-TCP transport race, live device resource panel with compute-share sliders
 that re-shard the mesh, web-client tracking, benchmarking center, QR/Bonjour
-discovery; see `Docs/Mesh2_WebUI_Guide.md`)**.
-**326 tests pass, 0 failures.**
+discovery; see `Docs/Mesh2_WebUI_Guide.md`)**, plus **Mesh 2.5/2.6 (a
+FULLY-measured four-leg transport race — production NMP vs kernel TCP vs
+TCP+TLS 1.3 vs QUIC, every leg wall-clock on real loopback sockets; a
+dnctl/pfctl loss lab for real packet loss; and the link-adaptive
+transport: path-classified chunk sizing, FEC and AWDL shaping gated to
+radio paths, burst sending with coalesced writes — measured medians below)**.
+**331 tests pass, 0 failures.**
+
+New here? **`Docs/Project_Overview.md`** is the whole story — core
+problem, architecture, measured state, roadmap. The loss-resilience deep
+dive with current numbers: **`Docs/CaseStudy_PacketLoss.md`**.
 
 ## Requirements
 
@@ -114,9 +123,10 @@ Mesh 2.1 adds, on the same stack:
   final metrics everywhere.
 - **A measured transport race** (`POST /api/comparison/run`) — runs a real
   generation, then replays its exact traffic pattern over real loopback
-  sockets: the full NMP stack (Noise IK + AES-256-GCM + FEC over UDP) vs
-  plain kernel TCP. Both legs are wall-clock measurements; QUIC stays in
-  the clearly-labeled model (it needs a TLS identity to race honestly).
+  sockets. Since Mesh 2.5 all four legs are wall-clock measurements on
+  real sockets: the full NMP stack (Noise IK + AES-256-GCM over UDP) vs
+  plain kernel TCP vs TCP+TLS 1.3 vs QUIC (the TLS/QUIC legs stage an
+  ephemeral self-signed P-256 identity in-process and pin it).
 - **Device panel** (`GET /api/devices/metrics`) — live kernel counters
   (RAM, storage, CPU, this process's footprint) plus per-peer mesh facts,
   and a **compute-share slider** (`POST /api/devices/:id/allocate`) that
@@ -179,7 +189,7 @@ coordinator + iPhone peer): `Docs/CrossDevice_Setup_Guide.md`.
 | `CoordinatorElection.swift` | Phase 4: deterministic election (highest compute class, ties → lowest peerID) |
 | `Bonjour.swift` | Phase 4: mDNS service publishing/browsing with capabilities in TXT records |
 | `PeerDiscoveryManager.swift` | Phase 4: discovery + capability refresh + election orchestration |
-| `UDPTransport.swift` | Network.framework UDP transport + transport abstraction for tests |
+| `UDPTransport.swift` | Network.framework UDP transport + transport abstraction; classifies the physical path (`NMPLinkKind`) and the kernel datagram ceiling |
 | `GGUF.swift` | Phase 5: GGUF v2/v3 container parsing (memory-mapped, hostile-count guards) |
 | `ComputeEngine.swift` | Phase 5: engine seam (`NMPShardComputeEngine`) + deterministic reference engine |
 | `ModelSharder.swift` | Phase 5: proportional layer apportionment (measured speed or class weights) |
@@ -205,7 +215,8 @@ coordinator + iPhone peer): `Docs/CrossDevice_Setup_Guide.md`.
 | `SpeculativeDecoder.swift` | Phase 9: draft/verify speculative decoding — prompt-lookup + draft-model drafters |
 | `AutoConfig.swift` | Phase 9: one-command setup — membership → benchmark → balance → wire format |
 | `WebUI.swift` | Mesh 2.0: protocol comparison model (measured NMP + modeled TCP/QUIC), LAN identity, Bonjour advert, CoreImage QR banner |
-| `TransportRace.swift` | Mesh 2.1: MEASURED protocol race — a run's traffic pattern replayed over the real NMP UDP stack vs plain kernel TCP |
+| `TransportRace.swift` | Mesh 2.1/2.5: MEASURED four-leg protocol race — a run's traffic replayed over the real NMP UDP stack vs kernel TCP vs TCP+TLS 1.3 vs QUIC, all wall-clock |
+| `TLSIdentity.swift` | Mesh 2.5: ephemeral self-signed P-256 identity (hand-rolled X.509) for the TLS/QUIC race legs |
 | `ResourceMonitor.swift` | Mesh 2.1: live host resource sampling (Mach/BSD kernel counters) for the device panel |
 | `web/` → `Public/` | Mesh 2.0/2.1: React UI source → committed build the coordinator serves (`--ui`) |
 
@@ -298,6 +309,17 @@ Mesh 2.1 (validated 2026-07-11, Apple M3):
 - [x] Two pre-existing races found and fixed: unlocked `activePeers`/`activePlan` reads crashing under load (now lock-protected), and async `registerPeer` racing the adaptive controller's membership read (now settled via `waitForMembership`)
 - [x] 0 regressions: **306 tests pass, verified over 5 consecutive full-suite runs** (15 new: resource monitor kernel counters, transport race byte/trip accounting, token streaming order, share-driven re-planning, new routes, WS generation events)
 
+Mesh 2.5/2.6 (validated 2026-07-13, Apple M-series; all numbers wall-clock, loopback unless noted):
+
+- [x] Four-leg race fully measured: NMP vs kernel TCP vs TCP+TLS 1.3 vs QUIC on real sockets; if a TLS identity can't be staged the legs are SKIPPED and say so — nothing is modeled in their place
+- [x] Handshake: NMP (Noise IK) **1.2–2.9 ms** vs TCP+TLS 1.3 **20–26 ms** vs QUIC **8–12 ms**
+- [x] Race totals, median of 5 runs — 32 trips × 64 KB/direction: NMP **18.3 ms**, TCP 4.4, TLS 23.7, QUIC 17.2; 16 trips × 4 KB/direction: NMP **3.1 ms**, TCP 1.5, TLS 19.3, QUIC 9.7 (beats TLS everywhere and QUIC at inference-shaped traffic; plain TCP is the unencrypted floor)
+- [x] Link-adaptive transport: `NMPLinkKind` path classification — radio gets MTU-packed 1350 B chunks, FEC parity, AWDL shaping; wired/loopback gets kernel-ceiling 9 KB datagrams (clamped to `net.inet.udp.maxdgram` — `maximumDatagramSize` overreports and oversized UDP sends vanish silently) with parity/shaping off
+- [x] AWDL latency-spike signal now requires loss corroboration — send-burst queueing over a near-zero baseline read as contention and deferred DATA at 0.0% loss (the bug that made early races 30× slower); regression-pinned
+- [x] Burst sending (`sendBurst`/`sendBurstAsync`): one queue hop per tensor, transport writes coalesced via `NWConnection.batch`, FLUSH on the last chunk; adopted by the orchestrator, the shard engine, and the race
+- [x] Loss sweep re-measured (medians of 3 paired runs): 2%/5%/10% **free**, 15% −12%, 20% −28% with ~2× p95, 25% = honest breaking point (stage timeouts); earlier Phase 6 sign-off measured −49/−55/−81% at 5/10/15% — see `Docs/CaseStudy_PacketLoss.md`
+- [x] 0 regressions: **331 tests pass** (7 new: link-kind gating, no-parity-on-wired, burst order + FLUSH placement, chunk-size policy, detector corroboration)
+
 ## Design Docs
 
 - **`Docs/Start_Here.md` — the operator's manual: every launch mode and when to
@@ -334,3 +356,9 @@ Mesh 2.1 (validated 2026-07-11, Apple M3):
   TinyLlama draft-model measurements
 - `Docs/Benchmarks.md` — how to run the benchmark suite and interpret the results
 - `Docs/CrossDevice_Setup_Guide.md` — Mac + iPhone mesh walkthrough
+- `Docs/Project_Overview.md` — the whole story: core problem, architecture,
+  how a token flows, measured state of the world, design decisions, honest
+  limitations, roadmap
+- `Docs/CaseStudy_PacketLoss.md` — loss-resilience deep dive: the four
+  defense layers (FEC / NACK / FLUSH / link-aware restraint), measured
+  micro + macro numbers, how to reproduce them

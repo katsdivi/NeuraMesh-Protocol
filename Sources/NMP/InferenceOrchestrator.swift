@@ -520,7 +520,13 @@ public final class NMPInferenceOrchestrator {
         let tensor = NMPActivationCodec.encode(activations, format: activationWireFormat)
         let chunks: [NMPTensorChunk]
         do {
-            chunks = try NMPTensorChunk.split(requestID: requestID, tensorBytes: tensor)
+            // Link-adaptive chunks: MTU-safe 1024 B on radio, the kernel
+            // datagram ceiling on wired/loopback (envelope comes off first).
+            let chunkBytes = max(1, connection.recommendedChunkBytes
+                                    - NMPTensorChunk.envelopeBytes)
+            chunks = try NMPTensorChunk.split(requestID: requestID,
+                                              tensorBytes: tensor,
+                                              chunkBytes: chunkBytes)
         } catch {
             completion(.failure(.sendFailed("chunking: \(error)")))
             return
@@ -540,14 +546,11 @@ public final class NMPInferenceOrchestrator {
             },
             timer: nil)
 
-        connection.sendAsync(priority: .critical, payload: meta.encode(), completion: nil)
-        for (index, chunk) in chunks.enumerated() {
-            connection.sendAsync(
-                flags: index == chunks.count - 1 ? [.flush] : [],
-                priority: .critical,
-                payload: chunk.encode(),
-                completion: nil)
-        }
+        // One burst: single hop onto the connection queue, coalesced
+        // transport writes, FLUSH on the last chunk.
+        connection.sendBurstAsync(
+            payloads: [meta.encode()] + chunks.map { $0.encode() },
+            priority: .critical)
 
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + timeout)

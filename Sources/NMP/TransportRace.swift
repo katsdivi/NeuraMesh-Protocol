@@ -61,15 +61,17 @@ public enum NMPTransportRace {
         /// directions) — same accounting as GenerationResult's
         /// networkPayloadBytes.
         public var payloadBytes: Int
-        /// Per-send chunk size on the NMP leg (mesh traffic ships
-        /// NMPTensorChunk.defaultChunkBytes-sized packets).
-        public var chunkBytes: Int
+        /// Per-send chunk size on the NMP leg. nil (the default) matches
+        /// mesh traffic: the connection's link-adaptive recommendation
+        /// (`PeerConnection.recommendedChunkBytes` — MTU-safe 1024 B on
+        /// radio, the kernel datagram ceiling on loopback/wired).
+        public var chunkBytes: Int?
 
         public init(roundTrips: Int, payloadBytes: Int,
-                    chunkBytes: Int = NMPTensorChunk.defaultChunkBytes) {
+                    chunkBytes: Int? = nil) {
             self.roundTrips = max(1, roundTrips)
             self.payloadBytes = max(2, payloadBytes)
-            self.chunkBytes = max(64, chunkBytes)
+            self.chunkBytes = chunkBytes.map { max(64, $0) }
         }
 
         /// Bytes sent each way per round trip.
@@ -119,7 +121,9 @@ public enum NMPTransportRace {
             self.legs = legs
             var note = "all legs measured over loopback sockets on this "
                 + "machine — same trip count and bytes per leg; NMP carries "
-                + "Noise IK + AES-256-GCM + FEC; the TLS 1.3 and QUIC legs "
+                + "Noise IK + AES-256-GCM (its FEC parity and AWDL shaping "
+                + "are radio-path features and stay out of wired/loopback "
+                + "runs, exactly as in production); the TLS 1.3 and QUIC legs "
                 + "use an ephemeral self-signed P-256 identity generated "
                 + "in-process (the client pins the exact certificate). "
                 + "Loopback isolates protocol/stack cost — radio time is "
@@ -155,6 +159,15 @@ public enum NMPTransportRace {
     ) {
         DispatchQueue.global(qos: .userInitiated).async {
             do {
+                // Untimed warmup: the first leg to run otherwise pays
+                // one-time process costs (allocator pools, framework init,
+                // crypto setup) that later legs get for free — and NMP
+                // always runs first. Measured: ~1.5 ms of NMP "handshake"
+                // was warmup, not protocol.
+                _ = try? runNMPLeg(
+                    plan: Plan(roundTrips: 2, payloadBytes: 8_192),
+                    timeout: timeout)
+
                 var legs = [try runNMPLeg(plan: plan, timeout: timeout),
                             try runTCPLeg(plan: plan, timeout: timeout)]
                 var skipped: String?
@@ -223,7 +236,10 @@ public enum NMPTransportRace {
         let initiatorStatic = NoiseStaticKeyPair()
         let responderStatic = NoiseStaticKeyPair()
 
-        // Responder: echo every decrypted payload straight back.
+        // Responder: echo every decrypted payload straight back. The
+        // connection shares the listener queue with its transport, exactly
+        // like production peers (PeerNode) — a split pair pays two
+        // cross-queue hops per datagram that production never pays.
         var responder: PeerConnection?
         listener.onNewTransport = { transport, _ in
             guard responder == nil else { return }   // one race client
@@ -233,9 +249,18 @@ public enum NMPTransportRace {
                     config: PeerConnectionConfig(localPeerID: RaceIDs.responder),
                     transport: transport,
                     localStatic: responderStatic,
-                    queue: DispatchQueue(label: "nmp.race.udp.responder"))
+                    queue: listenerQueue)
+                // Echo like PeerShardEngine responds: accumulate the request
+                // burst and answer with ONE burst when FLUSH (end-of-burst)
+                // arrives — onPacket already runs on the connection queue,
+                // so no extra hop and the reply's writes coalesce.
+                var pendingEcho: [Data] = []
                 connection.onPacket = { [weak connection] packet in
-                    connection?.sendAsync(payload: packet.payload)
+                    pendingEcho.append(packet.payload)
+                    guard packet.header.flags.contains(.flush) else { return }
+                    let burst = pendingEcho
+                    pendingEcho.removeAll(keepingCapacity: true)
+                    try? connection?.sendBurst(payloads: burst)
                 }
                 responder = connection
                 connection.start()
@@ -259,10 +284,11 @@ public enum NMPTransportRace {
             listener.cancel()
         }
 
+        // One queue for transport + connection, like production (PeerNode).
+        let initiatorQueue = DispatchQueue(label: "nmp.race.udp.initiator")
         let transport = UDPTransport(
             host: "127.0.0.1", port: port,
-            queue: DispatchQueue(label: "nmp.race.udp.transport"))
-        let initiatorQueue = DispatchQueue(label: "nmp.race.udp.initiator")
+            queue: initiatorQueue)
         let initiator = try PeerConnection(
             role: .initiator,
             config: PeerConnectionConfig(localPeerID: RaceIDs.initiator),
@@ -285,7 +311,8 @@ public enum NMPTransportRace {
         // Round trips: send bytesPerDirection in ≤chunkBytes packets,
         // wait for the same byte count echoed back.
         let perDirection = plan.bytesPerDirection
-        let chunk = Data(repeating: 0xA5, count: min(plan.chunkBytes, perDirection))
+        let chunkBytes = plan.chunkBytes ?? initiator.recommendedChunkBytes
+        let chunk = Data(repeating: 0xA5, count: min(chunkBytes, perDirection))
         let tripDone = DispatchSemaphore(value: 0)
         let receivedLock = NSLock()
         var receivedThisTrip = 0
@@ -306,12 +333,17 @@ public enum NMPTransportRace {
             receivedThisTrip = 0
             receivedLock.unlock()
 
+            // One burst per trip: single queue hop, coalesced transport
+            // writes, FLUSH on the last chunk — exactly like
+            // PeerShardEngine tensor traffic.
+            var payloads: [Data] = []
             var sent = 0
             while sent < perDirection {
                 let size = min(chunk.count, perDirection - sent)
-                initiator.sendAsync(payload: chunk.prefix(size))
+                payloads.append(chunk.prefix(size))
                 sent += size
             }
+            initiator.sendBurstAsync(payloads: payloads)
             guard tripDone.wait(timeout: .now() + timeout) == .success else {
                 throw RaceError.timedOut(
                     "NMP echo round trip (\(perDirection) B/direction)")
@@ -321,8 +353,9 @@ public enum NMPTransportRace {
 
         return LegResult(
             name: "NMP",
-            transportDescription: "UDP + Noise IK + AES-256-GCM + FEC "
-                + "(production stack, loopback)",
+            transportDescription: "UDP + Noise IK + AES-256-GCM (production "
+                + "stack, loopback: link-adaptive \(chunkBytes) B chunks; "
+                + "FEC parity + AWDL shaping engage on radio paths only)",
             handshakeMs: handshakeMs,
             transferMs: transferMs,
             roundTrips: plan.roundTrips,

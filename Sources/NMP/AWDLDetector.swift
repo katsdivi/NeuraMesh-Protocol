@@ -15,7 +15,14 @@
 //       by clock skew, so the detector compares a rolling median against a
 //       calm-period baseline and looks for a SHIFT: median exceeding
 //       baseline by 2× (and by at least 5 ms, so a near-zero loopback
-//       baseline can't trip on noise).
+//       baseline can't trip on noise). A latency shift alone is NOT enough:
+//       it must be corroborated by at least one loss in the window. A burst
+//       of back-to-back sends inflates one-way delay through the sender's
+//       own socket/queue backlog — with a near-zero baseline that
+//       self-induced queueing reads exactly like a contention spike (it
+//       stalled the loopback transport race at 40+ ms/trip). Real AWDL
+//       contention that matters produces loss the FEC layer can't absorb;
+//       queueing under clean conditions does not.
 //
 //  Suppression clears after 200 ms of calm (loss below 2%, no latency
 //  spike). Thresholds are heuristics tuned on test hardware — documented,
@@ -109,7 +116,9 @@ struct NMPAWDLDetector {
 
         let lossSignal = sentTimes.count >= config.minSendSamples
             && currentLossRate > config.engageLossRate
-        let latencySignal = latencySpiked()
+        // Loss corroboration: a median shift with zero loss is self-induced
+        // queueing (send bursts), not airtime contention. See header comment.
+        let latencySignal = latencySpiked() && !lossTimes.isEmpty
 
         let wasActive = suppressionActive
         if !suppressionActive {

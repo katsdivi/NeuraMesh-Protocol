@@ -163,6 +163,51 @@ public final class PeerConnection {
     private var shaper: NMPTrafficShaper
     private var deferTimer: DispatchSourceTimer?
 
+    /// AWDL contention shaping only makes sense on radio paths: loopback and
+    /// wired Ethernet have no shared airtime to protect, so shaping there
+    /// only adds latency. `.unknown` (in-memory test transports, unresolved
+    /// paths) keeps shaping on — the conservative default.
+    private var awdlShapingApplies: Bool {
+        config.awdl.enabled && transport.linkKind != .wiredOrLoopback
+    }
+
+    /// FEC parity exists to absorb radio loss without a retransmit round
+    /// trip. Loopback and wired Ethernet lose essentially nothing, so parity
+    /// there is +25% packets for no recovery — skip it. The NACK path stays
+    /// armed as the (never-exercised) safety net, and the receive side still
+    /// consumes parity, so a mixed-classification pair interoperates.
+    private var fecApplies: Bool {
+        config.fec.enabled && transport.linkKind != .wiredOrLoopback
+    }
+
+    /// Payload bytes that pack a 1500-byte Wi-Fi MTU without IP
+    /// fragmentation (a lost fragment kills the whole datagram on radio):
+    /// 1350 + seal(36) + UDP/IP(28) = 1414, leaving 86 B of headroom for
+    /// VPN/tunnel encapsulation on real networks.
+    static let radioChunkBytes = 1350
+
+    /// Largest payload worth putting in one packet on THIS link. Radio
+    /// paths pack the MTU but never fragment; unknown paths keep the
+    /// conservative 1024 B default. Loopback/wired paths take the kernel's
+    /// datagram ceiling instead: fragmentation is loss-free there and
+    /// per-datagram cost dominates. Valid once the connection is
+    /// established.
+    public var recommendedChunkBytes: Int {
+        switch transport.linkKind {
+        case .radio:
+            return Self.radioChunkBytes
+        case .unknown:
+            return NMPTensorChunk.defaultChunkBytes
+        case .wiredOrLoopback:
+            guard let maxDatagram = transport.maxDatagramBytes else {
+                return NMPTensorChunk.defaultChunkBytes
+            }
+            let sealedOverhead = NMPHeader.byteCount + NMPHeader.gcmTagByteCount
+            return max(NMPTensorChunk.defaultChunkBytes,
+                       min(maxDatagram - sealedOverhead, NMPHeader.maxPayloadLength))
+        }
+    }
+
     // Mesh 2.3: cumulative wire traffic — every datagram handed to /
     // received from the transport, handshake, NACKs, FEC parity and
     // retransmits included (this is what actually crossed the link).
@@ -288,7 +333,7 @@ public final class PeerConnection {
         guard state == .established, session != nil else {
             throw PeerConnectionError.notEstablished
         }
-        if config.awdl.enabled {
+        if awdlShapingApplies {
             syncSuppression(at: Self.monotonicNow())
             if shaper.shouldDefer(packetType: packetType, flags: flags, priority: priority) {
                 try shaper.deferPacket(packetType: packetType, flags: flags, payload: payload)
@@ -320,6 +365,55 @@ public final class PeerConnection {
         }
     }
 
+    /// Seals and sends several payloads as one burst with transport writes
+    /// coalesced (`NMPTransport.batched`) and FLUSH on the last payload
+    /// unless disabled — the burst IS the unit whose end expedites receiver
+    /// gap detection. This is the preferred way to ship a chunked tensor.
+    /// Callers must already be on the connection queue (like `send`);
+    /// off-queue callers use `sendBurstAsync`. Throws the first send error.
+    public func sendBurst(
+        payloads: [Data],
+        priority: NMPSendPriority = .normal,
+        flushLast: Bool = true
+    ) throws {
+        dispatchPrecondition(condition: .onQueue(queue))
+        var failure: Error?
+        transport.batched {
+            for (index, payload) in payloads.enumerated() {
+                let flags: NMPFlags =
+                    flushLast && index == payloads.count - 1 ? [.flush] : []
+                do {
+                    _ = try send(flags: flags, priority: priority,
+                                 payload: payload)
+                } catch {
+                    failure = error
+                    break
+                }
+            }
+        }
+        if let failure { throw failure }
+    }
+
+    /// Off-queue convenience for `sendBurst`: one hop onto the connection
+    /// queue for the whole burst. `completion` gets the first error, or nil.
+    public func sendBurstAsync(
+        payloads: [Data],
+        priority: NMPSendPriority = .normal,
+        flushLast: Bool = true,
+        completion: ((Error?) -> Void)? = nil
+    ) {
+        guard !payloads.isEmpty else { completion?(nil); return }
+        queue.async { [self] in
+            do {
+                try sendBurst(payloads: payloads, priority: priority,
+                              flushLast: flushLast)
+                completion?(nil)
+            } catch {
+                completion?(error)
+            }
+        }
+    }
+
     /// Seals and sends one packet, maintaining the retransmit window and the
     /// FEC group. The group-closing packet gets FEC_GROUP_END set BEFORE
     /// sealing (the header is AAD and cannot change afterward); the parity
@@ -332,7 +426,7 @@ public final class PeerConnection {
         guard let session else { throw PeerConnectionError.notEstablished }
 
         var flags = flags
-        let fecEligible = config.fec.enabled && packetType == .data
+        let fecEligible = fecApplies && packetType == .data
         let closesGroup = fecEligible && fecBuilder.willCloseGroup(flush: flags.contains(.flush))
         if closesGroup { flags.insert(.fecGroupEnd) }
 
@@ -348,7 +442,7 @@ public final class PeerConnection {
         // refilled.
         retransmitBuffer.store(sequence: seq, datagram: datagram)
         transmit(datagram)
-        if config.awdl.enabled { awdlDetector.recordSent(at: Self.monotonicNow()) }
+        if awdlShapingApplies { awdlDetector.recordSent(at: Self.monotonicNow()) }
 
         if fecEligible,
            let parityPayload = fecBuilder.add(sequence: seq, payload: payload,
@@ -555,7 +649,7 @@ public final class PeerConnection {
 
                 // AWDL: one-way delay sample (sender wall clock; the
                 // detector only reacts to shifts, so skew is tolerable).
-                if config.awdl.enabled {
+                if awdlShapingApplies {
                     let delta = Int64(bitPattern: Self.nowNanos() &- packet.header.timestampNanos)
                     awdlDetector.recordLatencySample(Double(delta) / 1e9, at: now)
                     syncSuppression(at: now)
@@ -628,7 +722,7 @@ public final class PeerConnection {
         // Each NACKed sequence is a loss report for the AWDL detector. FEC-
         // recovered losses never reach this point — by design, only loss the
         // FEC layer failed to absorb counts toward suppression.
-        if config.awdl.enabled {
+        if awdlShapingApplies {
             awdlDetector.recordLosses(sequences.count, at: now)
             syncSuppression(at: now)
         }

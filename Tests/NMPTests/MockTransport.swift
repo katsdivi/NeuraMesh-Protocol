@@ -18,6 +18,11 @@ final class MockTransport: NMPTransport {
     var dropOutbound: ((Data) -> Bool)?
     /// Optionally mutate outbound datagrams (corruption simulation).
     var corruptOutbound: ((Data) -> Data)?
+    /// Path classification reported to PeerConnection's AWDL shaping gate.
+    /// `.unknown` (the protocol default) keeps shaping active like a radio.
+    var linkKind: NMPLinkKind = .unknown
+    /// Kernel datagram ceiling reported to `recommendedChunkBytes`.
+    var maxDatagramBytes: Int?
 
     weak var peer: MockTransport?
     private let deliveryQueue: DispatchQueue

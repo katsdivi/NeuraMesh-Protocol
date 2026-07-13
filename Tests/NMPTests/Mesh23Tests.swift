@@ -74,7 +74,10 @@ final class WireTrafficTests: XCTestCase {
 
     /// A live mesh moves real datagrams; the counters must see them from
     /// both ends of the link — coordinator sent ≈ peer received (the
-    /// in-memory transport is lossless, so byte-exact).
+    /// in-memory transport is lossless, so byte-exact). Trailing metrics /
+    /// resource-report datagrams may still be in flight when inferSync
+    /// returns (counted at send, not yet at delivery), so poll until the
+    /// link quiesces before asserting exactness.
     func testCountersMatchAcrossALosslessLink() throws {
         let testbed = try NMPMeshTestbed(
             layerCount: 6, hiddenSize: 64, remotePeerCount: 1)
@@ -82,8 +85,16 @@ final class WireTrafficTests: XCTestCase {
         _ = try testbed.inferSync(input: testbed.makeInput())
 
         let peer = try XCTUnwrap(testbed.remotePeers.first)
-        let coordinator = peer.coordinatorSide.trafficTotals
-        let remote = peer.peerSide.trafficTotals
+        var coordinator = peer.coordinatorSide.trafficTotals
+        var remote = peer.peerSide.trafficTotals
+        let deadline = DispatchTime.now() + .seconds(2)
+        while (coordinator.sentBytes != remote.receivedBytes
+               || coordinator.receivedBytes != remote.sentBytes),
+              DispatchTime.now() < deadline {
+            Thread.sleep(forTimeInterval: 0.01)
+            coordinator = peer.coordinatorSide.trafficTotals
+            remote = peer.peerSide.trafficTotals
+        }
 
         XCTAssertGreaterThan(coordinator.sentBytes, 0,
                              "handshake + SHARD_ASSIGN + tensors went out")

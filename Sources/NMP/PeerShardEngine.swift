@@ -201,20 +201,24 @@ public final class NMPPeerShardEngine {
 
         do {
             let tensor = NMPActivationCodec.encode(output, format: requestFormat)
-            let chunks = try NMPTensorChunk.split(requestID: requestID, tensorBytes: tensor)
+            // Link-adaptive chunks: MTU-safe 1024 B on radio, the kernel
+            // datagram ceiling on wired/loopback (envelope comes off first).
+            let chunkBytes = max(1, connection.recommendedChunkBytes
+                                    - NMPTensorChunk.envelopeBytes)
+            let chunks = try NMPTensorChunk.split(requestID: requestID,
+                                                  tensorBytes: tensor,
+                                                  chunkBytes: chunkBytes)
             let response = NMPInferResponseMeta(
                 requestID: requestID, status: .ok,
                 computeMicros: UInt32(clamping: Int(computeSeconds * 1e6)),
                 totalBytes: UInt32(tensor.count),
                 chunkCount: UInt16(chunks.count))
-            send(payload: response.encode(), context: "response meta")
-            for (index, chunk) in chunks.enumerated() {
-                // FLUSH on the last chunk: nothing follows to fill receiver
-                // gaps, so expedite NACKs and close the FEC group.
-                send(payload: chunk.encode(),
-                     flags: index == chunks.count - 1 ? [.flush] : [],
-                     context: "response chunk \(index)")
-            }
+            // One burst, coalesced transport writes; FLUSH lands on the last
+            // chunk: nothing follows to fill receiver gaps, so expedite
+            // NACKs and close the FEC group.
+            try connection.sendBurst(
+                payloads: [response.encode()] + chunks.map { $0.encode() },
+                priority: .critical)
         } catch {
             onDiagnostic?("failed to send response \(requestID): \(error)")
             return

@@ -77,16 +77,31 @@ final class AWDLDetectorTests: XCTestCase {
         XCTAssertTrue(d.suppressionActive)
     }
 
-    func testLatencySpikeEngages() {
+    func testLatencySpikeWithLossEngages() {
         var d = makeDetector()
         // Establish a 10ms baseline.
         for i in 0..<10 { d.recordLatencySample(0.010, at: Double(i) * 0.001) }
         d.updateState(at: 0.010)
         XCTAssertFalse(d.suppressionActive)
-        // Median jumps to 25ms — 2.5× baseline and >5ms above it.
+        // Median jumps to 25ms — 2.5× baseline and >5ms above it — and a
+        // loss corroborates that the shift is contention, not queueing.
         for i in 0..<10 { d.recordLatencySample(0.025, at: 0.07 + Double(i) * 0.001) }
+        d.recordLosses(1, at: 0.075)
         d.updateState(at: 0.08)
         XCTAssertTrue(d.suppressionActive)
+    }
+
+    func testLatencySpikeWithoutLossDoesNotEngage() {
+        // A median shift with zero loss is what NMP's own send bursts look
+        // like on a clean link (socket/queue backlog inflates one-way delay
+        // over a near-zero baseline). This false-positived on loopback and
+        // deferred every DATA packet — it must NOT engage suppression.
+        var d = makeDetector()
+        for i in 0..<10 { d.recordLatencySample(0.0002, at: Double(i) * 0.001) }
+        d.updateState(at: 0.010)
+        for i in 0..<10 { d.recordLatencySample(0.020, at: 0.07 + Double(i) * 0.001) }
+        d.updateState(at: 0.08) // 100× shift, but no loss anywhere
+        XCTAssertFalse(d.suppressionActive)
     }
 
     func testClockSkewedSamplesStillDetectShift() {
@@ -97,7 +112,8 @@ final class AWDLDetectorTests: XCTestCase {
         d.updateState(at: 0.010)
         XCTAssertFalse(d.suppressionActive)
         for i in 0..<10 { d.recordLatencySample(-0.480, at: 0.07 + Double(i) * 0.001) }
-        d.updateState(at: 0.08) // +20ms shift > 5ms min delta
+        d.recordLosses(1, at: 0.075)
+        d.updateState(at: 0.08) // +20ms shift > 5ms min delta, loss-corroborated
         XCTAssertTrue(d.suppressionActive)
     }
 }

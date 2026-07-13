@@ -359,6 +359,123 @@ final class FECIntegrationTests: XCTestCase {
         wait(for: [delivered], timeout: 3)
     }
 
+    func testNoSuppressionOnWiredOrLoopbackPath() throws {
+        // Same loss storm as above, but the transport reports a path that
+        // cannot experience AWDL contention — shaping must stay out of the
+        // way entirely: no engagement, and sends never defer (non-nil seq).
+        let mesh = try makeEstablishedMesh(fecEnabled: false) { cfg in
+            cfg.awdl.minSendSamples = 10
+            cfg.awdl.lossWindow = 0.5
+        }
+        mesh.tInit.linkKind = .wiredOrLoopback
+        mesh.tResp.linkKind = .wiredOrLoopback
+
+        var rng = SplitMix64(seed: 42)
+        let lock = NSLock()
+        var seenSeqs: Set<UInt32> = []
+        mesh.tInit.dropOutbound = { datagram in
+            guard let h = Self.header(of: datagram), h.isEncrypted,
+                  h.packetType == .data else { return false }
+            lock.lock(); defer { lock.unlock() }
+            guard seenSeqs.insert(h.sequenceNumber).inserted else { return false }
+            return rng.chance(0.4)
+        }
+        mesh.initiator.onDiagnostic = { message in
+            XCTAssertFalse(message.contains("AWDL suppression engaged"),
+                           "wired/loopback path must never engage suppression")
+        }
+
+        let allSent = expectation(description: "every send got a sequence")
+        allSent.expectedFulfillmentCount = 40
+        for n in 0..<40 {
+            mesh.initiator.sendAsync(payload: Data("storm #\(n)".utf8)) { result in
+                if case .success(.some) = result { allSent.fulfill() }
+            }
+            Thread.sleep(forTimeInterval: 0.002)
+        }
+        wait(for: [allSent], timeout: 5)
+    }
+
+    func testNoParityOnWiredOrLoopbackPath() throws {
+        // FEC parity is a radio-loss feature; a wired/loopback sender must
+        // not spend +25% packets on it. Headers are plaintext AAD, so the
+        // wire can be audited without decrypting.
+        let mesh = try makeEstablishedMesh(fecEnabled: true)
+        mesh.tInit.linkKind = .wiredOrLoopback
+
+        let delivered = expectation(description: "all payloads delivered")
+        delivered.expectedFulfillmentCount = 8
+        mesh.responder.onPacket = { _ in delivered.fulfill() }
+        for n in 0..<8 {
+            mesh.initiator.sendAsync(payload: Data("wired #\(n)".utf8))
+        }
+        wait(for: [delivered], timeout: 5)
+
+        let parityCount = mesh.tInit.sentDatagrams
+            .compactMap(Self.header(of:))
+            .filter { $0.packetType == .fecRecovery }
+            .count
+        XCTAssertEqual(parityCount, 0,
+                       "wired/loopback path must not emit FEC parity")
+    }
+
+    func testRecommendedChunkBytesFollowsLinkKind() throws {
+        let mesh = try makeEstablishedMesh()
+
+        // Unknown: conservative default, whatever the kernel allows.
+        mesh.tInit.maxDatagramBytes = 9216
+        XCTAssertEqual(mesh.initiator.recommendedChunkBytes,
+                       NMPTensorChunk.defaultChunkBytes)
+
+        // Radio: MTU-packed but never fragmenting.
+        mesh.tInit.linkKind = .radio
+        XCTAssertEqual(mesh.initiator.recommendedChunkBytes,
+                       PeerConnection.radioChunkBytes)
+
+        // Wired/loopback with a known ceiling: ceiling minus seal overhead.
+        mesh.tInit.linkKind = .wiredOrLoopback
+        XCTAssertEqual(mesh.initiator.recommendedChunkBytes,
+                       9216 - NMPHeader.byteCount - NMPHeader.gcmTagByteCount)
+
+        // Wired/loopback but ceiling unknown: stay at the safe default.
+        mesh.tInit.maxDatagramBytes = nil
+        XCTAssertEqual(mesh.initiator.recommendedChunkBytes,
+                       NMPTensorChunk.defaultChunkBytes)
+
+        // Never exceed the UInt16 payload-length field.
+        mesh.tInit.maxDatagramBytes = 1 << 20
+        XCTAssertEqual(mesh.initiator.recommendedChunkBytes,
+                       NMPHeader.maxPayloadLength)
+    }
+
+    func testSendBurstDeliversInOrderWithFlushOnLast() throws {
+        let mesh = try makeEstablishedMesh()
+        let payloads = (0..<10).map { Data("burst #\($0)".utf8) }
+
+        let all = expectation(description: "burst delivered in order")
+        let lock = NSLock()
+        var received: [(payload: Data, flushed: Bool)] = []
+        mesh.responder.onPacket = { packet in
+            lock.lock()
+            received.append((packet.payload,
+                             packet.header.flags.contains(.flush)))
+            let count = received.count
+            lock.unlock()
+            if count == payloads.count { all.fulfill() }
+        }
+        mesh.initiator.sendBurstAsync(payloads: payloads) { error in
+            XCTAssertNil(error)
+        }
+        wait(for: [all], timeout: 5)
+
+        lock.lock(); defer { lock.unlock() }
+        XCTAssertEqual(received.map(\.payload), payloads,
+                       "burst must preserve submit order")
+        XCTAssertEqual(received.map(\.flushed),
+                       Array(repeating: false, count: payloads.count - 1) + [true],
+                       "FLUSH must land on exactly the last payload")
+    }
+
     func testCriticalDataBypassesSuppression() throws {
         let mesh = try makeEstablishedMesh(fecEnabled: false) { cfg in
             cfg.awdl.minSendSamples = 10

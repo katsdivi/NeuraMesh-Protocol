@@ -104,15 +104,43 @@ Pending parity groups expire after 50 ms.
 (a) NACKed-sequences / packets-sent exceeds 5% over a 100 ms window with at
 least 20 sends (a single early loss must not trip it), or (b) the rolling
 median of one-way delay samples shifts above a calm-period baseline by 2×
-and at least 5 ms. Disengage after 200 ms of sustained calm. The latency
-samples come from header timestamps (sender wall clock) — absolute values
-are polluted by clock skew, so only the SHIFT is used; the 5 ms floor stops
-a near-zero loopback baseline from tripping on noise. **These thresholds
-were tuned on the in-memory test harness and one machine; they must be
+and at least 5 ms, AND at least one loss sits in the window. Disengage
+after 200 ms of sustained calm. The latency samples come from header
+timestamps (sender wall clock) — absolute values are polluted by clock
+skew, so only the SHIFT is used; the 5 ms floor stops a near-zero loopback
+baseline from tripping on noise. The loss-corroboration requirement on (b)
+was added after the loopback transport race: a burst of back-to-back sends
+inflates one-way delay through the sender's own socket/queue backlog, and
+over a near-zero baseline that self-induced queueing read exactly like a
+contention spike — suppression engaged at 0.0% loss and deferred every DATA
+packet, turning 0.8 ms loopback round trips into 40+ ms ones. A latency
+shift with zero loss is queueing, not contention. **These thresholds were
+tuned on the in-memory test harness and one machine; they must be
 re-validated on real device meshes in Phase 5+.** Note also that FEC hides
 recovered losses from the sender (no NACK is ever sent), so the loss-rate
 signal only sees loss FEC failed to absorb — which is exactly the loss that
 should drive suppression.
+
+**Shaping, FEC, and chunk size are gated on the physical path.**
+`NMPTransport` now reports an `NMPLinkKind` (`radio` / `wiredOrLoopback` /
+`unknown`) and the kernel's datagram ceiling (`maxDatagramBytes`, clamped to
+`net.inet.udp.maxdgram` — `NWConnection.maximumDatagramSize` overreports on
+loopback and the kernel EMSGSIZEs anything bigger, silently, because UDP
+send errors are advisory); `UDPTransport` classifies the resolved `NWPath`
+when the connection becomes ready. AWDL contention is a shared-airtime
+phenomenon and FEC parity exists to absorb radio loss, so PeerConnection
+applies the detector + shaper + parity only when the path is NOT
+`wiredOrLoopback` — loopback and wired Ethernet get zero shaping overhead
+and zero parity (the NACK path stays armed as the safety net, and the
+receive side still consumes parity from a peer that classified differently).
+`PeerConnection.recommendedChunkBytes` follows the same split: MTU-packed
+1350 B on radio (fills a 1500 B Wi-Fi MTU with VPN headroom but never
+fragments — a lost IP fragment kills the whole datagram), the conservative
+1024 B default on unknown paths, and the kernel ceiling minus seal
+overhead (9180 B stock) on wired/loopback where fragmentation is loss-free
+and per-datagram cost dominates. Tensor senders and the transport race both consult it, and ship
+bursts through `sendBurst`/`sendBurstAsync` (one queue hop, transport
+writes coalesced via `NWConnection.batch`, FLUSH on the last chunk).
 
 **Traffic shaping defers plaintext, not sealed datagrams.** Sealing assigns
 the sequence number; deferring a sealed packet while later packets ship
@@ -165,16 +193,18 @@ round-trip with non-contiguous sequences, malformed-payload rejection, slice
 offsets, plus the two performance gates), `FECGroupBuilderTests` (2: emit on
 4th, FLUSH early close), `FECGroupReceiverTests` (5: no-loss discard,
 single-missing reconstruction, parity-first reordering, 2-missing wait →
-retransmit unlock, stale-group expiry), `AWDLDetectorTests` (7: calm, loss
+retransmit unlock, stale-group expiry), `AWDLDetectorTests` (8: calm, loss
 engage, min-sample guard, sustained-calm disengage, relapse resets timer,
-latency spike, clock-skew tolerance), `TrafficShaperTests` (4),
+loss-corroborated latency spike engages, uncorroborated spike does NOT,
+clock-skew tolerance), `TrafficShaperTests` (4),
 `LossTrackerTests` +2 (markRecovered, postponeUnattempted).
-Integration (`FECIntegrationTests`, 8): single black-holed packet recovered
+Integration (`FECIntegrationTests`, 9): single black-holed packet recovered
 via FEC with zero NACK retransmits, parity-loss → NACK fallback, 2-losses →
 NACK fallback, one loss per group across 3 interleaved groups, 1000-packet
 2% seeded-random loss (recovery rate printed + asserted ≥80%), FEC-vs-NACK
 recovery latency comparison (asserted <50%), suppression defers + backstop
-flushes, critical priority bypasses suppression.
+flushes, critical priority bypasses suppression, wired/loopback link kind
+never engages suppression.
 
 Phase 1-2 adjustments: `testManyPacketsSurviveRoundTrip` now asserts payload
 order + monotonic sequences (parity packets legitimately consume every 5th

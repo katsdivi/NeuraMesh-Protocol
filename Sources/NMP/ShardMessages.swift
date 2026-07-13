@@ -244,7 +244,12 @@ public struct NMPTensorChunk: Equatable, Sendable {
     /// Data bytes per chunk. 1024 + envelope(7) + NMP header/tag(36) keeps
     /// each datagram comfortably inside a 1500-byte MTU — no IP
     /// fragmentation, so Phase 2/3 loss recovery operates per-chunk.
+    /// This is the radio-path size; wired/loopback paths use
+    /// `PeerConnection.recommendedChunkBytes` (kernel datagram ceiling)
+    /// minus `envelopeBytes`.
     public static let defaultChunkBytes = 1024
+    /// Wire envelope: kind(1) + requestID(4) + chunkIndex(2).
+    public static let envelopeBytes = 7
 
     public var requestID: UInt32
     public var chunkIndex: UInt16
