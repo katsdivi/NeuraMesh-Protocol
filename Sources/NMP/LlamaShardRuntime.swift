@@ -55,12 +55,13 @@ public enum NMPLlamaShardError: Error, Sendable {
 /// plenty (`shared()`); instances are cheap and independent.
 public final class NMPLlamaShardRuntime {
 
-    static let expectedABI: Int32 = 1
+    static let expectedABI: Int32 = 2
 
     // Shim signatures (scalars and pointers only — see nmp_shard_shim.c).
     typealias AbiVersionFn = @convention(c) () -> Int32
+    // (path, start, end, maxCtx) — maxCtx is the KV cache capacity.
     typealias OpenFn = @convention(c) (
-        UnsafePointer<CChar>?, Int32, Int32) -> OpaquePointer?
+        UnsafePointer<CChar>?, Int32, Int32, Int32) -> OpaquePointer?
     typealias ArchFn = @convention(c) (
         OpaquePointer?,
         UnsafeMutablePointer<Int32>?, UnsafeMutablePointer<Int32>?,
@@ -68,8 +69,10 @@ public final class NMPLlamaShardRuntime {
         UnsafeMutablePointer<Int32>?, UnsafeMutablePointer<Int32>?,
         UnsafeMutablePointer<Int32>?) -> Void
     typealias BytesFn = @convention(c) (OpaquePointer?) -> Int
+    typealias MaxCtxFn = @convention(c) (OpaquePointer?) -> Int32
+    // (handle, tokens, in_hidden, n_tokens, n_past, out_hidden, k, out_ids, out_logits)
     typealias EvalFn = @convention(c) (
-        OpaquePointer?, UnsafePointer<Int32>?, UnsafePointer<Float>?, Int32,
+        OpaquePointer?, UnsafePointer<Int32>?, UnsafePointer<Float>?, Int32, Int32,
         UnsafeMutablePointer<Float>?, Int32,
         UnsafeMutablePointer<Int32>?, UnsafeMutablePointer<Float>?) -> Int32
     typealias FreeFn = @convention(c) (OpaquePointer?) -> Void
@@ -77,6 +80,7 @@ public final class NMPLlamaShardRuntime {
     let openShard: OpenFn
     let arch: ArchFn
     let bytes: BytesFn
+    let maxCtx: MaxCtxFn
     let eval: EvalFn
     let freeShard: FreeFn
 
@@ -147,6 +151,7 @@ public final class NMPLlamaShardRuntime {
         openShard = try symbol("nmp_shard_open", as: OpenFn.self)
         arch = try symbol("nmp_shard_arch", as: ArchFn.self)
         bytes = try symbol("nmp_shard_bytes", as: BytesFn.self)
+        maxCtx = try symbol("nmp_shard_max_ctx", as: MaxCtxFn.self)
         eval = try symbol("nmp_shard_eval", as: EvalFn.self)
         freeShard = try symbol("nmp_shard_free", as: FreeFn.self)
     }
@@ -174,6 +179,8 @@ public final class NMPLlamaShard {
     public let end: Int
     /// Bytes this shard actually loaded (proof it doesn't hold the whole model).
     public let bytesLoaded: Int
+    /// KV cache capacity in tokens (bounds prompt + generated length).
+    public let maxContext: Int
 
     /// First shard reads token ids and runs token_embd.
     public var isFirst: Bool { start == 0 }
@@ -184,14 +191,16 @@ public final class NMPLlamaShard {
     private let lock = NSLock()
 
     /// Opens blocks [start, end) of the model, partial-loading their weights.
-    /// `end < 0` (or > N) is clamped to the model's block count.
-    public init(modelPath: String, start: Int, end: Int,
+    /// `end < 0` (or > N) is clamped to the model's block count. `maxCtx` is
+    /// the per-shard KV cache capacity (prompt + generated tokens).
+    public init(modelPath: String, start: Int, end: Int, maxCtx: Int = 4096,
                 runtime: NMPLlamaShardRuntime? = nil) throws {
         self.runtime = try runtime ?? NMPLlamaShardRuntime.shared()
         let expanded = (modelPath as NSString).expandingTildeInPath
         self.modelPath = expanded
 
-        guard let opened = self.runtime.openShard(expanded, Int32(start), Int32(end)) else {
+        guard let opened = self.runtime.openShard(
+            expanded, Int32(start), Int32(end), Int32(maxCtx)) else {
             throw NMPLlamaShardError.openFailed(path: expanded, start: start, end: end)
         }
         self.handle = opened
@@ -207,6 +216,7 @@ public final class NMPLlamaShard {
         self.start = Int(s)
         self.end = Int(e)
         self.bytesLoaded = self.runtime.bytes(opened)
+        self.maxContext = Int(self.runtime.maxCtx(opened))
     }
 
     deinit {
@@ -214,20 +224,26 @@ public final class NMPLlamaShard {
     }
 
     // MARK: Evaluation
+    //
+    // All evals process only the `n_tokens` NEW positions at `nPast` and
+    // attend over the shard's cached K/V for [0, nPast) — so a decode step is
+    // O(n), not O(n^2). `nPast` is authoritative: it is where the new K/V land
+    // and how far attention reaches; a replayed step (same nPast) is
+    // idempotent. Pass nPast=0 with the whole prompt to prefill.
 
-    /// First shard: run `tokens` (the whole sequence, since there is no KV
-    /// cache) through token_embd + blocks [0, end), returning the residual
-    /// hidden state for every position — `hiddenSize × tokens.count` floats,
-    /// laid out position-major (position 0's n_embd floats, then position 1's,
-    /// …). Precondition: `isFirst && !isLast`.
-    public func evalTokensToHidden(_ tokens: [Int32]) throws -> [Float] {
+    /// First shard: run the NEW `tokens` through token_embd + blocks
+    /// [0, end), returning the residual hidden state for those positions —
+    /// `hiddenSize × tokens.count` floats, position-major. Precondition:
+    /// `isFirst && !isLast`.
+    public func evalTokensToHidden(_ tokens: [Int32], nPast: Int) throws -> [Float] {
         precondition(isFirst && !isLast, "evalTokensToHidden on a non-first or terminal shard")
         let count = tokens.count
         var out = [Float](repeating: 0, count: max(1, count * hiddenSize))
         try withLockedEval { eval, h in
             tokens.withUnsafeBufferPointer { tp in
                 out.withUnsafeMutableBufferPointer { op in
-                    eval(h, tp.baseAddress, nil, Int32(count), op.baseAddress, 0, nil, nil)
+                    eval(h, tp.baseAddress, nil, Int32(count), Int32(nPast),
+                         op.baseAddress, 0, nil, nil)
                 }
             }
         }
@@ -235,27 +251,28 @@ public final class NMPLlamaShard {
     }
 
     /// Middle shard: run an incoming residual (`hiddenSize × tokenCount`
-    /// floats) through blocks [start, end), returning the outgoing residual
-    /// of the same shape. Precondition: `!isFirst && !isLast`.
-    public func evalHiddenToHidden(_ hidden: [Float], tokenCount: Int) throws -> [Float] {
+    /// floats, the NEW positions) through blocks [start, end), returning the
+    /// outgoing residual of the same shape. Precondition: `!isFirst && !isLast`.
+    public func evalHiddenToHidden(_ hidden: [Float], tokenCount: Int, nPast: Int) throws -> [Float] {
         precondition(!isFirst && !isLast, "evalHiddenToHidden on a boundary shard")
         try requireHiddenWidth(hidden, tokenCount: tokenCount)
         var out = [Float](repeating: 0, count: max(1, tokenCount * hiddenSize))
         try withLockedEval { eval, h in
             hidden.withUnsafeBufferPointer { ip in
                 out.withUnsafeMutableBufferPointer { op in
-                    eval(h, nil, ip.baseAddress, Int32(tokenCount), op.baseAddress, 0, nil, nil)
+                    eval(h, nil, ip.baseAddress, Int32(tokenCount), Int32(nPast),
+                         op.baseAddress, 0, nil, nil)
                 }
             }
         }
         return out
     }
 
-    /// Last shard: run an incoming residual through blocks [start, end),
-    /// then output_norm + lm_head on the final position, returning the top-`k`
+    /// Last shard: run an incoming residual through blocks [start, end), then
+    /// output_norm + lm_head on the final position, returning the top-`k`
     /// (token id, logit) pairs sorted by logit descending. Precondition:
     /// `!isFirst && isLast`.
-    public func evalHiddenToTopK(_ hidden: [Float], tokenCount: Int, k: Int)
+    public func evalHiddenToTopK(_ hidden: [Float], tokenCount: Int, nPast: Int, k: Int)
         throws -> [(id: Int32, logit: Float)] {
         precondition(!isFirst && isLast, "evalHiddenToTopK on a first or non-terminal shard")
         try requireHiddenWidth(hidden, tokenCount: tokenCount)
@@ -266,8 +283,8 @@ public final class NMPLlamaShard {
             hidden.withUnsafeBufferPointer { ip in
                 ids.withUnsafeMutableBufferPointer { idp in
                     logits.withUnsafeMutableBufferPointer { lp in
-                        eval(h, nil, ip.baseAddress, Int32(tokenCount), nil,
-                             Int32(kk), idp.baseAddress, lp.baseAddress)
+                        eval(h, nil, ip.baseAddress, Int32(tokenCount), Int32(nPast),
+                             nil, Int32(kk), idp.baseAddress, lp.baseAddress)
                     }
                 }
             }
@@ -275,10 +292,10 @@ public final class NMPLlamaShard {
         return (0..<kk).map { (ids[$0], logits[$0]) }
     }
 
-    /// Single shard (start == 0 && end == N): run the WHOLE model over
-    /// `tokens` and return the top-`k` (id, logit) pairs at the last position.
-    /// Precondition: `isFirst && isLast`.
-    public func evalTokensToTopK(_ tokens: [Int32], k: Int)
+    /// Single shard (start == 0 && end == N): run the NEW `tokens` through the
+    /// WHOLE model and return the top-`k` (id, logit) pairs at the last
+    /// position. Precondition: `isFirst && isLast`.
+    public func evalTokensToTopK(_ tokens: [Int32], nPast: Int, k: Int)
         throws -> [(id: Int32, logit: Float)] {
         precondition(isFirst && isLast, "evalTokensToTopK on a split shard")
         let kk = max(1, k)
@@ -288,8 +305,8 @@ public final class NMPLlamaShard {
             tokens.withUnsafeBufferPointer { tp in
                 ids.withUnsafeMutableBufferPointer { idp in
                     logits.withUnsafeMutableBufferPointer { lp in
-                        eval(h, tp.baseAddress, nil, Int32(tokens.count), nil,
-                             Int32(kk), idp.baseAddress, lp.baseAddress)
+                        eval(h, tp.baseAddress, nil, Int32(tokens.count), Int32(nPast),
+                             nil, Int32(kk), idp.baseAddress, lp.baseAddress)
                     }
                 }
             }

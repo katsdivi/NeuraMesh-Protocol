@@ -57,6 +57,8 @@ public final class NMPLlamaShardComputeEngine: NMPShardComputeEngine {
     public let hiddenSize: Int
     /// `general.name` from GGUF (basename fallback) — the SHARD_ASSIGN tag.
     public let modelTag: String
+    /// Per-shard KV cache capacity (prompt + generated tokens).
+    public let maxContext: Int
 
     /// Total layers in the plan. Defaults to the model's block count and is
     /// overwritten by SHARD_ASSIGN.totalLayers (see PeerShardEngine), so the
@@ -71,7 +73,7 @@ public final class NMPLlamaShardComputeEngine: NMPShardComputeEngine {
     /// Cached open shard for the current assigned range (reopened on change).
     private var openShard: NMPLlamaShard?
 
-    public init(modelPath: String) throws {
+    public init(modelPath: String, maxContext: Int = 4096) throws {
         let expanded = (modelPath as NSString).expandingTildeInPath
         let gguf = try NMPGGUFModel.load(path: expanded)
         guard let layers = gguf.layerCount else {
@@ -84,6 +86,8 @@ public final class NMPLlamaShardComputeEngine: NMPShardComputeEngine {
         self.layerCount = layers
         self.hiddenSize = hidden
         self._globalLayerCount = layers
+        // Cap the cache at the model's trained context when it is smaller.
+        self.maxContext = min(maxContext, gguf.contextLength ?? maxContext)
         let metadataName = gguf.modelName
         self.modelTag = (metadataName?.isEmpty == false)
             ? metadataName! : (expanded as NSString).lastPathComponent
@@ -104,7 +108,8 @@ public final class NMPLlamaShardComputeEngine: NMPShardComputeEngine {
         if let existing = openShard, existing.start == start, existing.end == end {
             return existing
         }
-        let opened = try NMPLlamaShard(modelPath: modelPath, start: start, end: end)
+        let opened = try NMPLlamaShard(modelPath: modelPath, start: start, end: end,
+                                       maxCtx: maxContext)
         openShard = opened  // ARC frees the previous shard (and its weights)
         return opened
     }
@@ -117,18 +122,22 @@ public final class NMPLlamaShardComputeEngine: NMPShardComputeEngine {
         let shard = try shard(start: start, end: end)
         let k = min(Self.maxCandidates, NMPLlamaWire.responseCapacity(width: hiddenSize))
 
+        // The request's basePos IS the KV cache position (n_past): the tokens
+        // it carries are the NEW positions to append to the cache.
         // Single shard: token-state request straight to top-k logits.
         if shard.isFirst && shard.isLast {
             let request = try decodeTokenRequest(input)
-            let candidates = try shard.evalTokensToTopK(request.tokens, k: k)
+            let candidates = try shard.evalTokensToTopK(
+                request.tokens, nPast: request.basePos, k: k)
             return try encodeLogits(nextPos: request.basePos + request.tokens.count,
                                     candidates: candidates)
         }
 
-        // First shard: token-state request -> residual for every position.
+        // First shard: token-state request -> residual for the new positions.
         if shard.isFirst {
             let request = try decodeTokenRequest(input)
-            let residual = try shard.evalTokensToHidden(request.tokens)
+            let residual = try shard.evalTokensToHidden(
+                request.tokens, nPast: request.basePos)
             return try NMPLlamaShardWire.encode(
                 NMPLlamaShardWire.ShardResponse(
                     nextPos: request.basePos + request.tokens.count,
@@ -138,22 +147,25 @@ public final class NMPLlamaShardComputeEngine: NMPShardComputeEngine {
         }
 
         // Non-first shard: input is a residual carried in a shard response.
+        // Its positions are [nextPos - tokenCount, nextPos), so n_past is the
+        // former — the same cache position the earlier shards used.
         guard NMPLlamaShardWire.isShardResponse(input) else {
             throw NMPLlamaShardEngineError.notShardResponse
         }
         let response = try NMPLlamaShardWire.decodeShardResponse(input)
         let tokenCount = response.tokens.count
+        let nPast = response.nextPos - tokenCount
 
         // Last shard: residual -> top-k logits.
         if shard.isLast {
             let candidates = try shard.evalHiddenToTopK(
-                response.hiddenState, tokenCount: tokenCount, k: k)
+                response.hiddenState, tokenCount: tokenCount, nPast: nPast, k: k)
             return try encodeLogits(nextPos: response.nextPos, candidates: candidates)
         }
 
         // Middle shard: residual -> residual.
         let outResidual = try shard.evalHiddenToHidden(
-            response.hiddenState, tokenCount: tokenCount)
+            response.hiddenState, tokenCount: tokenCount, nPast: nPast)
         return try NMPLlamaShardWire.encode(
             NMPLlamaShardWire.ShardResponse(
                 nextPos: response.nextPos,
@@ -181,13 +193,12 @@ public final class NMPLlamaShardComputeEngine: NMPShardComputeEngine {
 
 // MARK: - Prompt codec
 
-/// Text ↔ token-state translation for a REAL sharded plan. Differs from
-/// NMPLlamaPromptCodec in one essential way: the shard shim has no KV cache,
-/// so every step must re-present the WHOLE sequence (basePos 0, all tokens)
-/// rather than just the newest token at a growing position. This codec is
-/// therefore stateful — it accumulates the running token list. That state is
-/// per-generation and single-flight; a retried pass replays the same
-/// activation vector, so accumulation stays consistent.
+/// Text ↔ token-state translation for a REAL sharded plan. With the shard
+/// shim's per-shard KV cache (ABI 2), this is incremental and stateless — the
+/// prompt prefills the cache (basePos 0), then each step ships just the newest
+/// token at the growing position. `basePos` is the cache length each shard
+/// resumes from, so a retried/replayed pass overwrites the same slots and
+/// cannot desynchronize the generation.
 ///
 /// Needs only the tokenizer, so it is built over a vocab-only llama model
 /// (the coordinator never loads weights).
@@ -197,9 +208,6 @@ public final class NMPLlamaShardPromptCodec: NMPPromptCodec {
 
     private let model: NMPLlamaModel
     private let width: Int
-    private let queue = DispatchQueue(label: "nmp.llama.shard.codec")
-    /// The full sequence so far (prompt + every accepted token).
-    private var sequence: [Int32] = []
 
     public init(model: NMPLlamaModel) {
         self.model = model
@@ -213,7 +221,7 @@ public final class NMPLlamaShardPromptCodec: NMPPromptCodec {
             throw NMPLlamaShardEngineError.promptTooLong(
                 tokens: tokens.count, capacity: capacity)
         }
-        queue.sync { sequence = tokens }
+        // Prefill: the whole prompt at cache position 0.
         return try NMPLlamaWire.encode(
             NMPLlamaWire.Request(basePos: 0, tokens: tokens), width: width)
     }
@@ -230,18 +238,11 @@ public final class NMPLlamaShardPromptCodec: NMPPromptCodec {
 
     public func makeNextInput(after output: [Float], token: NMPGeneratedToken,
                               position: Int) throws -> [Float] {
-        let full: [Int32] = try queue.sync {
-            sequence.append(Int32(token.index))
-            let capacity = NMPLlamaWire.requestCapacity(width: width)
-            guard sequence.count <= capacity else {
-                throw NMPLlamaShardEngineError.promptTooLong(
-                    tokens: sequence.count, capacity: capacity)
-            }
-            return sequence
-        }
-        // Whole sequence, basePos 0 — the shard shim reprocesses from scratch.
+        // Decode: just the new token at the cache position the shards reached.
+        let response = try NMPLlamaWire.decodeResponse(output)
         return try NMPLlamaWire.encode(
-            NMPLlamaWire.Request(basePos: 0, tokens: full), width: width)
+            NMPLlamaWire.Request(basePos: response.nextPos, tokens: [Int32(token.index)]),
+            width: width)
     }
 
     public func render(tokens: [NMPGeneratedToken]) -> String {

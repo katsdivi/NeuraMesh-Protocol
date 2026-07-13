@@ -43,18 +43,21 @@ the real mesh. Verified against llama.cpp on Qwen2.5-0.5B:
   qwen2 (QKV bias) and qwen3 (QK-norm) are handled by tensor detection.
 - **It runs through the actual mesh, not just a harness.** The Swift engine
   (`NMPLlamaShardComputeEngine`) partial-loads its assigned range on
-  SHARD_ASSIGN and routes `runLayers` through the shim; the full `n_embd × T`
-  residual crosses the real transport (Noise IK, AES-GCM, FEC, NACK) inside
-  `NMPLlamaShardWire`; and a 2-way and a 3-way split each produce text
-  IDENTICAL to the single-device baseline, with every peer's loaded weights a
-  strict subset of the model (see `LlamaShardTests` /
-  `LlamaMeshIntegrationTests`).
+  SHARD_ASSIGN and routes `runLayers` through the shim; the residual crosses
+  the real transport (Noise IK, AES-GCM, FEC, NACK) inside `NMPLlamaShardWire`;
+  and a 2-way and a 3-way split each produce text IDENTICAL to the
+  single-device baseline, with every peer's loaded weights a strict subset of
+  the model (see `LlamaShardTests` / `LlamaMeshIntegrationTests`).
+- **Per-shard KV cache (ABI 2), bit-exact.** Each shard keeps a persistent
+  per-layer K/V cache, so a decode step processes only the NEW token and
+  attends over cached keys/values — O(n) per token instead of reprocessing the
+  whole sequence, and the wire hand-off shrinks from `n_embd × T` to `n_embd`
+  per token. `n_past` (the request's basePos) is the authoritative cache
+  length, which keeps a replayed step idempotent. Still bit-exact vs the
+  whole-model run (F32 cache).
 
 ### Remaining
 
-- Per-shard **KV cache** (today it reprocesses the whole sequence each step —
-  correct but O(n²); this is the speed pass, and it also shrinks the wire
-  hand-off from `n_embd × T` to `n_embd` per token).
 - **UI + iOS**: the dashboard and peer app don't yet expose the shard engine
   or show per-device layer ranges / loaded MB (the mesh plumbing is done; this
   is surface wiring — select `NMPLlamaShardComputeEngine` from the dashboard

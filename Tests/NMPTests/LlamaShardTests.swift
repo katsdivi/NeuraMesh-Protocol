@@ -41,16 +41,17 @@ enum ShardTestSupport {
     static let promptTokens: [Int32] = [785, 6722, 315, 9625, 374]
     static let goldenContinuation: [Int32] = [12095, 13, 1084, 374, 279, 7772, 3283, 304]
 
-    /// Drives a split plan the way the pipeline does: rebuild the first-shard
-    /// request from the WHOLE sequence each step (no KV cache), walk it
-    /// through every engine in order, read the greedy token, append, repeat.
+    /// Drives a split plan the way the pipeline does WITH the KV cache:
+    /// prefill the whole prompt at cache position 0, then feed just the newest
+    /// token at the growing position each step, walking every engine in order.
     static func generate(engines: [(engine: NMPLlamaShardComputeEngine, start: Int, end: Int)],
                          prompt: [Int32], count: Int, hiddenSize: Int) throws -> [Int32] {
-        var sequence = prompt
         var generated: [Int32] = []
+        var nPast = 0
+        var batch = prompt   // first pass carries the whole prompt
         for _ in 0..<count {
             var activation = try NMPLlamaWire.encode(
-                NMPLlamaWire.Request(basePos: 0, tokens: sequence), width: hiddenSize)
+                NMPLlamaWire.Request(basePos: nPast, tokens: batch), width: hiddenSize)
             for stage in engines {
                 activation = try stage.engine.runLayers(
                     start: stage.start, end: stage.end, input: activation)
@@ -58,7 +59,8 @@ enum ShardTestSupport {
             let response = try NMPLlamaWire.decodeResponse(activation)
             let top = try XCTUnwrap(response.top?.id)
             generated.append(top)
-            sequence.append(top)
+            nPast += batch.count
+            batch = [top]   // decode one token at a time
         }
         return generated
     }
@@ -141,6 +143,35 @@ final class LlamaShardTests: XCTestCase {
             count: ShardTestSupport.goldenContinuation.count,
             hiddenSize: engine.hiddenSize)
         XCTAssertEqual(out, ShardTestSupport.goldenContinuation)
+    }
+
+    // MARK: KV cache — the wire hand-off shrinks during decode
+
+    /// With the per-shard KV cache, a decode step ships only the NEW token's
+    /// residual (n_embd), not the whole sequence (n_embd × T) — the bandwidth
+    /// win that keeps per-token mesh round trips small.
+    func testDecodeShrinksWireToOneTokenResidual() throws {
+        let path = try ShardTestSupport.requireModelPath()
+        let engine = try NMPLlamaShardComputeEngine(modelPath: path)
+        let n = engine.layerCount
+        let split = n / 2
+        let hidden = engine.hiddenSize
+        let prompt = ShardTestSupport.promptTokens
+
+        // Prefill: the first shard emits the residual for the whole prompt.
+        let prefillIn = try NMPLlamaWire.encode(
+            NMPLlamaWire.Request(basePos: 0, tokens: prompt), width: hidden)
+        let prefillOut = try engine.runLayers(start: 0, end: split, input: prefillIn)
+        let prefill = try NMPLlamaShardWire.decodeShardResponse(prefillOut)
+        XCTAssertEqual(prefill.hiddenState.count, hidden * prompt.count)
+
+        // Decode one token at the next position: the residual is ONE position.
+        let decodeIn = try NMPLlamaWire.encode(
+            NMPLlamaWire.Request(basePos: prompt.count, tokens: [12095]), width: hidden)
+        let decodeOut = try engine.runLayers(start: 0, end: split, input: decodeIn)
+        let decode = try NMPLlamaShardWire.decodeShardResponse(decodeOut)
+        XCTAssertEqual(decode.hiddenState.count, hidden,
+                       "decode must ship a single-token residual, not the whole sequence")
     }
 
     // MARK: Falsification
