@@ -45,7 +45,7 @@ public enum NMPLlamaEngineError: Error, Sendable {
 
 // MARK: - Compute engine
 
-public final class NMPLlamaComputeEngine: NMPShardComputeEngine {
+public final class NMPLlamaComputeEngine: NMPShardComputeEngine, NMPGlobalLayerAware {
 
     public let model: NMPLlamaModel
     /// Candidates returned per decode — enough for any sampling strategy

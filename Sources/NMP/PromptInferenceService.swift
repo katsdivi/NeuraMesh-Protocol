@@ -175,6 +175,15 @@ public final class NMPPromptInferenceService {
                         return
                     }
                     state.passRetriesRemaining -= 1
+                    // A failed pass often means the plan just changed under us
+                    // (a peer dropped/joined → re-shard → fresh, empty per-shard
+                    // KV caches). Retrying the incremental decode input would
+                    // hit a stale cache; rebuild a from-scratch re-prefill of the
+                    // whole sequence so every shard's cache refills consistently.
+                    // Codecs without per-shard state return nil → resend as-is.
+                    if let reprefill = self.codec.rebuildInput() {
+                        state.activations = reprefill
+                    }
                     // Brief pause lets an in-progress re-shard finish
                     // (SHARD_ASSIGN round is sub-ms in-process, one RTT
                     // per peer over Wi-Fi).

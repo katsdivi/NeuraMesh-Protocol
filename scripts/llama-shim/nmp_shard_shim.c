@@ -60,6 +60,7 @@ struct nmp_shard {
 
     // Persistent per-layer KV cache (one entry per LOCAL block, index l-start).
     int max_ctx;
+    int cached_len;                 // contiguous positions currently in cache
     struct ggml_context *kv_ctx;
     struct ggml_tensor **k_cache;   // each [head_dim, n_head_kv, max_ctx] F32
     struct ggml_tensor **v_cache;   // each [head_dim, n_head_kv, max_ctx] F32
@@ -256,6 +257,13 @@ int nmp_shard_eval(struct nmp_shard *s, const int32_t *tokens, const float *in_h
     if (!first && !in_hidden) return -2;
     if (n_tokens <= 0 || n_past < 0) return -3;
     if (n_past + n_tokens > s->max_ctx) return -4;
+    // A fresh prompt (n_past 0) resets the cache; otherwise n_past must not
+    // exceed what we have contiguously cached, or attention would read
+    // uninitialized positions [cached_len, n_past). This makes a stale cache
+    // after a re-shard a hard error the coordinator can recover from (by
+    // re-prefilling), never silent garbage.
+    if (n_past == 0) s->cached_len = 0;
+    if (n_past > s->cached_len) return -5;
 
     int n_kv = n_past + n_tokens;
     size_t mem = ggml_tensor_overhead() * 16384 + ggml_graph_overhead();
@@ -312,6 +320,7 @@ int nmp_shard_eval(struct nmp_shard *s, const int32_t *tokens, const float *in_h
     } else {
         ggml_backend_tensor_get(outp, out_hidden, 0, (size_t) a->n_embd * n_tokens * sizeof(float));
     }
+    s->cached_len = n_past + n_tokens;   // contiguous positions now cached
     ggml_gallocr_free(al);
     ggml_free(ctx);
     return 0;

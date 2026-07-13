@@ -208,6 +208,36 @@ final class LlamaShardTests: XCTestCase {
         XCTAssertNotEqual(good, bad)
     }
 
+    // MARK: Edge cases
+
+    /// A sequence longer than the KV cache capacity must fail cleanly, not
+    /// crash or emit garbage.
+    func testMaxContextOverflowIsGracefulError() throws {
+        let path = try ShardTestSupport.requireModelPath()
+        let engine = try NMPLlamaShardComputeEngine(modelPath: path, maxContext: 8)
+        let n = engine.layerCount
+        // 20 tokens into an 8-slot cache — over capacity on the first pass.
+        let longPrompt = [Int32](repeating: 374, count: 20)
+        let request = try NMPLlamaWire.encode(
+            NMPLlamaWire.Request(basePos: 0, tokens: longPrompt), width: engine.hiddenSize)
+        XCTAssertThrowsError(try engine.runLayers(start: 0, end: n, input: request),
+                             "over-capacity prompt must throw, not crash")
+    }
+
+    /// An extreme boundary — a single-layer first shard — is still bit-exact.
+    func testSingleLayerFirstShardMatches() throws {
+        let path = try ShardTestSupport.requireModelPath()
+        let engineA = try NMPLlamaShardComputeEngine(modelPath: path)
+        let engineB = try NMPLlamaShardComputeEngine(modelPath: path)
+        let n = engineA.layerCount
+        let out = try ShardTestSupport.generate(
+            engines: [(engineA, 0, 1), (engineB, 1, n)],
+            prompt: ShardTestSupport.promptTokens,
+            count: ShardTestSupport.goldenContinuation.count,
+            hiddenSize: engineA.hiddenSize)
+        XCTAssertEqual(out, ShardTestSupport.goldenContinuation)
+    }
+
     // MARK: Codec (needs the llama.cpp shim for the tokenizer)
 
     /// The shard-aware prompt codec feeds the WHOLE sequence each step and the

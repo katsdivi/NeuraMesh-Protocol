@@ -50,8 +50,21 @@ public protocol NMPPromptCodec: AnyObject {
     func makeNextInput(after output: [Float], token: NMPGeneratedToken,
                        position: Int) throws -> [Float]
 
+    /// A from-scratch input that reconstructs the WHOLE generation so far, for
+    /// recovery: when a pass fails (a dropped peer, a re-shard, a stale per-
+    /// shard KV cache), retrying the same incremental input can't succeed —
+    /// the caches must be refilled. Codecs that keep per-shard state (the real
+    /// llama shard codec) return a full re-prefill here; others return nil and
+    /// the retry just re-sends the same input. Default: nil.
+    func rebuildInput() -> [Float]?
+
     /// Final text for the generated tokens.
     func render(tokens: [NMPGeneratedToken]) -> String
+}
+
+extension NMPPromptCodec {
+    /// Default: no special recovery input (stateless / KV-cache-free codecs).
+    public func rebuildInput() -> [Float]? { nil }
 }
 
 // MARK: - Reference codec (Phase 6 behavior, unchanged)

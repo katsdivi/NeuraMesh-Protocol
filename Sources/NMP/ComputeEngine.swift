@@ -36,6 +36,15 @@ public protocol NMPShardComputeEngine: AnyObject {
     func runLayers(start: Int, end: Int, input: [Float]) throws -> [Float]
 }
 
+/// An engine that runs a layer SUB-RANGE and therefore needs to know the
+/// plan's TOTAL layer count to tell whether its shard is the terminal one
+/// (the last shard runs output_norm + lm_head). The peer engine sets this
+/// from `SHARD_ASSIGN.totalLayers` on every assignment, so a re-shard that
+/// changes the plan size is reflected without a concrete-type check.
+public protocol NMPGlobalLayerAware: AnyObject {
+    var globalLayerCount: Int { get set }
+}
+
 public enum NMPComputeError: Error, Equatable, Sendable {
     case invalidLayerRange(start: Int, end: Int, layerCount: Int)
     case invalidInputWidth(expected: Int, got: Int)

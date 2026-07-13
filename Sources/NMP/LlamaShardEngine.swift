@@ -47,7 +47,7 @@ public enum NMPLlamaShardEngineError: Error, Sendable {
 /// Real sharded llama compute for one peer. Holds the model path and the
 /// whole-model shape (from GGUF metadata); opens exactly its assigned
 /// `[start, end)` on demand and partial-loads only those blocks.
-public final class NMPLlamaShardComputeEngine: NMPShardComputeEngine {
+public final class NMPLlamaShardComputeEngine: NMPShardComputeEngine, NMPGlobalLayerAware {
 
     /// Candidates the last shard returns per decode (greedy uses [0]).
     public static let maxCandidates = 40
@@ -216,6 +216,11 @@ public final class NMPLlamaShardPromptCodec: NMPPromptCodec {
 
     private let model: NMPLlamaModel
     private let width: Int
+    private let queue = DispatchQueue(label: "nmp.llama.shard.codec")
+    /// The full sequence so far (prompt + every accepted token) — kept ONLY
+    /// so rebuildInput() can re-prefill all shards after a churn event; the
+    /// happy path stays incremental (one token per step).
+    private var sequence: [Int32] = []
 
     public init(model: NMPLlamaModel) {
         self.model = model
@@ -229,6 +234,7 @@ public final class NMPLlamaShardPromptCodec: NMPPromptCodec {
             throw NMPLlamaShardEngineError.promptTooLong(
                 tokens: tokens.count, capacity: capacity)
         }
+        queue.sync { sequence = tokens }
         // Prefill: the whole prompt at cache position 0.
         return try NMPLlamaWire.encode(
             NMPLlamaWire.Request(basePos: 0, tokens: tokens), width: width)
@@ -246,11 +252,23 @@ public final class NMPLlamaShardPromptCodec: NMPPromptCodec {
 
     public func makeNextInput(after output: [Float], token: NMPGeneratedToken,
                               position: Int) throws -> [Float] {
+        queue.sync { sequence.append(Int32(token.index)) }
         // Decode: just the new token at the cache position the shards reached.
         let response = try NMPLlamaWire.decodeResponse(output)
         return try NMPLlamaWire.encode(
             NMPLlamaWire.Request(basePos: response.nextPos, tokens: [Int32(token.index)]),
             width: width)
+    }
+
+    /// Recovery after churn: re-prefill EVERY shard with the whole sequence at
+    /// cache position 0, so a re-shard (new ranges → fresh empty caches) or a
+    /// stale cache refills consistently before the next token.
+    public func rebuildInput() -> [Float]? {
+        let full = queue.sync { sequence }
+        guard !full.isEmpty,
+              full.count <= NMPLlamaWire.requestCapacity(width: width) else { return nil }
+        return try? NMPLlamaWire.encode(
+            NMPLlamaWire.Request(basePos: 0, tokens: full), width: width)
     }
 
     public func render(tokens: [NMPGeneratedToken]) -> String {

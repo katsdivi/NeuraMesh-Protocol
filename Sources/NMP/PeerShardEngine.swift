@@ -107,8 +107,10 @@ public final class NMPPeerShardEngine {
             onDiagnostic?("SHARD_ASSIGN rejected: layers \(assign.startLayer)..<\(assign.endLayer) "
                           + "of \(engine.layerCount), hidden \(assign.hiddenSize) vs \(engine.hiddenSize)")
         } else {
-            if let llamaEngine = engine as? NMPLlamaComputeEngine {
-                llamaEngine.globalLayerCount = Int(assign.totalLayers)
+            // Sub-range engines (real llama shard, full-model llama) need the
+            // plan's total layer count to know if their shard is terminal.
+            if let layerAware = engine as? NMPGlobalLayerAware {
+                layerAware.globalLayerCount = Int(assign.totalLayers)
             }
             status = .ready
             assignment = assign
