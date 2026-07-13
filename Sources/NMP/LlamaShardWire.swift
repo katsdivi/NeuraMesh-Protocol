@@ -3,26 +3,38 @@
 //  NMP — Phase 10 (cross-device sharding)
 //
 //  Inter-shard wire format for cross-device llama plans. When the model
-//  is split across multiple peers, the intermediate shards exchange
-//  HIDDEN STATES (the real activation vector from the transformer layers)
-//  alongside the current sequence tokens to permit downstream shards to
-//  run the decode logic.
+//  is split across multiple peers, the intermediate shards exchange the
+//  RESIDUAL HIDDEN STATE (the real activation the ggml graph-surgery shim
+//  hands off between block ranges) alongside the sequence tokens so a
+//  downstream shard can continue the forward pass.
+//
+//  The residual is the FULL activation, never truncated: with no KV cache
+//  yet, each shard reprocesses the whole sequence, so the hidden state is
+//  `n_embd × tokenCount` floats (position 0's n_embd values, then position
+//  1's, …). The vector therefore GROWS past the model's hidden width to
+//  hold it — encode() sizes to max(width, header + tokens + residual), and
+//  decode() reads every residual float back. (`width` is just the minimum /
+//  padding floor for compatibility with fixed-width reference tensors.)
 //
 //  Wire layout (all values are Float32):
 //
 //    shard request  (coordinator → non-first peer):
 //      [0] magic 0x4E5348 ("NSH" — NMP Shard Hidden)
-//      [1] basePos        — KV cache trim position
-//      [2] tokenCount     — how many tokens are packaged
-//      [3 ... 3 + tokenCount - 1] tokens — cast to Float
-//      [3 + tokenCount ...] hidden state — n_embd floats (truncated to fit)
+//      [1] basePos        — sequence base position (0 while there is no KV cache)
+//      [2] tokenCount     — how many tokens (T) are packaged
+//      [3 ... 3 + T - 1]  tokens — cast to Float
+//      [3 + T ...]        residual hidden state — n_embd × T floats
 //
 //    shard response (non-last peer → coordinator):
 //      [0] magic 0x4E5352 ("NSR" — NMP Shard Response)
 //      [1] nextPos        — basePos + tokenCount
-//      [2] tokenCount     — how many tokens are packaged
-//      [3 ... 3 + tokenCount - 1] tokens — cast to Float
-//      [3 + tokenCount ...] hidden state — n_embd floats (truncated to fit)
+//      [2] tokenCount     — how many tokens (T) are packaged
+//      [3 ... 3 + T - 1]  tokens — cast to Float
+//      [3 + T ...]        residual hidden state — n_embd × T floats
+//
+//  Because the residual grows with the sequence, the mesh must stay on a
+//  LOSSLESS activation format (.float32 / .zeroTrimmed) for the hand-off to
+//  be bit-exact — .mixedPrecision would round the residual to fp16.
 //
 //  This file is pure Swift (no llama.cpp) — testable everywhere.
 //
@@ -76,19 +88,17 @@ public enum NMPLlamaShardWire {
         }
     }
 
-    // MARK: - Capacity
-
-    /// Max hidden state floats a `width`-wide tensor can carry.
-    public static func maxHiddenCapacity(tokensCount: Int, width: Int) -> Int {
-        max(0, width - headerWidth - tokensCount)
-    }
-
     // MARK: - Encode
 
+    /// The wire vector is sized EXACTLY to header + tokens + residual — no
+    /// truncation (the residual must survive intact) and no zero-padding to
+    /// `width` (padding would make decode over-read the extra zeros as
+    /// residual, since the hidden length is inferred as "everything after
+    /// the tokens"). `width` is accepted for call-site symmetry with the
+    /// token-state wire but does not bound the residual.
     public static func encode(_ request: ShardRequest, width: Int) throws -> [Float] {
         let needed = headerWidth + request.tokens.count
-        let totalCount = needed + request.hiddenState.count
-        let size = max(width, totalCount)
+        let size = needed + request.hiddenState.count
         var vector = [Float](repeating: 0, count: size)
         vector[0] = shardRequestMagic
         vector[1] = Float(request.basePos)
@@ -104,8 +114,7 @@ public enum NMPLlamaShardWire {
 
     public static func encode(_ response: ShardResponse, width: Int) throws -> [Float] {
         let needed = headerWidth + response.tokens.count
-        let totalCount = needed + response.hiddenState.count
-        let size = max(width, totalCount)
+        let size = needed + response.hiddenState.count
         var vector = [Float](repeating: 0, count: size)
         vector[0] = shardResponseMagic
         vector[1] = Float(response.nextPos)

@@ -15,40 +15,52 @@ breaking that rule.
 
 ## 1. True cross-device sharding of a *real* model (the big one)
 
-**Status: 🚧 IN PROGRESS — the hard part is DONE and verified; mesh/UI
-integration remains. Goal: run Qwen-14B across a Mac + iPhone (+ any other
-devices) so no single device holds the whole model.**
+**Status: 🚧 IN PROGRESS — real sharding works end-to-end through the mesh
+(bit-exact, partial-load proven). Remaining: KV-cache speed pass, UI/iOS
+surfacing, and scaling to 14B on real devices. Goal: run Qwen-14B across a
+Mac + iPhone (+ any other devices) so no single device holds the whole
+model.**
 
 ### What works now (2026-07-13, verified)
 
 The real engine is `scripts/llama-shim/nmp_shard_shim.c` — a **ggml
 graph-surgery** shim (build: `scripts/setup_shard.sh`). It builds the
 transformer forward directly in ggml, so it can run an arbitrary block range
-`[start,end)` and **load only those blocks' weights**. Verified against
-llama.cpp on Qwen2.5-0.5B:
+`[start,end)` and **load only those blocks' weights**. It is bound into Swift
+(`LlamaShardRuntime.swift` → `NMPLlamaShardComputeEngine`) and runs through
+the real mesh. Verified against llama.cpp on Qwen2.5-0.5B:
 
 - **Forward is bit-exact.** Hand-built ggml Qwen2 forward reproduces
   llama.cpp's greedy output exactly (two prompts).
 - **The split is real.** 2-way (@6/@12/@18) and 3-way (@8,16) layer splits
-  all match the whole-model output; only the `n_embd` hidden residual crosses
-  the "wire". A falsification test (zeroing the residual) collapses the
-  output — proving downstream shards genuinely depend on the hand-off, which
-  the earlier fake did not.
+  all match the whole-model output; only the residual crosses the "wire". A
+  falsification test (zeroing the residual) collapses the output — proving
+  downstream shards genuinely depend on the hand-off, which the earlier fake
+  did not.
 - **Memory is actually reduced.** Each shard partial-loads only its blocks
   (e.g. 219 MB + 266 MB for a 24-layer @12 split — neither holds all).
 - **Arch-generic.** Params are read from GGUF metadata (runs 0.5B and 14B);
   qwen2 (QKV bias) and qwen3 (QK-norm) are handled by tensor detection.
+- **It runs through the actual mesh, not just a harness.** The Swift engine
+  (`NMPLlamaShardComputeEngine`) partial-loads its assigned range on
+  SHARD_ASSIGN and routes `runLayers` through the shim; the full `n_embd × T`
+  residual crosses the real transport (Noise IK, AES-GCM, FEC, NACK) inside
+  `NMPLlamaShardWire`; and a 2-way and a 3-way split each produce text
+  IDENTICAL to the single-device baseline, with every peer's loaded weights a
+  strict subset of the model (see `LlamaShardTests` /
+  `LlamaMeshIntegrationTests`).
 
-### Remaining (integration, lower risk)
+### Remaining
 
 - Per-shard **KV cache** (today it reprocesses the whole sequence each step —
-  correct but O(n²); this is the speed pass).
-- **Swift wiring**: dlopen the shard shim from `LlamaRuntime`, route
-  `runLayers` through it, carry the full residual in `NMPLlamaShardWire`
-  (no truncation), partial-load per peer over the mesh.
-- **Mesh + UI + iOS**: capacity sharder drives the N-way split; dashboard and
-  peer app show real per-device layer ranges and loaded MB.
-- **Scale to 14B** across whatever devices are present, measured.
+  correct but O(n²); this is the speed pass, and it also shrinks the wire
+  hand-off from `n_embd × T` to `n_embd` per token).
+- **UI + iOS**: the dashboard and peer app don't yet expose the shard engine
+  or show per-device layer ranges / loaded MB (the mesh plumbing is done; this
+  is surface wiring — select `NMPLlamaShardComputeEngine` from the dashboard
+  and render `loadedBytes`).
+- **Scale to 14B** across whatever devices are present, measured (the code is
+  arch-generic, so this is an operational step: a 14B GGUF + real devices).
 
 ### The earlier fake (preserved in history)
 

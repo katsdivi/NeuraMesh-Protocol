@@ -142,7 +142,8 @@ final class LlamaShardWireTests: XCTestCase {
     func testShardRequestRoundTrip() throws {
         let request = NMPLlamaShardWire.ShardRequest(basePos: 17, tokens: [1, 2, 3, 4], hiddenState: [0.1, -0.5, 0.99, -100.2])
         let vector = try NMPLlamaShardWire.encode(request, width: 64)
-        XCTAssertEqual(vector.count, 64)
+        // Sized EXACTLY to header + tokens + residual — no padding to width.
+        XCTAssertEqual(vector.count, 3 + 4 + 4)
         XCTAssertTrue(NMPLlamaShardWire.isShardRequest(vector))
         let decoded = try NMPLlamaShardWire.decodeShardRequest(vector)
         XCTAssertEqual(decoded.basePos, request.basePos)
@@ -153,7 +154,7 @@ final class LlamaShardWireTests: XCTestCase {
     func testShardResponseRoundTrip() throws {
         let response = NMPLlamaShardWire.ShardResponse(nextPos: 21, tokens: [5, 6], hiddenState: [-0.0125, 12.34, 45.67])
         let vector = try NMPLlamaShardWire.encode(response, width: 64)
-        XCTAssertEqual(vector.count, 64)
+        XCTAssertEqual(vector.count, 3 + 2 + 3)
         XCTAssertFalse(NMPLlamaShardWire.isShardRequest(vector))
         XCTAssertTrue(NMPLlamaShardWire.isShardResponse(vector))
         let decoded = try NMPLlamaShardWire.decodeShardResponse(vector)
@@ -162,17 +163,38 @@ final class LlamaShardWireTests: XCTestCase {
         XCTAssertEqual(decoded.hiddenState, response.hiddenState)
     }
 
-    func testCapacityLimits() throws {
-        let state = [Float](repeating: 1.0, count: 62)
-        // Header is 3 + tokens (1) = 4 slots. Max hidden capacity is 64 - 4 = 60.
-        // It should encode successfully but truncate the hidden state to 60.
-        let request = NMPLlamaShardWire.ShardRequest(basePos: 0, tokens: [1], hiddenState: state)
-        let vector = try NMPLlamaShardWire.encode(request, width: 64)
-        XCTAssertEqual(vector.count, 64)
-        
-        let decoded = try NMPLlamaShardWire.decodeShardRequest(vector)
-        XCTAssertEqual(decoded.hiddenState.count, 60)
-        XCTAssertEqual(decoded.hiddenState, Array(state[..<60]))
+    /// The whole point of the shard wire: a FULL n_embd × T residual survives
+    /// intact — never truncated to `width` — even with genuine trailing zeros
+    /// in the activation (which must not be confused with padding).
+    func testFullResidualIsLosslessAndUntruncated() throws {
+        let nEmbd = 896, tokenCount = 7
+        // Deterministic activation values, with the final few positions set to
+        // exactly 0.0 to prove trailing zeros round-trip as-is.
+        var state = (0..<(nEmbd * tokenCount)).map { Float($0 % 13) - 6.0 }
+        for i in (state.count - 5)..<state.count { state[i] = 0.0 }
+        let tokens: [Int32] = [785, 6722, 315, 9625, 374, 12095, 13]
+
+        let response = NMPLlamaShardWire.ShardResponse(
+            nextPos: tokenCount, tokens: tokens, hiddenState: state)
+        // width is n_embd here, but the residual is n_embd × T — much wider.
+        let vector = try NMPLlamaShardWire.encode(response, width: nEmbd)
+        XCTAssertEqual(vector.count, 3 + tokenCount + nEmbd * tokenCount)
+
+        let decoded = try NMPLlamaShardWire.decodeShardResponse(vector)
+        XCTAssertEqual(decoded.tokens, tokens)
+        XCTAssertEqual(decoded.hiddenState.count, nEmbd * tokenCount)
+        XCTAssertEqual(decoded.hiddenState, state)
+
+        // And it survives the actual mesh activation codec losslessly
+        // (float32 leg) — bit-for-bit, including the trailing zeros.
+        let bytes = NMPActivationCodec.encode(vector, format: .float32)
+        let back = try NMPActivationCodec.decode(bytes)
+        XCTAssertEqual(back.map(\.bitPattern), vector.map(\.bitPattern))
+        // zeroTrimmed drops the trailing-zero run on the wire but restores the
+        // full length on decode — also lossless for the residual.
+        let trimmed = NMPActivationCodec.encode(vector, format: .zeroTrimmed)
+        let backTrim = try NMPActivationCodec.decode(trimmed)
+        XCTAssertEqual(backTrim.map(\.bitPattern), vector.map(\.bitPattern))
     }
 }
 
@@ -323,137 +345,108 @@ final class LlamaMeshIntegrationTests: XCTestCase {
         }
     }
 
+    /// Drives a REAL sharded plan through the full in-memory mesh: N peers,
+    /// each an NMPLlamaShardComputeEngine that partial-loads ONLY its layer
+    /// range, chained over the actual transport (Noise IK, AES-GCM, FEC,
+    /// NACK). Returns the generation result plus the peer engines (to prove
+    /// each loaded only its slice). Skips unless the ggml shard shim is built.
+    private func generateSharded(shardCount: Int, model: NMPLlamaModel,
+                                 prompt: String, tokens: Int) throws
+        -> (result: NMPPromptInferenceService.GenerationResult,
+            engines: [NMPLlamaShardComputeEngine]) {
+        guard NMPLlamaShardRuntime.locate() != nil else {
+            throw XCTSkip("shard shim missing — run scripts/setup_shard.sh")
+        }
+        let path = LlamaTestSupport.modelPath!
+        var engines: [NMPLlamaShardComputeEngine] = []
+        let first = try NMPLlamaShardComputeEngine(modelPath: path)
+        engines.append(first)
+
+        let testbed = try NMPLlamaTestbed(
+            engine: first, modelTag: first.modelTag,
+            placement: .sharded(shardCount: shardCount),
+            engineFactory: {
+                let extra = try NMPLlamaShardComputeEngine(modelPath: path)
+                engines.append(extra)
+                return extra
+            })
+        try testbed.startSync()
+
+        // The shard-aware codec re-presents the WHOLE sequence each step
+        // (the shim has no KV cache).
+        let service = NMPPromptInferenceService(
+            orchestrator: testbed.orchestrator,
+            codec: NMPLlamaShardPromptCodec(model: model))
+        let done = expectation(description: "generation sharded \(shardCount)-way")
+        var outcome: Result<NMPPromptInferenceService.GenerationResult,
+                            NMPPromptInferenceService.ServiceError>?
+        service.run(prompt: prompt, maxTokens: tokens) { result in
+            outcome = result
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 300)
+        return (try XCTUnwrap(outcome).get(), engines)
+    }
+
+    /// The Phase 10 headline: a model split across a 2-peer mesh — each peer
+    /// holding ONLY its layers' weights — produces text IDENTICAL to the
+    /// single-device baseline, with only the activation residual crossing the
+    /// wire. This is the real ggml graph-surgery path, end-to-end over the
+    /// transport (superseding the earlier fake that faked correctness with
+    /// hardcoded RMS constants).
     func testShardedMeshProducesIdenticalText() throws {
         let model = try LlamaTestSupport.requireFullModel()
         let prompt = "The capital of France is"
 
         let local = try generate(placement: .local, model: model,
                                  prompt: prompt, tokens: 12)
+        let (sharded, engines) = try generateSharded(
+            shardCount: 2, model: model, prompt: prompt, tokens: 12)
 
-        // For sharded mode, we need a factory to instantiate multiple model/engine copies.
-        let engine = NMPLlamaComputeEngine(model: model)
-        let testbed = try NMPLlamaTestbed(
-            engine: engine, modelTag: model.name, placement: .sharded(shardCount: 2),
-            engineFactory: {
-                let m = try NMPLlamaModel(modelPath: LlamaTestSupport.modelPath!)
-                return NMPLlamaComputeEngine(model: m)
-            }
-        )
-        try testbed.startSync()
+        XCTAssertEqual(sharded.shardCount, 2)
+        XCTAssertEqual(local.text, sharded.text,
+                       "2-way sharded execution must match the local baseline")
+        // Real bytes moved over the (in-memory) transport stack.
+        XCTAssertGreaterThan(sharded.networkPayloadBytes, 0)
 
-        let service = NMPPromptInferenceService(
-            orchestrator: testbed.orchestrator,
-            codec: NMPLlamaPromptCodec(model: model))
-        let done = expectation(description: "generation sharded")
-        var outcome: Result<NMPPromptInferenceService.GenerationResult,
-                            NMPPromptInferenceService.ServiceError>?
-        service.run(prompt: prompt, maxTokens: 12) { result in
-            outcome = result
-            done.fulfill()
+        // Each peer loaded ONLY its layer range — neither holds the whole model.
+        let fileSize = (try FileManager.default
+            .attributesOfItem(atPath: LlamaTestSupport.modelPath!)[.size] as? Int) ?? .max
+        XCTAssertEqual(engines.count, 2)
+        for engine in engines {
+            XCTAssertGreaterThan(engine.loadedBytes, 0)
+            XCTAssertLessThan(engine.loadedBytes, fileSize,
+                              "a shard peer must not load the whole model")
         }
-        wait(for: [done], timeout: 300)
-        let shardedResult = try XCTUnwrap(outcome).get()
-
-        XCTAssertEqual(shardedResult.shardCount, 2)
-        XCTAssertEqual(local.text, shardedResult.text,
-                       "sharded model execution must produce identical text to local baseline")
     }
 
+    /// The weight-partition claim, proven through the mesh: a 3-way split
+    /// still reproduces the baseline text AND every peer's loaded weights are
+    /// a strict subset of the model. Uses the real ggml partial-load
+    /// (nmp_shard_open reads only its tensors from the single GGUF) — no
+    /// pre-slicing of the model file required.
     func testShardedWeightExecutionProducesIdenticalText() throws {
         let model = try LlamaTestSupport.requireFullModel()
-        let sourcePath = LlamaTestSupport.modelPath!
-        
-        let fileManager = FileManager.default
-        let part1Path = sourcePath.replacingOccurrences(of: ".gguf", with: "_part1.gguf")
-        let part2Path = sourcePath.replacingOccurrences(of: ".gguf", with: "_part2.gguf")
-        
-        let layerCount = model.layerCount
-        let middle = layerCount / 2
-        
-        // Helper to run python slice script
-        func runSlicer(input: String, output: String, start: Int, end: Int) throws {
-            let task = Process()
-            task.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            
-            // Find current directory path to locate scripts/gguf_slice.py
-            let currentDir = fileManager.currentDirectoryPath
-            let scriptPath = "\(currentDir)/scripts/gguf_slice.py"
-            
-            task.arguments = ["python3", scriptPath, input, output, String(start), String(end)]
-            try task.run()
-            task.waitUntilExit()
-            guard task.terminationStatus == 0 else {
-                throw NSError(domain: "LlamaTests", code: Int(task.terminationStatus),
-                              userInfo: [NSLocalizedDescriptionKey: "GGUF slice script failed with exit code \(task.terminationStatus)"])
-            }
+        guard model.layerCount >= 3 else {
+            throw XCTSkip("model has too few layers for a 3-way split")
         }
-        
-        // Slicing model parts dynamically if not already cached
-        if !fileManager.fileExists(atPath: part1Path) {
-            print("Dynamic Test Setup: Slicing Part 1 (layers 0..\(middle))...")
-            try runSlicer(input: sourcePath, output: part1Path, start: 0, end: middle)
-        }
-        if !fileManager.fileExists(atPath: part2Path) {
-            print("Dynamic Test Setup: Slicing Part 2 (layers \(middle)..\(layerCount))...")
-            try runSlicer(input: sourcePath, output: part2Path, start: middle, end: layerCount)
-        }
-        
         let prompt = "The capital of France is"
+
         let local = try generate(placement: .local, model: model,
                                  prompt: prompt, tokens: 12)
-        
-        // Print full model intermediate embeddings for prompt to compare
-        let localCodec = NMPLlamaPromptCodec(model: model)
-        let promptTokens = try model.tokenize(prompt, addSpecial: true)
-        let fullEmbd = try model.decodeEmbedding(tokens: promptTokens, basePos: 0)
-        let fullSumSq = fullEmbd.map { $0 * $0 }.reduce(0, +)
-        print("DIAGNOSTIC: Full model layer 24 embedding sum of squares = \(fullSumSq)")
-        print("DIAGNOSTIC: Full model layer 24 embedding first 5 floats = \(Array(fullEmbd.prefix(5)))")
-        
-        var callCount = 0
-        let engineFactory = {
-            defer { callCount += 1 }
-            let path = callCount == 0 ? part1Path : part2Path
-            let m = try NMPLlamaModel(modelPath: path)
-            return NMPLlamaComputeEngine(model: m)
+        let (sharded, engines) = try generateSharded(
+            shardCount: 3, model: model, prompt: prompt, tokens: 12)
+
+        XCTAssertEqual(sharded.shardCount, 3)
+        XCTAssertEqual(local.text, sharded.text,
+                       "3-way weight-sharded execution must match the local baseline")
+
+        let fileSize = (try FileManager.default
+            .attributesOfItem(atPath: LlamaTestSupport.modelPath!)[.size] as? Int) ?? .max
+        XCTAssertEqual(engines.count, 3)
+        for engine in engines {
+            XCTAssertGreaterThan(engine.loadedBytes, 0)
+            XCTAssertLessThan(engine.loadedBytes, fileSize)
         }
-        
-        let testbed = try NMPLlamaTestbed(
-            engine: NMPLlamaComputeEngine(model: model), // Host reference
-            modelTag: model.name,
-            placement: .sharded(shardCount: 2),
-            engineFactory: engineFactory
-        )
-        try testbed.startSync()
-        
-        // Let's test Peer A directly first
-        let peerAModel = try NMPLlamaModel(modelPath: part1Path)
-        let peerAEmbd = try peerAModel.decodeEmbedding(tokens: promptTokens, basePos: 0)
-        print("DIAGNOSTIC: Sliced Part 1 total embedding count = \(peerAEmbd.count)")
-        for i in 0..<promptTokens.count {
-            let slice = peerAEmbd[i*896 ..< (i+1)*896]
-            let sumSq = slice.map { $0 * $0 }.reduce(0, +)
-            let rms = sqrt(sumSq / 896.0)
-            print("DIAGNOSTIC: Token \(i) RMS = \(rms)")
-        }
-        
-        let service = NMPPromptInferenceService(
-            orchestrator: testbed.orchestrator,
-            codec: NMPLlamaPromptCodec(model: model))
-        let done = expectation(description: "generation weight-sharded")
-        var outcome: Result<NMPPromptInferenceService.GenerationResult,
-                            NMPPromptInferenceService.ServiceError>?
-        service.run(prompt: prompt, maxTokens: 12) { result in
-            outcome = result
-            done.fulfill()
-        }
-        wait(for: [done], timeout: 300)
-        let shardedResult = try XCTUnwrap(outcome).get()
-        
-        XCTAssertEqual(shardedResult.shardCount, 2)
-        print("DIAGNOSTIC: Local result: \(local.text)")
-        print("DIAGNOSTIC: Sharded result: \(shardedResult.text)")
-        XCTAssertEqual(local.text, shardedResult.text,
-                       "weight-sharded model execution must produce identical text to local baseline")
     }
 }
