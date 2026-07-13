@@ -241,6 +241,34 @@ func activateWebUI(server: NMPDashboardServer, meshSummary: [String]) {
     print(NMPWebUIBanner.render(port: server.boundPort, meshSummary: meshSummary))
 }
 
+// MARK: - Headless transport-race benchmark
+//
+//   swift run nmp-dashboard --benchmark-race [dir] [trials] [condition]
+//
+// Races NMP vs TCP vs TCP+TLS 1.3 vs QUIC over `trials` runs per traffic
+// shape and writes Results/transport_race_<condition>.csv. Under real loss:
+//   sudo scripts/loss_lab.sh 2      # shape the 20000..40000 band
+//   swift run nmp-dashboard --benchmark-race Results 30 loss2pct
+
+if CommandLine.arguments.dropFirst().first == "--benchmark-race" {
+    let args = Array(CommandLine.arguments.dropFirst(2))
+    let directory = URL(fileURLWithPath: args.first ?? "Results")
+    let trials = args.count > 1 ? (Int(args[1]) ?? 20) : 20
+    let condition = args.count > 2 ? args[2] : "clean"
+    do {
+        print("[nmp-dashboard] transport race: \(trials) trials/shape, condition=\(condition)")
+        let report = try NMPTransportRaceBenchmark.runAndExport(
+            trials: trials, condition: condition, to: directory,
+            progress: { print("  \($0)") })
+        print("\n" + report.summaryLines.joined(separator: "\n"))
+        print("\nCSV: \(directory.path)/transport_race_\(condition).csv")
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(Data("race benchmark failed: \(error)\n".utf8))
+        exit(1)
+    }
+}
+
 // MARK: - Headless benchmark mode
 
 if CommandLine.arguments.dropFirst().first == "--benchmark" {
