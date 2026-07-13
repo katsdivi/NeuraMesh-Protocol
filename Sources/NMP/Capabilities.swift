@@ -114,6 +114,11 @@ public struct NMPCapabilities: Equatable, Sendable {
     /// TXT-learned key is trust-on-first-use unless the responder's key is
     /// independently pinned via `authorizedStaticKeys` — see Phase5_Design.md.
     public var noiseStaticPublicKey: Data?
+    /// Free storage in MB (trailing field, backward-compatible): how large a
+    /// model file this device can hold at rest. 0 = unknown / not advertised.
+    /// Drives storage-aware model selection — a device without room for the
+    /// full model file forces the mesh down to a smaller one.
+    public var storageFreeMB: UInt32
 
     public init(
         peerID: UInt32,
@@ -124,7 +129,8 @@ public struct NMPCapabilities: Equatable, Sendable {
         maxInferenceTokensPerSecond: Double = 0,
         modelFormats: [String] = [],
         udpPort: UInt16 = 0,
-        noiseStaticPublicKey: Data? = nil
+        noiseStaticPublicKey: Data? = nil,
+        storageFreeMB: UInt32 = 0
     ) {
         self.peerID = peerID
         self.deviceName = deviceName
@@ -135,6 +141,7 @@ public struct NMPCapabilities: Equatable, Sendable {
         self.modelFormats = modelFormats
         self.udpPort = udpPort
         self.noiseStaticPublicKey = noiseStaticPublicKey
+        self.storageFreeMB = storageFreeMB
     }
 
     // MARK: Binary wire format
@@ -191,6 +198,8 @@ public struct NMPCapabilities: Equatable, Sendable {
         } else {
             out.append(0)
         }
+        // Trailing field (older decoders ignore it): free storage in MB.
+        out.appendBigEndian(storageFreeMB)
         return out
     }
 
@@ -248,6 +257,17 @@ public struct NMPCapabilities: Equatable, Sendable {
                 cursor += keyLength
             }
         }
+        // Trailing field: free storage (u32). Fully absent = an older blob
+        // (default 0); partially present = a real truncation.
+        var storageFreeMB: UInt32 = 0
+        if bytes.count > cursor {
+            guard bytes.count >= cursor + 4 else {
+                throw NMPCapabilitiesError.truncated(
+                    expectedAtLeast: cursor + 4, got: bytes.count)
+            }
+            storageFreeMB = bytes.readBigEndianUInt32(at: cursor)
+            cursor += 4
+        }
         // Any bytes past `cursor` are fields from a future revision: ignored.
 
         return NMPCapabilities(
@@ -259,7 +279,8 @@ public struct NMPCapabilities: Equatable, Sendable {
             maxInferenceTokensPerSecond: Double(bytes.readBigEndianUInt32(at: 11)) / 100,
             modelFormats: formats,
             udpPort: udpPort,
-            noiseStaticPublicKey: publicKey
+            noiseStaticPublicKey: publicKey,
+            storageFreeMB: storageFreeMB
         )
     }
 
@@ -345,6 +366,8 @@ public enum NMPSystemCapabilityProbe {
         loadSampler: NMPCPULoadSampler? = nil
     ) -> NMPCapabilities {
         let ramMB = UInt32(clamping: ProcessInfo.processInfo.physicalMemory / (1024 * 1024))
+        let storageFreeMB = UInt32(clamping:
+            NMPResourceMonitor().sample().storageFreeBytes / (1024 * 1024))
         return NMPCapabilities(
             peerID: peerID,
             deviceName: deviceModel(),
@@ -352,7 +375,8 @@ public enum NMPSystemCapabilityProbe {
             computeClass: estimateComputeClass(ramMB: ramMB),
             currentLoadPercent: loadSampler?.samplePercent() ?? 0,
             maxInferenceTokensPerSecond: 0, // measured in Phase 5, estimated 0 until then
-            modelFormats: modelFormats
+            modelFormats: modelFormats,
+            storageFreeMB: storageFreeMB
         )
     }
 

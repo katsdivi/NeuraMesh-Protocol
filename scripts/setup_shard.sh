@@ -27,9 +27,15 @@ fi
 
 mkdir -p "$OUT_DIR"
 
+# Bake the ggml backend directory so the shim can load ONLY the CPU/BLAS
+# backends and SKIP Metal — a 2nd Metal instance (llama.cpp's static ggml has
+# one too) conflicts at process teardown. The shard shim computes on CPU, so
+# this costs nothing and keeps the test binary's exit clean.
+LIBEXEC="$GGML_PREFIX/libexec"
+
 if [ "${1:-}" = "--test" ]; then
     echo "building self-test…"
-    clang -DNMP_SHARD_MAIN -O2 "$SRC" \
+    clang -DNMP_SHARD_MAIN -DNMP_GGML_LIBEXEC="\"$LIBEXEC\"" -O2 "$SRC" \
         -I"$GGML_PREFIX/include" -L"$GGML_PREFIX/lib" -lggml -lggml-base \
         -Wl,-rpath,"$GGML_PREFIX/lib" -lm -o "$OUT_DIR/shardtest"
     MODEL="${2:-$HOME/models/qwen2.5-0.5b-instruct-q4_k_m.gguf}"
@@ -38,7 +44,7 @@ if [ "${1:-}" = "--test" ]; then
 fi
 
 echo "building $OUT …"
-clang -O2 -dynamiclib "$SRC" \
+clang -O2 -dynamiclib -DNMP_GGML_LIBEXEC="\"$LIBEXEC\"" "$SRC" \
     -I"$GGML_PREFIX/include" -L"$GGML_PREFIX/lib" -lggml -lggml-base \
     -Wl,-rpath,"$GGML_PREFIX/lib" -lm -o "$OUT"
 echo "ok: $OUT"

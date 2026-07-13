@@ -40,6 +40,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <pthread.h>
+#include <dirent.h>
 
 #define NMP_SHARD_ABI 2
 #define NMP_SHARD_DEFAULT_CTX 4096
@@ -65,6 +67,67 @@ struct nmp_shard {
     struct ggml_tensor **k_cache;   // each [head_dim, n_head_kv, max_ctx] F32
     struct ggml_tensor **v_cache;   // each [head_dim, n_head_kv, max_ctx] F32
 };
+
+// ---- atexit sweep ----
+// ggml-metal's static destructors assert if any ggml context/backend is still
+// open at process teardown. Like the llama shim, we track every open shard and
+// free the stragglers from an atexit hook (LIFO, so it runs before ggml's own
+// teardown). Without this the test binary aborts at exit even though every
+// test passed. Frees are also removed from the registry so a normal
+// nmp_shard_free never double-frees.
+#define NMP_SHARD_MAX_OPEN 512
+static struct nmp_shard *g_open[NMP_SHARD_MAX_OPEN];
+static int g_open_count = 0;
+static pthread_mutex_t g_open_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_atexit_registered = 0;
+
+static void free_shard_internal(struct nmp_shard *s);
+
+static void nmp_shard_free_all_at_exit(void) {
+    pthread_mutex_lock(&g_open_lock);
+    for (int i = 0; i < g_open_count; i++) { free_shard_internal(g_open[i]); g_open[i] = NULL; }
+    g_open_count = 0;
+    pthread_mutex_unlock(&g_open_lock);
+}
+static void register_shard(struct nmp_shard *s) {
+    pthread_mutex_lock(&g_open_lock);
+    if (!g_atexit_registered) { g_atexit_registered = 1; atexit(nmp_shard_free_all_at_exit); }
+    if (g_open_count < NMP_SHARD_MAX_OPEN) g_open[g_open_count++] = s;
+    pthread_mutex_unlock(&g_open_lock);
+}
+static void unregister_shard(struct nmp_shard *s) {
+    pthread_mutex_lock(&g_open_lock);
+    for (int i = 0; i < g_open_count; i++) {
+        if (g_open[i] == s) { g_open[i] = g_open[--g_open_count]; break; }
+    }
+    pthread_mutex_unlock(&g_open_lock);
+}
+
+// Load ONLY the CPU + BLAS ggml backends (skip Metal). We compute on CPU, and
+// loading Metal here spins up a second Metal instance alongside llama.cpp's
+// static ggml — the two conflict in their teardown when a single process
+// exercises both shims. When NMP_GGML_LIBEXEC isn't baked in, fall back to
+// ggml_backend_load_all() (Metal included) so the shim still works standalone.
+static void nmp_shard_load_backends(void) {
+#ifdef NMP_GGML_LIBEXEC
+    DIR *dir = opendir(NMP_GGML_LIBEXEC);
+    if (dir) {
+        struct dirent *entry;
+        char path[2048];
+        int loaded = 0;
+        while ((entry = readdir(dir))) {
+            if (strstr(entry->d_name, "libggml-metal")) continue;   // no Metal
+            if (strstr(entry->d_name, "libggml-cpu") || strstr(entry->d_name, "libggml-blas")) {
+                snprintf(path, sizeof path, "%s/%s", NMP_GGML_LIBEXEC, entry->d_name);
+                if (ggml_backend_load(path)) loaded++;
+            }
+        }
+        closedir(dir);
+        if (loaded > 0) return;
+    }
+#endif
+    ggml_backend_load_all();
+}
 
 static int32_t md_i32(struct gguf_context *g, const char *arch, const char *suf, int32_t dflt) {
     char key[160]; snprintf(key, sizeof key, "%s.%s", arch, suf);
@@ -100,7 +163,7 @@ int nmp_shard_abi_version(void) { return NMP_SHARD_ABI; }
 // (+ token_embd if start==0, + output_norm/output if end==n_layer). max_ctx is
 // the KV cache capacity (<=0 -> default); it bounds prompt+generated tokens.
 struct nmp_shard *nmp_shard_open(const char *path, int start, int end, int max_ctx) {
-    ggml_backend_load_all();
+    nmp_shard_load_backends();
     struct nmp_shard *s = calloc(1, sizeof *s);
     s->start = start; s->end = end;
     s->max_ctx = max_ctx > 0 ? max_ctx : NMP_SHARD_DEFAULT_CTX;
@@ -162,6 +225,7 @@ struct nmp_shard *nmp_shard_open(const char *path, int start, int end, int max_c
                                            a->head_dim, a->n_head_kv, s->max_ctx);
     }
     ggml_backend_alloc_ctx_tensors(s->kv_ctx, s->be);
+    register_shard(s);
     return s;
 }
 
@@ -326,7 +390,7 @@ int nmp_shard_eval(struct nmp_shard *s, const int32_t *tokens, const float *in_h
     return 0;
 }
 
-void nmp_shard_free(struct nmp_shard *s) {
+static void free_shard_internal(struct nmp_shard *s) {
     if (!s) return;
     if (s->kv_ctx) ggml_free(s->kv_ctx);
     free(s->k_cache);
@@ -334,6 +398,12 @@ void nmp_shard_free(struct nmp_shard *s) {
     if (s->ctx) ggml_free(s->ctx);
     if (s->be)  ggml_backend_free(s->be);
     free(s);
+}
+
+void nmp_shard_free(struct nmp_shard *s) {
+    if (!s) return;
+    unregister_shard(s);   // so the atexit sweep won't double-free
+    free_shard_internal(s);
 }
 
 #ifdef NMP_SHARD_MAIN

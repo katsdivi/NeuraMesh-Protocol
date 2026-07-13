@@ -127,6 +127,52 @@ public struct NMPGGUFModel: Sendable {
         return metadata["\(arch).\(suffix)"]
     }
 
+    // MARK: Footprint (for capacity-aware model selection)
+
+    /// Total weights in the model — the sum of every tensor's element count.
+    /// Exact and architecture-agnostic (used as the primary quality signal:
+    /// more parameters ≈ more capable).
+    public var totalParameters: Int {
+        Int(tensors.reduce(UInt64(0)) { $0 &+ $1.elementCount })
+    }
+
+    /// Byte size of each tensor's data, from consecutive offsets within the
+    /// (aligned) tensor-data section; the last tensor runs to the end of file.
+    /// `fileBytes` is the on-disk size (the container header isn't stored in
+    /// the parsed model, so the caller supplies it — the catalog reads it once).
+    private func tensorByteSizes(fileBytes: Int) -> [String: Int] {
+        let dataBytes = max(0, fileBytes - Int(tensorDataOffset))
+        let sorted = tensors.sorted { $0.offset < $1.offset }
+        var sizes: [String: Int] = [:]
+        for (i, tensor) in sorted.enumerated() {
+            let end = (i + 1 < sorted.count) ? Int(sorted[i + 1].offset) : dataBytes
+            sizes[tensor.name] = max(0, end - Int(tensor.offset))
+        }
+        return sizes
+    }
+
+    /// Exact per-transformer-block weight bytes: the summed size of every
+    /// `blk.*` tensor divided by the block count. This is the number the
+    /// capacity sharder needs (`layerCapacity(ramMB:bytesPerLayer:)`) to decide
+    /// how many layers a device's RAM can hold. Quantization survives (the
+    /// bytes are the quantized on-disk sizes). nil if the block count is
+    /// unknown or there are no block tensors.
+    public func bytesPerLayer(fileBytes: Int) -> Int? {
+        guard let layers = layerCount, layers > 0 else { return nil }
+        let sizes = tensorByteSizes(fileBytes: fileBytes)
+        let blockBytes = sizes
+            .filter { $0.key.hasPrefix("blk.") }
+            .reduce(0) { $0 + $1.value }
+        return blockBytes > 0 ? blockBytes / layers : nil
+    }
+
+    /// Approximate bits per weight (on-disk) — the quantization level, used as
+    /// the secondary quality signal (same params ⇒ higher precision wins).
+    public func bitsPerWeight(fileBytes: Int) -> Double {
+        let params = totalParameters
+        return params > 0 ? Double(fileBytes) * 8 / Double(params) : 0
+    }
+
     // MARK: Loading
 
     /// Parses the container header from a file. The file is memory-mapped,

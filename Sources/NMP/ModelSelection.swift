@@ -1,0 +1,185 @@
+//
+//  ModelSelection.swift
+//  NMP — Phase C (adaptive model tiering)
+//
+//  The "optimal per scenario" brain: given the devices in the mesh right now
+//  (RAM + free storage) and the model files actually available, pick the
+//  BEST model that fits — highest quality with speed headroom — and re-decide
+//  it every time membership changes.
+//
+//  It sits ABOVE the sharder and reuses its capacity math
+//  (`NMPModelSharder.layerCapacity` / `planDetailed`). Two ceilings gate a
+//  candidate:
+//    • STORAGE — every hosting device must have disk for the model file
+//      (partial-load still reads its layers from the whole GGUF on disk). A
+//      device without room can't host that model → it drops out, and if too
+//      few remain the mesh degrades to a smaller model.
+//    • RAM — the layer split must fit aggregate RAM under per-device ceilings,
+//      with headroom reserved for the KV cache + activations (so the winner is
+//      never so large it fragments into tiny, round-trip-heavy shards).
+//
+//  Pure Swift (no ggml, no llama) — fully unit-tested with synthetic meshes
+//  and catalogs, and it reads real GGUFs via the Phase 5 parser.
+//
+
+import Foundation
+
+// MARK: - Candidate
+
+/// One model the mesh could run, with the footprint the selector needs.
+public struct NMPModelCandidate: Equatable, Sendable {
+    public let path: String
+    public let name: String
+    public let architecture: String
+    public let layerCount: Int
+    public let hiddenSize: Int
+    public let fileBytes: Int
+    /// Exact quantized weight bytes per transformer block.
+    public let bytesPerLayer: Int
+    /// Total weights — the primary quality signal.
+    public let totalParameters: Int
+
+    public init(path: String, name: String, architecture: String,
+                layerCount: Int, hiddenSize: Int, fileBytes: Int,
+                bytesPerLayer: Int, totalParameters: Int) {
+        self.path = path
+        self.name = name
+        self.architecture = architecture
+        self.layerCount = layerCount
+        self.hiddenSize = hiddenSize
+        self.fileBytes = fileBytes
+        self.bytesPerLayer = bytesPerLayer
+        self.totalParameters = totalParameters
+    }
+
+    /// File size rounded to whole MB (the unit storage ceilings compare in).
+    public var fileMB: Int { fileBytes / 1_048_576 }
+    /// On-disk bits per weight — the quantization level (secondary quality).
+    public var bitsPerWeight: Double {
+        totalParameters > 0 ? Double(fileBytes) * 8 / Double(totalParameters) : 0
+    }
+
+    /// Higher quality first: more parameters, then higher precision.
+    public static func higherQuality(_ a: NMPModelCandidate, _ b: NMPModelCandidate) -> Bool {
+        if a.totalParameters != b.totalParameters {
+            return a.totalParameters > b.totalParameters
+        }
+        return a.bitsPerWeight > b.bitsPerWeight
+    }
+}
+
+// MARK: - Catalog
+
+/// Discovers the models actually available (so "what can we run" is found, not
+/// hardcoded), reading each GGUF's real footprint.
+public enum NMPModelCatalog {
+
+    /// Reads one GGUF into a candidate; nil if it can't be parsed or lacks the
+    /// dimensions the selector needs.
+    public static func candidate(path: String) -> NMPModelCandidate? {
+        let expanded = (path as NSString).expandingTildeInPath
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: expanded),
+              let fileBytes = (attrs[.size] as? NSNumber)?.intValue, fileBytes > 0,
+              let gguf = try? NMPGGUFModel.load(path: expanded),
+              let layers = gguf.layerCount, layers > 0,
+              let hidden = gguf.hiddenSize,
+              let bpl = gguf.bytesPerLayer(fileBytes: fileBytes) else {
+            return nil
+        }
+        return NMPModelCandidate(
+            path: expanded,
+            name: gguf.modelName ?? (expanded as NSString).lastPathComponent,
+            architecture: gguf.architecture ?? "unknown",
+            layerCount: layers, hiddenSize: hidden, fileBytes: fileBytes,
+            bytesPerLayer: bpl, totalParameters: gguf.totalParameters)
+    }
+
+    /// Scans a directory for `.gguf` models, highest quality first. Skips
+    /// unreadable files and the `_partN` shards left by earlier experiments.
+    public static func scan(directory: String) -> [NMPModelCandidate] {
+        let dir = (directory as NSString).expandingTildeInPath
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir) else {
+            return []
+        }
+        return names
+            .filter { $0.hasSuffix(".gguf") && !$0.contains("_part") }
+            .compactMap { candidate(path: (dir as NSString).appendingPathComponent($0)) }
+            .sorted(by: NMPModelCandidate.higherQuality)
+    }
+}
+
+// MARK: - Selection
+
+public struct NMPModelSelection: Equatable, Sendable {
+    public let model: NMPModelCandidate
+    public let plan: [NMPShardPlanEntry]
+    /// Devices that host a slice (had storage + RAM for the winner).
+    public let eligiblePeers: [UInt32]
+    /// Human-readable "why this model" — including what larger tiers were
+    /// skipped and the binding reason.
+    public let reason: String
+}
+
+public enum NMPModelSelector {
+
+    /// Reserve ~40% of RAM for the OS, KV cache, and live activations — the
+    /// same headroom the sharder uses, which also keeps the winning model from
+    /// fitting so tightly it fragments into tiny, round-trip-heavy shards.
+    public static let defaultHeadroom = 0.6
+
+    /// Picks the highest-quality model that fits the current mesh. Returns nil
+    /// only when even the smallest candidate can't fit anywhere.
+    public static func pick(
+        mesh: [NMPCapabilities],
+        catalog: [NMPModelCandidate],
+        headroom: Double = defaultHeadroom,
+        measuredSecondsPerLayer: [UInt32: Double] = [:],
+        computeShares: [UInt32: Double] = [:]
+    ) -> NMPModelSelection? {
+        let ranked = catalog.sorted(by: NMPModelCandidate.higherQuality)
+        var skipped: [String] = []
+
+        for model in ranked {
+            // Devices that can HOST this model: room for the file on disk AND
+            // enough RAM for at least one of its layers.
+            var capacities: [UInt32: Int] = [:]
+            var eligible: [NMPCapabilities] = []
+            var storageBlocked = 0
+            for device in mesh {
+                let hasDisk = Int(device.storageFreeMB) >= model.fileMB
+                let cap = NMPModelSharder.layerCapacity(
+                    ramMB: device.ramMB, bytesPerLayer: model.bytesPerLayer,
+                    headroom: headroom)
+                if !hasDisk { storageBlocked += 1; continue }
+                if cap >= 1 { eligible.append(device); capacities[device.peerID] = cap }
+            }
+            let totalCapacity = capacities.values.reduce(0, +)
+
+            guard totalCapacity >= model.layerCount, !eligible.isEmpty else {
+                let why = storageBlocked > 0
+                    ? "\(storageBlocked) device(s) lack \(model.fileMB) MB disk"
+                    : "RAM fits only \(totalCapacity)/\(model.layerCount) layers"
+                skipped.append("\(model.name) [\(why)]")
+                continue
+            }
+
+            let plan = NMPModelSharder.planDetailed(
+                layerCount: model.layerCount, peers: eligible,
+                measuredSecondsPerLayer: measuredSecondsPerLayer,
+                computeShares: computeShares,
+                layerCapacities: capacities, objective: .capacityThenSpeed)
+
+            var reason = "chose \(model.name) — "
+                + "\(model.fileMB) MB, \(model.layerCount) layers, "
+                + "fits \(eligible.count)/\(mesh.count) device(s) "
+                + "(RAM holds \(totalCapacity) layers)"
+            if !skipped.isEmpty {
+                reason += "; degraded past " + skipped.joined(separator: ", ")
+            }
+            return NMPModelSelection(
+                model: model, plan: plan.entries,
+                eligiblePeers: eligible.map(\.peerID), reason: reason)
+        }
+        return nil
+    }
+}
