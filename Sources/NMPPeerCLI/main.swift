@@ -57,7 +57,7 @@ struct PeerArguments {
                 print("""
                 usage: nmp-peer [--layers N] [--hidden N] [--gguf path] \
                 [--tag modelTag] [--slow msPerLayer] \
-                [--engine reference|llamaCpp] [--model path.gguf] [--gpu-layers N]
+                [--engine reference|llamaCpp|llamaShard] [--model path.gguf] [--gpu-layers N]
                 """)
                 exit(0)
             default:
@@ -74,8 +74,34 @@ struct PeerArguments {
 let arguments = PeerArguments.parse()
 let engine: NMPShardComputeEngine
 var modelTag = arguments.modelTag
+/// Non-nil only for --engine llamaShard, so onServed can report loaded MB.
+var llamaShardEngine: NMPLlamaShardComputeEngine?
 
-if arguments.engineKind == "llamaCpp" {
+if arguments.engineKind == "llamaShard" {
+    // TRUE cross-device sharding: this peer loads ONLY the layer range the
+    // coordinator assigns (ggml graph surgery), so a device too small for the
+    // whole model still contributes. Needs the shard shim (scripts/setup_shard.sh).
+    guard let modelPath = arguments.modelPath ?? arguments.ggufPath else {
+        FileHandle.standardError.write(Data("--engine llamaShard requires --model path.gguf\n".utf8))
+        exit(2)
+    }
+    do {
+        let shardEngine = try NMPLlamaShardComputeEngine(modelPath: modelPath)
+        engine = shardEngine
+        llamaShardEngine = shardEngine
+        modelTag = shardEngine.modelTag
+        print("[peer] llamaShard engine: \(shardEngine.modelTag) — "
+              + "\(shardEngine.layerCount) layers × \(shardEngine.hiddenSize) hidden; "
+              + "will partial-load ONLY the assigned range (ctx \(shardEngine.maxContext))")
+    } catch {
+        FileHandle.standardError.write(Data("""
+        failed to start llamaShard engine: \(error)
+        checklist: brew install ggml && scripts/setup_shard.sh, and --model must point at a .gguf file
+        \n
+        """.utf8))
+        exit(1)
+    }
+} else if arguments.engineKind == "llamaCpp" {
     guard let modelPath = arguments.modelPath else {
         FileHandle.standardError.write(Data("--engine llamaCpp requires --model path.gguf\n".utf8))
         exit(2)
@@ -130,11 +156,23 @@ func stamp() -> String {
 
 node.onStatus = { print("[peer \(stamp())] \($0)") }
 node.onDiagnostic = { print("[peer \(stamp())] (diag) \($0)") }
+node.onAssigned = { assign in
+    guard llamaShardEngine != nil else { return }
+    print("[peer \(stamp())] shard assigned: layers "
+          + "\(assign.startLayer)..<\(assign.endLayer) of \(assign.totalLayers) "
+          + "— partial-loading only this range")
+}
 node.onServed = { requestID, layers, seconds in
+    // For a real shard peer, report the MEASURED loaded weights (only this
+    // range), the honest proof it doesn't hold the whole model.
+    let loaded = llamaShardEngine?.loadedBytes ?? 0
+    let loadedNote = loaded > 0
+        ? String(format: ", loaded %.1f MB (its range only)", Double(loaded) / 1_048_576)
+        : ""
     print("[peer \(stamp())] served request \(requestID): layers "
           + "\(layers.lowerBound)..<\(layers.upperBound) in "
           + String(format: "%.2f", seconds * 1000) + " ms "
-          + "(mem \(NMPPeerShardEngine.residentMemoryMB()) MB)")
+          + "(mem \(NMPPeerShardEngine.residentMemoryMB()) MB\(loadedNote))")
 }
 
 do {

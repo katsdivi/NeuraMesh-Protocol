@@ -100,6 +100,14 @@ public final class NMPLlamaShardComputeEngine: NMPShardComputeEngine {
         return openShard?.bytesLoaded ?? 0
     }
 
+    /// Eagerly opens (partial-loads) the shard for [start, end) — the same
+    /// shard runLayers will use — so `loadedBytes` reports the real footprint
+    /// before the first inference (the dashboard shows it immediately).
+    @discardableResult
+    public func preload(start: Int, end: Int) throws -> Int {
+        try shard(start: start, end: end).bytesLoaded
+    }
+
     /// Returns the cached shard for [start, end), opening (and replacing any
     /// stale one) if the range changed. Serialized by `stateLock`.
     private func shard(start: Int, end: Int) throws -> NMPLlamaShard {

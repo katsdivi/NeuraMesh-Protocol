@@ -103,10 +103,12 @@ struct DashboardArguments {
             case "--ui": arguments.ui = true
             case "--help", "-h":
                 print("""
-                usage: nmp-dashboard [port] [--engine reference|llamaCpp] \
-                [--model path.gguf] [--gpu-layers N] [--placement local|remote] \
+                usage: nmp-dashboard [port] [--engine reference|llamaCpp|llamaShard] \
+                [--model path.gguf] [--gpu-layers N] [--placement local|remote|sharded:N] \
                 [--auto-config] [--probe-passes N] [--speculation] [--draft-model path.gguf] \
                 [--ui]
+                  llamaShard: TRUE cross-device sharding — each peer loads only its
+                  layer range (needs scripts/setup_shard.sh); use --placement sharded:N
                 """)
                 exit(0)
             default:
@@ -633,6 +635,197 @@ func runLlamaDashboard(model: NMPLlamaModel, arguments: DashboardArguments) -> N
 
     print("[nmp-dashboard] Ctrl-C to stop")
     dispatchMain()
+}
+
+// MARK: - Phase 10: llamaShard engine mode (TRUE cross-device sharding)
+
+/// Real sharded dashboard: N in-process peers, each partial-loading ONLY its
+/// layer range via the ggml graph-surgery shim, chained over the full NMP
+/// stack. The Devices panel shows each peer's MEASURED layer range and loaded
+/// MB (via NMPShardReport) — so "no single device holds the whole model" is
+/// shown as fact. Needs the shard shim (scripts/setup_shard.sh) AND the llama
+/// shim (for the tokenizer). Never returns.
+func runLlamaShardDashboard(modelPath: String, arguments: DashboardArguments) -> Never {
+    let shardCount: Int
+    if case .sharded(let n) = arguments.placement { shardCount = max(2, n) } else { shardCount = 2 }
+
+    // Engines in shardIndex order (engine[0] is reused by the testbed as peer 0).
+    var shardEngines: [NMPLlamaShardComputeEngine] = []
+    let vocab: NMPLlamaModel
+    let testbed: NMPLlamaTestbed
+    let plan: [NMPShardPlanEntry]
+    do {
+        let first = try NMPLlamaShardComputeEngine(modelPath: modelPath)
+        shardEngines.append(first)
+        vocab = try NMPLlamaModel(modelPath: modelPath, vocabOnly: true)
+        print("[nmp-dashboard] llamaShard engine: \(first.modelTag) — "
+              + "\(first.layerCount) layers × \(first.hiddenSize) hidden, "
+              + "\(shardCount)-way split")
+        testbed = try NMPLlamaTestbed(
+            engine: first, modelTag: first.modelTag,
+            placement: .sharded(shardCount: shardCount),
+            engineFactory: {
+                let extra = try NMPLlamaShardComputeEngine(modelPath: modelPath)
+                shardEngines.append(extra)
+                return extra
+            })
+        plan = try testbed.startSync()
+    } catch {
+        fatalError("llamaShard mesh assembly failed: \(error) "
+                   + "(needs scripts/setup_shard.sh + scripts/setup_llama.sh)")
+    }
+
+    // Partial-load each peer's range up front so loaded MB is real immediately,
+    // and print the honest split.
+    let fullModelBytes = (try? FileManager.default
+        .attributesOfItem(atPath: (modelPath as NSString).expandingTildeInPath)[.size] as? Int) ?? nil
+    var loadedByPeer: [UInt32: Int] = [:]
+    for (i, entry) in plan.enumerated() where i < shardEngines.count {
+        let bytes = (try? shardEngines[i].preload(start: entry.startLayer, end: entry.endLayer)) ?? 0
+        loadedByPeer[entry.peerID] = bytes
+    }
+    let devices = NMPShardReport.devices(plan: plan, loadedBytesByPeer: loadedByPeer)
+    print("[nmp-dashboard] real sharding — each peer holds ONLY its layers:")
+    for device in devices {
+        print("  - peer 0x\(String(device.peerID, radix: 16)) shard \(device.shardIndex): \(device.summary)")
+    }
+    if let full = fullModelBytes {
+        let honest = NMPShardReport.noPeerHoldsWholeModel(devices, fullModelBytes: full)
+        print("  (whole model \(String(format: "%.1f", Double(full) / 1_048_576)) MB — "
+              + (honest ? "no peer holds it all ✅" : "⚠️ a peer holds the whole model"))
+    }
+
+    let server = NMPDashboardServer()
+    server.onDiagnostic = { print("[nmp-dashboard] \($0)") }
+    do { try server.start(port: port) }
+    catch { fatalError("dashboard server failed to start: \(error)") }
+    print("[nmp-dashboard] dashboard running at http://localhost:\(server.boundPort)")
+
+    // Seed the Devices panel with real ranges + loaded MB.
+    server.updatePeerState(
+        peerID: testbed.coordinatorID, name: "coordinator (tokenizer)",
+        latencyMS: 0, loadPercent: 0, assigned: "tokenizer only", alive: true)
+    for device in devices {
+        server.updatePeerState(
+            peerID: device.peerID, name: "shard-peer-\(device.shardIndex) (in-process)",
+            latencyMS: 0, loadPercent: 0, assigned: device.summary, alive: true)
+    }
+    testbed.onInferenceServed = { peerID, layers, seconds in
+        let idx = plan.firstIndex { $0.peerID == peerID }?.description ?? "?"
+        server.updatePeerState(
+            peerID: peerID, name: "shard-peer-\(idx) (in-process)",
+            latencyMS: Int(seconds * 1000), loadPercent: 0,
+            assigned: NMPShardReport.devices(plan: plan, loadedBytesByPeer: loadedByPeer)
+                .first { $0.peerID == peerID }?.summary
+                ?? "layers \(layers.lowerBound)-\(layers.upperBound - 1)",
+            alive: true)
+    }
+
+    let promptService = NMPPromptInferenceService(
+        orchestrator: testbed.orchestrator,
+        codec: NMPLlamaShardPromptCodec(model: vocab))
+    promptService.onProgress = { done, total in
+        server.updateInferenceProgress(
+            progress: Double(done) / Double(max(total, 1)),
+            stage: "sharded generation: token \(done)/\(total)")
+    }
+    promptService.onToken = { token, count, requested in
+        server.reportGenerationToken(text: token.text, index: token.index,
+                                     count: count, requested: requested)
+    }
+
+    server.onInferenceRequest = { request, respond in
+        server.reportGenerationStarted(
+            prompt: request.prompt, maxTokens: request.maxTokens, speculative: false)
+        server.reportMeshEvent("🌐 sharded inference: up to \(request.maxTokens) token(s) "
+                               + "across \(shardCount) shard(s)")
+        promptService.run(prompt: request.prompt, maxTokens: request.maxTokens) { result in
+            switch result {
+            case .success(let generation):
+                server.reportGenerationComplete(generation)
+                server.reportMeshEvent(String(
+                    format: "🌐 sharded inference done: %d tokens in %.1f ms across %d shard(s)",
+                    generation.tokenCount, generation.totalSeconds * 1000, generation.shardCount))
+                respond(.success(generation))
+            case .failure(.busy):
+                respond(.failure(status: 429, message: "an inference is already running — retry shortly"))
+            case .failure(.emptyPrompt):
+                respond(.failure(status: 400, message: "prompt is empty"))
+            case .failure(.codec(let reason)):
+                respond(.failure(status: 400, message: "prompt encoding failed: \(reason)"))
+            case .failure(.orchestration(let error)):
+                server.reportGenerationFailed(String(describing: error))
+                respond(.failure(status: 500, message: "mesh orchestration failed: \(error)"))
+            }
+        }
+    }
+
+    server.onDeviceMetricsRequest = { respond in
+        let sample = resourceMonitor.sample()
+        var peers: [[String: Any]] = [[
+            "id": String(testbed.coordinatorID, radix: 16),
+            "name": "coordinator (tokenizer)", "alive": true,
+            "assigned": "tokenizer only", "compute_share": 1.0,
+            "computing": false, "is_coordinator": true,
+            "link": "local — no network hop",
+        ]]
+        for device in devices {
+            peers.append([
+                "id": String(device.peerID, radix: 16),
+                "name": "shard-peer-\(device.shardIndex) (in-process)",
+                "alive": true,
+                "assigned": device.summary,
+                "layers_loaded": device.layerCount,
+                "loaded_mb": device.loadedMB,
+                "compute_share": 1.0,
+                "computing": false,
+                "is_coordinator": false,
+                "link": "in-process link (full NMP stack: Noise IK, AES-GCM, FEC, NACK)",
+            ])
+        }
+        respond([
+            "host": sample.asJSONObject,
+            "host_note": "all mesh peers run in-process — each partial-loads ONLY "
+                + "its layer range (real ggml graph surgery), so no peer holds the "
+                + "whole model (see loaded_mb per device)",
+            "generation_in_flight": false,
+            "allocation_supported": false,
+            "allocation_note": "re-sharding a live shard plan is future work; "
+                + "the split is fixed for this run",
+            "peers": peers,
+            "totals": [
+                "devices": peers.count,
+                "devices_alive": peers.count,
+                "layers_assigned": shardEngines.first?.layerCount ?? 0,
+            ] as [String: Any],
+        ])
+    }
+
+    var shardMeshInfo = NMPDashboardServer.MeshInfo()
+    shardMeshInfo.engine = "llamaShard"
+    shardMeshInfo.modelName = shardEngines.first?.modelTag ?? "?"
+    shardMeshInfo.shardCount = shardCount
+    shardMeshInfo.wireFormat = testbed.orchestrator.activationWireFormat.rawValue
+    server.meshInfo = shardMeshInfo
+
+    if dashboardArguments.ui {
+        activateWebUI(server: server, meshSummary: [
+            "Mesh: llamaShard — \(shardEngines.first?.modelTag ?? "?")",
+            "Split: \(shardCount)-way, each peer partial-loads only its layers",
+            "Wire format: \(shardMeshInfo.wireFormat)",
+        ])
+    }
+
+    print("[nmp-dashboard] Ctrl-C to stop")
+    dispatchMain()
+}
+
+if dashboardArguments.engine == "llamaShard" {
+    guard let modelPath = dashboardArguments.modelPath else {
+        FileHandle.standardError.write(Data("--engine llamaShard requires --model path.gguf\n".utf8))
+        exit(2)
+    }
+    runLlamaShardDashboard(modelPath: modelPath, arguments: dashboardArguments)
 }
 
 if dashboardArguments.engine == "llamaCpp" {

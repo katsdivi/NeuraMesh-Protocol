@@ -16,10 +16,10 @@ breaking that rule.
 ## 1. True cross-device sharding of a *real* model (the big one)
 
 **Status: 🚧 IN PROGRESS — real sharding works end-to-end through the mesh
-(bit-exact, partial-load proven). Remaining: KV-cache speed pass, UI/iOS
-surfacing, and scaling to 14B on real devices. Goal: run Qwen-14B across a
-Mac + iPhone (+ any other devices) so no single device holds the whole
-model.**
+(bit-exact, KV-cached, partial-load proven) and is exposed in the dashboard
+and the compute peer. Remaining: scaling to 14B on real devices. Goal: run
+Qwen-14B across a Mac + iPhone (+ any other devices) so no single device holds
+the whole model.**
 
 ### What works now (2026-07-13, verified)
 
@@ -56,14 +56,25 @@ the real mesh. Verified against llama.cpp on Qwen2.5-0.5B:
   length, which keeps a replayed step idempotent. Still bit-exact vs the
   whole-model run (F32 cache).
 
+### Surfaced in the dashboard + peer (2026-07-13, verified live)
+
+- `nmp-dashboard --engine llamaShard --model M.gguf --placement sharded:N`
+  runs the real N-way sharded mesh. The Devices panel shows each peer's
+  MEASURED layer range and loaded MB via `NMPShardReport` (e.g. peer 0 "layers
+  0-11 · 209.4 MB", peer 1 "layers 12-23 · 253.6 MB" — neither holds the whole
+  ~485 MB model), and `POST /api/inference` returns real text
+  ("Paris. It is the largest city in Europe…") across 2 shards.
+- `nmp-peer --engine llamaShard --model M.gguf` makes a real device a shard
+  peer: it partial-loads ONLY the range the coordinator assigns and logs the
+  loaded MB. This is the native/iOS compute-peer path.
+
 ### Remaining
 
-- **UI + iOS**: the dashboard and peer app don't yet expose the shard engine
-  or show per-device layer ranges / loaded MB (the mesh plumbing is done; this
-  is surface wiring — select `NMPLlamaShardComputeEngine` from the dashboard
-  and render `loadedBytes`).
 - **Scale to 14B** across whatever devices are present, measured (the code is
   arch-generic, so this is an operational step: a 14B GGUF + real devices).
+- Live re-sharding of a shard plan and cross-device loaded-MB reporting
+  (today the dashboard's shard split is fixed per run; a remote peer's loaded
+  MB would ride the metrics wire).
 
 ### The earlier fake (preserved in history)
 
