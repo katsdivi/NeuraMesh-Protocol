@@ -88,3 +88,90 @@ public final class NMPReferencePromptCodec: NMPPromptCodec {
         NMPPromptInferenceService.render(words: tokens.map(\.text))
     }
 }
+
+// MARK: - Chat prompt assembly (Mesh 2.7)
+
+/// One turn of a chat conversation, as posted to POST /api/chat.
+public struct NMPChatMessage: Equatable, Sendable {
+    public enum Role: String, Sendable {
+        case system, user, assistant
+    }
+
+    public let role: Role
+    public let content: String
+
+    public init(role: Role, content: String) {
+        self.role = role
+        self.content = content
+    }
+}
+
+/// Folds a chat transcript into the single prompt string the token loop
+/// consumes. The mesh itself is stateless across requests — the client
+/// resends the whole conversation each turn, and the template makes the
+/// engine treat it as dialogue.
+///
+/// Two templates, chosen by engine:
+/// - llama engines get the Llama-2-chat instruction format
+///   (`[INST] … [/INST]`, system folded into the first instruction via
+///   `<<SYS>>`), which the validated llama-2-7b-chat model was trained
+///   on. No literal `<s>` tokens — the tokenizer adds BOS itself.
+/// - everything else (the reference engine) gets a plain transcript
+///   (`User: … / Assistant: …`); the reference engine emits placeholder
+///   vocabulary regardless, so the template only needs to be consistent.
+public enum NMPChatPrompt {
+
+    public static func format(messages: [NMPChatMessage],
+                              engine: String) -> String {
+        engine.hasPrefix("llama")
+            ? llamaChatFormat(messages)
+            : transcriptFormat(messages)
+    }
+
+    static func llamaChatFormat(_ messages: [NMPChatMessage]) -> String {
+        var system: String?
+        var out = ""
+        var pendingUser: String?
+
+        func flushInstruction(_ user: String) {
+            var instruction = user
+            if let sys = system {
+                instruction = "<<SYS>>\n\(sys)\n<</SYS>>\n\n\(user)"
+                system = nil // only the first instruction carries it
+            }
+            out += out.isEmpty ? "[INST] \(instruction) [/INST]"
+                               : " [INST] \(instruction) [/INST]"
+        }
+
+        for message in messages {
+            switch message.role {
+            case .system:
+                system = message.content
+            case .user:
+                if let user = pendingUser { flushInstruction(user) }
+                pendingUser = message.content
+            case .assistant:
+                if let user = pendingUser {
+                    flushInstruction(user)
+                    pendingUser = nil
+                }
+                out += " \(message.content)"
+            }
+        }
+        if let user = pendingUser { flushInstruction(user) }
+        return out
+    }
+
+    static func transcriptFormat(_ messages: [NMPChatMessage]) -> String {
+        var lines: [String] = []
+        for message in messages {
+            switch message.role {
+            case .system:    lines.append(message.content)
+            case .user:      lines.append("User: \(message.content)")
+            case .assistant: lines.append("Assistant: \(message.content)")
+            }
+        }
+        lines.append("Assistant:")
+        return lines.joined(separator: "\n")
+    }
+}

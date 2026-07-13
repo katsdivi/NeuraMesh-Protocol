@@ -355,3 +355,144 @@ final class WebUIRouteTests: XCTestCase {
         XCTAssertTrue((headers["Content-Type"] as? String ?? "").contains("text/html"))
     }
 }
+
+// MARK: - Chat prompt template (Mesh 2.7)
+
+final class ChatPromptTests: XCTestCase {
+
+    private func msg(_ role: NMPChatMessage.Role, _ content: String) -> NMPChatMessage {
+        NMPChatMessage(role: role, content: content)
+    }
+
+    func testLlamaTemplateWrapsTurnsInInstructionBlocks() {
+        let prompt = NMPChatPrompt.format(
+            messages: [msg(.user, "Hi there"),
+                       msg(.assistant, "Hello!"),
+                       msg(.user, "How are you?")],
+            engine: "llamaCpp")
+        XCTAssertEqual(prompt,
+                       "[INST] Hi there [/INST] Hello! [INST] How are you? [/INST]")
+        XCTAssertFalse(prompt.contains("<s>"),
+                       "the tokenizer adds BOS — never as literal text")
+    }
+
+    func testLlamaTemplateFoldsSystemIntoFirstInstructionOnly() {
+        let prompt = NMPChatPrompt.format(
+            messages: [msg(.system, "Be brief."),
+                       msg(.user, "One"),
+                       msg(.assistant, "1"),
+                       msg(.user, "Two")],
+            engine: "llamaCpp")
+        XCTAssertEqual(prompt,
+                       "[INST] <<SYS>>\nBe brief.\n<</SYS>>\n\nOne [/INST] 1 "
+                       + "[INST] Two [/INST]")
+        XCTAssertEqual(prompt.components(separatedBy: "<<SYS>>").count, 2,
+                       "system prompt rides the FIRST instruction only")
+    }
+
+    func testTranscriptTemplateForReferenceEngine() {
+        let prompt = NMPChatPrompt.format(
+            messages: [msg(.system, "Talk like a pirate."),
+                       msg(.user, "Hi"),
+                       msg(.assistant, "Arr"),
+                       msg(.user, "Bye")],
+            engine: "reference")
+        XCTAssertEqual(prompt,
+                       "Talk like a pirate.\nUser: Hi\nAssistant: Arr\n"
+                       + "User: Bye\nAssistant:")
+    }
+}
+
+// MARK: - /api/chat route (Mesh 2.7)
+
+final class ChatRouteTests: XCTestCase {
+
+    private var server: NMPDashboardServer!
+
+    override func setUpWithError() throws {
+        server = NMPDashboardServer()
+        try server.start(port: 0)
+    }
+
+    override func tearDown() {
+        server.stop()
+        server = nil
+    }
+
+    private var base: String { "http://127.0.0.1:\(server.boundPort)" }
+
+    private func request(
+        _ method: String, _ path: String, body: [String: Any]? = nil
+    ) throws -> (status: Int, data: Data) {
+        var request = URLRequest(url: URL(string: base + path)!)
+        request.httpMethod = method
+        if let body {
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        }
+        let done = expectation(description: "\(method) \(path)")
+        var outcome: (Int, Data)?
+        URLSession.shared.dataTask(with: request) { data, response, _ in
+            if let http = response as? HTTPURLResponse {
+                outcome = (http.statusCode, data ?? Data())
+            }
+            done.fulfill()
+        }.resume()
+        wait(for: [done], timeout: 10)
+        return try XCTUnwrap(outcome)
+    }
+
+    func testChatAssemblesEngineTemplateAndReturnsGenerationJSON() throws {
+        var info = NMPDashboardServer.MeshInfo()
+        info.engine = "llamaCpp"
+        server.meshInfo = info
+
+        var seenPrompt: String?
+        server.onInferenceRequest = { request, respond in
+            seenPrompt = request.prompt
+            respond(.success(.init(
+                text: "I am well.", tokenCount: 3, totalSeconds: 0.3,
+                networkPayloadBytes: 900, shardCount: 1,
+                perTokenSeconds: [0.1, 0.1, 0.1], engine: "llamaCpp")))
+        }
+        let (status, data) = try request("POST", "/api/chat", body: [
+            "messages": [
+                ["role": "user", "content": "Hi"],
+                ["role": "assistant", "content": "Hello!"],
+                ["role": "user", "content": "How are you?"],
+            ],
+            "max_tokens": 8,
+        ])
+        XCTAssertEqual(status, 200)
+        XCTAssertEqual(seenPrompt,
+                       "[INST] Hi [/INST] Hello! [INST] How are you? [/INST]")
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(object["output"] as? String, "I am well.")
+        XCTAssertEqual(object["round_trips"] as? Int, 3)
+        XCTAssertEqual(object["assembled_prompt_chars"] as? Int,
+                       seenPrompt?.count)
+    }
+
+    func testChatRejectsEmptyAndNonUserFinalTurns() throws {
+        server.onInferenceRequest = { _, _ in XCTFail("must not reach the mesh") }
+        let (missing, _) = try request("POST", "/api/chat", body: ["messages": []])
+        XCTAssertEqual(missing, 400)
+        let (badRole, _) = try request("POST", "/api/chat", body: [
+            "messages": [["role": "wizard", "content": "hi"]],
+        ])
+        XCTAssertEqual(badRole, 400)
+        let (assistantLast, _) = try request("POST", "/api/chat", body: [
+            "messages": [["role": "user", "content": "hi"],
+                         ["role": "assistant", "content": "hello"]],
+        ])
+        XCTAssertEqual(assistantLast, 400,
+                       "the last message must be the user's turn")
+    }
+
+    func testChatWithoutPipelineIs503() throws {
+        let (status, _) = try request("POST", "/api/chat", body: [
+            "messages": [["role": "user", "content": "hi"]],
+        ])
+        XCTAssertEqual(status, 503)
+    }
+}

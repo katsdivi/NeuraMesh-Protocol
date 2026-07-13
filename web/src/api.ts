@@ -202,6 +202,12 @@ export interface BenchmarkResults {
   runs: BenchmarkRun[];
 }
 
+/** Mesh 2.7: one chat turn, as POST /api/chat consumes it. */
+export interface ChatMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}
+
 async function post<T>(path: string, body: unknown): Promise<T> {
   const response = await fetch(path, {
     method: 'POST',
@@ -226,6 +232,14 @@ export const api = {
     enable_speculation?: boolean;
     enable_comparison?: boolean;
   }): Promise<InferenceResult> => post('/api/inference', request),
+
+  /** Mesh 2.7: chat — the server folds the transcript into the engine's
+   *  template and runs the same mesh generation as /api/inference. */
+  chat: (request: {
+    messages: ChatMessage[];
+    max_tokens: number;
+    enable_speculation?: boolean;
+  }): Promise<InferenceResult> => post('/api/chat', request),
 
   benchmark: (request: {
     prompt: string;

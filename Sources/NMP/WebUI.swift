@@ -250,7 +250,10 @@ public final class NMPWebUIBroadcaster {
             onDiagnostic?("bonjour advert failed: \(error)")
             return
         }
-        let txt = NWTXTRecord(["port": String(port), "proto": "http"])
+        // "host" (Mesh 2.7) lets the peer app build the UI's URL straight
+        // from the browse result — no throwaway resolution connection.
+        let txt = NWTXTRecord(["port": String(port), "proto": "http",
+                               "host": NMPLANIdentity.localHostname()])
         listener.service = NWListener.Service(
             name: serviceName, type: Self.serviceType, txtRecord: txt)
         listener.newConnectionHandler = { $0.cancel() } // advert only

@@ -739,6 +739,8 @@ public final class NMPDashboardServer {
             switch path {
             case "/api/inference":
                 handleInferencePOST(body: body, client: client)
+            case "/api/chat":
+                handleChatPOST(body: body, client: client)
             case "/api/benchmark/run":
                 handleBenchmarkPOST(body: body, client: client)
             case "/api/comparison":
@@ -1199,38 +1201,7 @@ public final class NMPDashboardServer {
             self.queue.async {
                 switch response {
                 case .success(let result):
-                    let tokensPerSec = result.totalSeconds > 0
-                        ? Double(result.tokenCount) / result.totalSeconds : 0
-                    // A round trip = one full mesh pass; the speculative
-                    // path counts them explicitly, the plain path spends
-                    // one per pass (perTokenSeconds entries).
-                    let roundTrips = result.speculation?.meshRoundTrips
-                        ?? result.perTokenSeconds.count
-                    var object: [String: Any] = [
-                        "output": result.text,
-                        "token_count": result.tokenCount,
-                        "latency_ms": (result.totalSeconds * 1000 * 10).rounded() / 10,
-                        "tokens_per_sec": (tokensPerSec * 100).rounded() / 100,
-                        "network_payload_bytes": result.networkPayloadBytes,
-                        "shard_count": result.shardCount,
-                        "engine": result.engine,
-                        "round_trips": roundTrips,
-                        "wire_format": self.storedMeshInfo.wireFormat,
-                    ]
-                    if let stats = result.speculation {
-                        object["speculation"] = [
-                            "drafter": stats.drafterName,
-                            "mesh_round_trips": stats.meshRoundTrips,
-                            "drafted_tokens": stats.draftedTokens,
-                            "accepted_draft_tokens": stats.acceptedDraftTokens,
-                            "fallback_rounds": stats.fallbackRounds,
-                            "acceptance_rate":
-                                (stats.acceptanceRate * 1000).rounded() / 1000,
-                            "tokens_per_round_trip":
-                                (stats.tokensPerRoundTrip(tokenCount: result.tokenCount)
-                                 * 100).rounded() / 100,
-                        ]
-                    }
+                    let object = self.generationJSON(result)
                     // Mesh 2.5: "Compare protocols" runs the MEASURED
                     // transport race on the generation's real traffic
                     // pattern — the modeled re-pricing is gone from this
@@ -1242,7 +1213,8 @@ public final class NMPDashboardServer {
                         return
                     }
                     let plan = NMPTransportRace.Plan(
-                        roundTrips: roundTrips,
+                        roundTrips: result.speculation?.meshRoundTrips
+                            ?? result.perTokenSeconds.count,
                         payloadBytes: result.networkPayloadBytes)
                     NMPTransportRace.run(plan: plan) { [weak self, weak client] raced in
                         guard let self, let client else { return }
@@ -1265,6 +1237,112 @@ public final class NMPDashboardServer {
                                              object: object)
                         }
                     }
+                case .failure(let status, let message):
+                    self.respondJSON(
+                        client,
+                        status: "\(status) \(Self.reasonPhrase(for: status))",
+                        object: ["error": message])
+                }
+            }
+        }
+    }
+
+    /// The JSON body every generation-returning route shares
+    /// (/api/inference, /api/chat). Runs on `queue`.
+    private func generationJSON(
+        _ result: NMPPromptInferenceService.GenerationResult
+    ) -> [String: Any] {
+        let tokensPerSec = result.totalSeconds > 0
+            ? Double(result.tokenCount) / result.totalSeconds : 0
+        // A round trip = one full mesh pass; the speculative path counts
+        // them explicitly, the plain path spends one per pass
+        // (perTokenSeconds entries).
+        let roundTrips = result.speculation?.meshRoundTrips
+            ?? result.perTokenSeconds.count
+        var object: [String: Any] = [
+            "output": result.text,
+            "token_count": result.tokenCount,
+            "latency_ms": (result.totalSeconds * 1000 * 10).rounded() / 10,
+            "tokens_per_sec": (tokensPerSec * 100).rounded() / 100,
+            "network_payload_bytes": result.networkPayloadBytes,
+            "shard_count": result.shardCount,
+            "engine": result.engine,
+            "round_trips": roundTrips,
+            "wire_format": storedMeshInfo.wireFormat,
+        ]
+        if let stats = result.speculation {
+            object["speculation"] = [
+                "drafter": stats.drafterName,
+                "mesh_round_trips": stats.meshRoundTrips,
+                "drafted_tokens": stats.draftedTokens,
+                "accepted_draft_tokens": stats.acceptedDraftTokens,
+                "fallback_rounds": stats.fallbackRounds,
+                "acceptance_rate":
+                    (stats.acceptanceRate * 1000).rounded() / 1000,
+                "tokens_per_round_trip":
+                    (stats.tokensPerRoundTrip(tokenCount: result.tokenCount)
+                     * 100).rounded() / 100,
+            ]
+        }
+        return object
+    }
+
+    // MARK: POST /api/chat (Mesh 2.7)
+
+    /// Chat = the same generation pipeline as /api/inference, with the
+    /// prompt assembled server-side from a whole conversation
+    /// (`{"messages":[{"role":"user","content":"…"}, …]}`) so the web UI
+    /// and the peer app share one template per engine (NMPChatPrompt).
+    /// The mesh stays stateless: clients resend the transcript each turn.
+    private func handleChatPOST(body: Data, client: Client) {
+        guard let handler = onInferenceRequest else {
+            respondJSON(client, status: "503 Service Unavailable",
+                        object: ["error": "no inference pipeline is wired to this server"])
+            return
+        }
+        guard let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let rawMessages = object["messages"] as? [[String: Any]],
+              !rawMessages.isEmpty else {
+            respondJSON(client, status: "400 Bad Request",
+                        object: ["error": "body must be JSON with a non-empty 'messages' array"])
+            return
+        }
+        var messages: [NMPChatMessage] = []
+        for raw in rawMessages {
+            guard let roleRaw = raw["role"] as? String,
+                  let role = NMPChatMessage.Role(rawValue: roleRaw),
+                  let content = raw["content"] as? String else {
+                respondJSON(client, status: "400 Bad Request",
+                            object: ["error": "each message needs a role "
+                                + "(system|user|assistant) and string content"])
+                return
+            }
+            messages.append(NMPChatMessage(role: role, content: content))
+        }
+        guard messages.last?.role == .user,
+              messages.last.map({ !$0.content.trimmingCharacters(
+                in: .whitespacesAndNewlines).isEmpty }) == true else {
+            respondJSON(client, status: "400 Bad Request",
+                        object: ["error": "the last message must be a non-empty user turn"])
+            return
+        }
+        let maxTokens = (object["max_tokens"] as? Int) ?? 64
+        let enableSpeculation = (object["enable_speculation"] as? Bool) ?? false
+        let prompt = NMPChatPrompt.format(messages: messages,
+                                          engine: storedMeshInfo.engine)
+
+        handler(InferenceRequest(prompt: prompt, maxTokens: maxTokens,
+                                 enableSpeculation: enableSpeculation)) { [weak self, weak client] response in
+            guard let self, let client else { return }
+            self.queue.async {
+                switch response {
+                case .success(let result):
+                    var object = self.generationJSON(result)
+                    // What the template produced — chat clients show only
+                    // the transcript, so surface the real prompt for
+                    // debugging/curiosity.
+                    object["assembled_prompt_chars"] = prompt.count
+                    self.respondJSON(client, status: "200 OK", object: object)
                 case .failure(let status, let message):
                     self.respondJSON(
                         client,

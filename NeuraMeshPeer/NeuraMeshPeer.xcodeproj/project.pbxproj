@@ -11,6 +11,7 @@
 		1A0000000000000000000015 /* PeerViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000011 /* PeerViewModel.swift */; };
 		1A0000000000000000000016 /* PeerStatusView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000012 /* PeerStatusView.swift */; };
 		1A0000000000000000000019 /* NMP in Frameworks */ = {isa = PBXBuildFile; productRef = 1A0000000000000000000018 /* NMP */; };
+		1A000000000000000000001B /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A000000000000000000001A /* ChatView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -19,6 +20,7 @@
 		1A0000000000000000000011 /* PeerViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerViewModel.swift; sourceTree = "<group>"; };
 		1A0000000000000000000012 /* PeerStatusView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerStatusView.swift; sourceTree = "<group>"; };
 		1A0000000000000000000013 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		1A000000000000000000001A /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -56,6 +58,7 @@
 				1A0000000000000000000010 /* NeuraMeshPeerApp.swift */,
 				1A0000000000000000000011 /* PeerViewModel.swift */,
 				1A0000000000000000000012 /* PeerStatusView.swift */,
+				1A000000000000000000001A /* ChatView.swift */,
 			);
 			path = Sources;
 			sourceTree = "<group>";
@@ -137,6 +140,7 @@
 				1A0000000000000000000014 /* NeuraMeshPeerApp.swift in Sources */,
 				1A0000000000000000000015 /* PeerViewModel.swift in Sources */,
 				1A0000000000000000000016 /* PeerStatusView.swift in Sources */,
+				1A000000000000000000001B /* ChatView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

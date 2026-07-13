@@ -12,6 +12,7 @@
     <key>NSBonjourServices</key>
     <array>
         <string>_neuramesh._tcp</string>
+        <string>_neuramesh-ui._tcp</string>
     </array>
 </dict>
 </plist>

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Navbar, type View } from './components/Navbar';
 import { Dashboard } from './components/Dashboard';
 import { Inference } from './components/Inference';
+import { Chat } from './components/Chat';
 import { Devices } from './components/Devices';
 import { Benchmarking } from './components/Benchmarking';
 import { Compare } from './components/Compare';
@@ -76,6 +77,7 @@ export function App() {
           />
         )}
         {view === 'run' && <Inference health={health} live={liveGeneration} />}
+        {view === 'chat' && <Chat health={health} live={liveGeneration} />}
         {view === 'devices' && <Devices />}
         {view === 'benchmark' && <Benchmarking />}
         {view === 'compare' && <Compare />}
