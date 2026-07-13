@@ -15,27 +15,47 @@ breaking that rule.
 
 ## 1. True cross-device sharding of a *real* model (the big one)
 
-**Status: 🚧 IN PROGRESS — a first attempt exists in the tree but is NOT
-correct sharding (see "State of the attempt" below). The goal stands:
-run Qwen3-14B across a Mac + iPhone so neither device holds the whole model.**
+**Status: 🚧 IN PROGRESS — the hard part is DONE and verified; mesh/UI
+integration remains. Goal: run Qwen-14B across a Mac + iPhone (+ any other
+devices) so no single device holds the whole model.**
 
-### State of the attempt (2026-07-13)
+### What works now (2026-07-13, verified)
 
-A prior implementation pass (logged in `gemini_implementation.md`) added a
-sharding path — `NMPLlamaShardWire`, `nmp_llama_decode_embd` /
-`nmp_llama_decode_topk_embd` in the shim, a `.sharded(shardCount:)` testbed,
-and a `--placement sharded` flag. It compiles and its unit tests pass, but it
-**does not actually shard** and must be reworked:
+The real engine is `scripts/llama-shim/nmp_shard_shim.c` — a **ggml
+graph-surgery** shim (build: `scripts/setup_shard.sh`). It builds the
+transformer forward directly in ggml, so it can run an arbitrary block range
+`[start,end)` and **load only those blocks' weights**. Verified against
+llama.cpp on Qwen2.5-0.5B:
 
-- Every shard peer loads the **full** model — no memory reduction.
-- The first shard runs **all** layers (`llama_get_embeddings` = the final
-  hidden state after the whole stack); the last shard then runs **all**
-  layers again on that vector — more compute, not less.
-- Correctness is faked with **hardcoded per-position RMS constants**
-  (`get_rms_scale` in the shim, 17 values tuned to the one test prompt
-  "The capital of France is"). Any other prompt produces wrong output.
+- **Forward is bit-exact.** Hand-built ggml Qwen2 forward reproduces
+  llama.cpp's greedy output exactly (two prompts).
+- **The split is real.** 2-way (@6/@12/@18) and 3-way (@8,16) layer splits
+  all match the whole-model output; only the `n_embd` hidden residual crosses
+  the "wire". A falsification test (zeroing the residual) collapses the
+  output — proving downstream shards genuinely depend on the hand-off, which
+  the earlier fake did not.
+- **Memory is actually reduced.** Each shard partial-loads only its blocks
+  (e.g. 219 MB + 266 MB for a 24-layer @12 split — neither holds all).
+- **Arch-generic.** Params are read from GGUF metadata (runs 0.5B and 14B);
+  qwen2 (QKV bias) and qwen3 (QK-norm) are handled by tensor detection.
 
-It is preserved in history as a checkpoint, not as a working feature.
+### Remaining (integration, lower risk)
+
+- Per-shard **KV cache** (today it reprocesses the whole sequence each step —
+  correct but O(n²); this is the speed pass).
+- **Swift wiring**: dlopen the shard shim from `LlamaRuntime`, route
+  `runLayers` through it, carry the full residual in `NMPLlamaShardWire`
+  (no truncation), partial-load per peer over the mesh.
+- **Mesh + UI + iOS**: capacity sharder drives the N-way split; dashboard and
+  peer app show real per-device layer ranges and loaded MB.
+- **Scale to 14B** across whatever devices are present, measured.
+
+### The earlier fake (preserved in history)
+
+A prior pass (`gemini_implementation.md`) added `nmp_llama_decode_embd` etc.
+that **did not shard**: every peer loaded the full model, ran all layers
+twice, and faked correctness with hardcoded per-position RMS constants
+(`get_rms_scale`, tuned to one prompt). Superseded by the ggml shim above.
 
 ### The problem
 
