@@ -68,13 +68,33 @@ the real mesh. Verified against llama.cpp on Qwen2.5-0.5B:
   peer: it partial-loads ONLY the range the coordinator assigns and logs the
   loaded MB. This is the native/iOS compute-peer path.
 
-### Remaining
+### Adaptive model tiering (2026-07-14, storage + RAM aware)
 
-- **Scale to 14B** across whatever devices are present, measured (the code is
-  arch-generic, so this is an operational step: a 14B GGUF + real devices).
-- Live re-sharding of a shard plan and cross-device loaded-MB reporting
-  (today the dashboard's shard split is fixed per run; a remote peer's loaded
-  MB would ride the metrics wire).
+The mesh now picks the OPTIMAL model for whatever devices are present, and
+re-decides on churn:
+
+- `NMPCapabilities` advertises free storage; `NMPModelCatalog` discovers the
+  GGUFs actually on disk and reads each one's real footprint (exact
+  `bytesPerLayer`, params, quant) via the Phase 5 GGUF parser.
+- `NMPModelSelector` picks the highest-quality model that FITS — every hosting
+  device needs disk for the file (storage ceiling → **degrade** when a device
+  can't hold it) AND the layer split must fit aggregate RAM with headroom
+  (reusing `layerCapacity`, which also guards against speed-killing
+  fragmentation).
+- `NMPAdaptiveModelController` turns a membership change into a decision:
+  unchanged / reshard (same model) / **switch model** (reload a different GGUF)
+  / no-fit — so a device leaving degrades the model and a device returning
+  upgrades it. The reload reuses the Phase A churn-safe re-prefill.
+- `nmp-dashboard --engine llamaShard` (no `--model`) auto-selects the best
+  model from `~/models` for the host and shows the choice + reason.
+
+### Remaining (needs the target model + real devices)
+
+- **Live re-selection in the running dashboard**: today it auto-selects at
+  startup; wiring the controller to reload models on live join/leave is the
+  last integration step, best validated on the real 14B across a Mac + iPhone.
+- **The 14B end-to-end run**, measured (the selector/shim are arch-generic for
+  qwen2/qwen3; llama-arch models need a NORMAL-RoPE shim variant first).
 
 ### The earlier fake (preserved in history)
 
