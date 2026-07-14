@@ -183,3 +183,75 @@ public enum NMPModelSelector {
         return nil
     }
 }
+
+// MARK: - Adaptive controller (churn-driven re-selection)
+
+/// Keeps the mesh on the OPTIMAL model as devices come and go. Feed it the
+/// current membership on every join/leave; it re-runs the selector and reports
+/// what changed, so the coordinator knows whether to just re-shard (same
+/// model) or switch models (reload a different GGUF on the peers). Pure
+/// decision logic — the caller performs the reload/re-assign (reusing the
+/// churn-safe re-prefill from Phase A).
+public final class NMPAdaptiveModelController {
+
+    /// What a membership change implies.
+    public enum Decision: Equatable, Sendable {
+        /// The best model is unchanged and so is its plan — nothing to do.
+        case unchanged(NMPModelSelection)
+        /// Same model, but the layer split changed (re-assign the plan).
+        case reshard(NMPModelSelection)
+        /// A different model is now optimal (reload it on the peers, then
+        /// re-assign). `from` is the previous model name ("(none)" on the
+        /// first selection).
+        case switchModel(from: String, to: NMPModelSelection)
+        /// Not even the smallest candidate fits the current mesh.
+        case noModelFits
+
+        public var selection: NMPModelSelection? {
+            switch self {
+            case .unchanged(let s), .reshard(let s), .switchModel(_, let s): return s
+            case .noModelFits: return nil
+            }
+        }
+    }
+
+    private let catalog: [NMPModelCandidate]
+    private let headroom: Double
+    private var current: NMPModelSelection?
+
+    public init(catalog: [NMPModelCandidate],
+                headroom: Double = NMPModelSelector.defaultHeadroom) {
+        self.catalog = catalog
+        self.headroom = headroom
+    }
+
+    /// The model + plan currently in force (nil before the first fit).
+    public var currentSelection: NMPModelSelection? { current }
+
+    /// Re-decides for `mesh`, updates internal state, and returns what changed.
+    public func evaluate(
+        mesh: [NMPCapabilities],
+        measuredSecondsPerLayer: [UInt32: Double] = [:],
+        computeShares: [UInt32: Double] = [:]
+    ) -> Decision {
+        guard let pick = NMPModelSelector.pick(
+            mesh: mesh, catalog: catalog, headroom: headroom,
+            measuredSecondsPerLayer: measuredSecondsPerLayer,
+            computeShares: computeShares) else {
+            current = nil
+            return .noModelFits
+        }
+        let previous = current
+        current = pick
+        guard let previous else {
+            return .switchModel(from: "(none)", to: pick)
+        }
+        if previous.model.path != pick.model.path {
+            return .switchModel(from: previous.model.name, to: pick)
+        }
+        if previous.plan != pick.plan {
+            return .reshard(pick)
+        }
+        return .unchanged(pick)
+    }
+}

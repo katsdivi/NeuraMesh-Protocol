@@ -122,6 +122,67 @@ final class ModelSelectionTests: XCTestCase {
         XCTAssertLessThan(cand.bitsPerWeight, 33)     // not wider than f32
     }
 
+    // MARK: Adaptive controller (churn)
+
+    func testControllerDegradesAndUpgradesAcrossChurn() {
+        let controller = NMPAdaptiveModelController(catalog: ladder)
+        let mac = device(1, ramMB: 32_768, storageMB: 500_000)
+        let phone = device(2, ramMB: 8_192, storageMB: 60_000)
+
+        // Two strong devices → 14B (first selection is a "switch"/load).
+        let start = controller.evaluate(mesh: [mac, phone])
+        guard case .switchModel(let from, let to) = start else {
+            return XCTFail("first fit should be a switchModel, got \(start)")
+        }
+        XCTAssertEqual(from, "(none)")
+        XCTAssertEqual(to.model.name, "qwen14b")
+
+        // The phone leaves → 8 GB alone can't hold 14B → degrade to 7B.
+        let dropped = controller.evaluate(mesh: [phone])
+        guard case .switchModel(let f2, let t2) = dropped else {
+            return XCTFail("dropping to one small device should switch models, got \(dropped)")
+        }
+        XCTAssertEqual(f2, "qwen14b")
+        XCTAssertEqual(t2.model.name, "qwen7b")
+
+        // The Mac comes back → upgrade to 14B again.
+        let rejoined = controller.evaluate(mesh: [mac, phone])
+        guard case .switchModel(_, let t3) = rejoined else {
+            return XCTFail("a rejoining device should upgrade the model, got \(rejoined)")
+        }
+        XCTAssertEqual(t3.model.name, "qwen14b")
+
+        // No change → unchanged.
+        if case .unchanged(let sel) = controller.evaluate(mesh: [mac, phone]) {
+            XCTAssertEqual(sel.model.name, "qwen14b")
+        } else {
+            XCTFail("identical membership should be .unchanged")
+        }
+    }
+
+    func testControllerReshardsSameModelOnPlanChange() {
+        let controller = NMPAdaptiveModelController(catalog: ladder)
+        let a = device(1, ramMB: 32_768, storageMB: 500_000)
+        let b = device(2, ramMB: 32_768, storageMB: 500_000)
+        _ = controller.evaluate(mesh: [a, b])   // → 14B
+
+        // Same devices + model, but cap device 2's compute share → the split
+        // shifts (same model) ⇒ a re-shard, not a model switch.
+        let decision = controller.evaluate(mesh: [a, b], computeShares: [2: 0.1])
+        switch decision {
+        case .reshard(let sel): XCTAssertEqual(sel.model.name, "qwen14b")
+        case .unchanged: break   // acceptable if the plan happens to match
+        default: XCTFail("expected reshard/unchanged for same model, got \(decision)")
+        }
+    }
+
+    func testControllerReportsNoFitWhenMeshTooSmall() {
+        let controller = NMPAdaptiveModelController(catalog: ladder)
+        let tiny = device(1, ramMB: 1_024, storageMB: 100)
+        XCTAssertEqual(controller.evaluate(mesh: [tiny]), .noModelFits)
+        XCTAssertNil(controller.currentSelection)
+    }
+
     func testRealCatalogScanSortsByQuality() throws {
         let dir = ("~/models" as NSString).expandingTildeInPath
         guard FileManager.default.fileExists(atPath: dir) else {

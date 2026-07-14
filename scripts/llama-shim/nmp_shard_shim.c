@@ -109,6 +109,15 @@ static void unregister_shard(struct nmp_shard *s) {
 // exercises both shims. When NMP_GGML_LIBEXEC isn't baked in, fall back to
 // ggml_backend_load_all() (Metal included) so the shim still works standalone.
 static void nmp_shard_load_backends(void) {
+    // Load exactly ONCE — ggml_backend_load() is NOT idempotent, so calling it
+    // per shard-open would re-register the backends every time and make device
+    // lookup (and thus compute) pathologically slow under many opens.
+    static pthread_mutex_t once_lock = PTHREAD_MUTEX_INITIALIZER;
+    static int loaded = 0;
+    pthread_mutex_lock(&once_lock);
+    if (loaded) { pthread_mutex_unlock(&once_lock); return; }
+    loaded = 1;
+    pthread_mutex_unlock(&once_lock);
 #ifdef NMP_GGML_LIBEXEC
     DIR *dir = opendir(NMP_GGML_LIBEXEC);
     if (dir) {

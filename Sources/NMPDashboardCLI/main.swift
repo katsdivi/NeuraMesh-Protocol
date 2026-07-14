@@ -673,7 +673,8 @@ func runLlamaDashboard(model: NMPLlamaModel, arguments: DashboardArguments) -> N
 /// MB (via NMPShardReport) — so "no single device holds the whole model" is
 /// shown as fact. Needs the shard shim (scripts/setup_shard.sh) AND the llama
 /// shim (for the tokenizer). Never returns.
-func runLlamaShardDashboard(modelPath: String, arguments: DashboardArguments) -> Never {
+func runLlamaShardDashboard(modelPath: String, selectionReason: String? = nil,
+                            arguments: DashboardArguments) -> Never {
     let shardCount: Int
     if case .sharded(let n) = arguments.placement { shardCount = max(2, n) } else { shardCount = 2 }
 
@@ -837,23 +838,45 @@ func runLlamaShardDashboard(modelPath: String, arguments: DashboardArguments) ->
     server.meshInfo = shardMeshInfo
 
     if dashboardArguments.ui {
-        activateWebUI(server: server, meshSummary: [
+        var summary = [
             "Mesh: llamaShard — \(shardEngines.first?.modelTag ?? "?")",
             "Split: \(shardCount)-way, each peer partial-loads only its layers",
             "Wire format: \(shardMeshInfo.wireFormat)",
-        ])
+        ]
+        if let selectionReason { summary.append("Model choice: \(selectionReason)") }
+        activateWebUI(server: server, meshSummary: summary)
     }
+    if let selectionReason { server.reportMeshEvent("model choice — \(selectionReason)") }
 
     print("[nmp-dashboard] Ctrl-C to stop")
     dispatchMain()
 }
 
 if dashboardArguments.engine == "llamaShard" {
-    guard let modelPath = dashboardArguments.modelPath else {
-        FileHandle.standardError.write(Data("--engine llamaShard requires --model path.gguf\n".utf8))
-        exit(2)
+    // Explicit --model wins; otherwise auto-select the OPTIMAL model from
+    // ~/models for THIS host (the real "pick whatever fits" path).
+    var modelPath = dashboardArguments.modelPath
+    var selectionReason: String?
+    if modelPath == nil {
+        // The ggml shard shim implements qwen2/qwen3 blocks (NEOX RoPE, GQA);
+        // only offer architectures it runs correctly. Other arches (e.g. llama
+        // NORMAL RoPE) need a shim variant first.
+        let catalog = NMPModelCatalog.scan(directory: "~/models")
+            .filter { $0.architecture.hasPrefix("qwen") }
+        let host = NMPSystemCapabilityProbe.measure(peerID: 0x0000_0001)
+        guard !catalog.isEmpty,
+              let pick = NMPModelSelector.pick(mesh: [host], catalog: catalog) else {
+            let msg = "no model in ~/models fits this host (RAM \(host.ramMB) MB, "
+                + "free disk \(host.storageFreeMB) MB) — pass --model path.gguf\n"
+            FileHandle.standardError.write(Data(msg.utf8))
+            exit(2)
+        }
+        modelPath = pick.model.path
+        selectionReason = pick.reason
+        print("[nmp-dashboard] auto-selected \(pick.model.name): \(pick.reason)")
     }
-    runLlamaShardDashboard(modelPath: modelPath, arguments: dashboardArguments)
+    runLlamaShardDashboard(modelPath: modelPath!, selectionReason: selectionReason,
+                           arguments: dashboardArguments)
 }
 
 if dashboardArguments.engine == "llamaCpp" {
