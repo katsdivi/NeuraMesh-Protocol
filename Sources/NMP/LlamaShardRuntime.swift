@@ -93,11 +93,33 @@ public final class NMPLlamaShardRuntime {
         if let override = ProcessInfo.processInfo.environment["NMP_SHARD_LIB"] {
             paths.append((override as NSString).expandingTildeInPath)
         }
+        // iOS: the shim ships as a code-signed framework embedded in the app
+        // bundle (dlopen of an arbitrary path is blocked on device — only
+        // bundled, signed Mach-O is loadable), and a side-loaded copy in the
+        // app's Documents dir is honored for on-device experimentation.
+        #if os(iOS) || os(tvOS)
+        if let frameworks = Bundle.main.privateFrameworksURL {
+            paths.append(frameworks
+                .appendingPathComponent("nmpshard.framework/nmpshard").path)
+        }
+        if let docs = FileManager.default.urls(
+            for: .documentDirectory, in: .userDomainMask).first {
+            paths.append(docs.appendingPathComponent("libnmpshard.dylib").path)
+        }
+        #endif
         paths.append(FileManager.default.currentDirectoryPath
                      + "/Vendor/llama/libnmpshard.dylib")
         paths.append((NSHomeDirectory() as NSString)
                      .appendingPathComponent(".nmp/libnmpshard.dylib"))
         return paths
+    }
+
+    /// True when the shard shim can actually be dlopen'd right now — the safe,
+    /// side-effect-free cue for a peer to choose the REAL sharded engine over
+    /// the reference stand-in (constructing the engine alone does NOT prove the
+    /// shim loads, since it opens lazily on first compute).
+    public static var isAvailable: Bool {
+        (try? shared()) != nil
     }
 
     /// The first candidate path that exists, or nil — the cue for callers

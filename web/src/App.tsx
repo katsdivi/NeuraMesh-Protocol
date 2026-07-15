@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from 'react';
+import { Component, useEffect, useRef, useState, type ReactNode } from 'react';
 import { Navbar, type View } from './components/Navbar';
 import { Dashboard } from './components/Dashboard';
 import { Inference } from './components/Inference';
 import { Chat } from './components/Chat';
+import { Models } from './components/Models';
 import { Devices } from './components/Devices';
 import { Benchmarking } from './components/Benchmarking';
 import { Compare } from './components/Compare';
@@ -68,6 +69,7 @@ export function App() {
         />
       )}
       <main className="page">
+        <ViewBoundary view={view}>
         {view === 'dashboard' && (
           <Dashboard
             health={health}
@@ -78,14 +80,52 @@ export function App() {
         )}
         {view === 'run' && <Inference health={health} live={liveGeneration} />}
         {view === 'chat' && <Chat health={health} live={liveGeneration} />}
+        {view === 'models' && <Models />}
         {view === 'devices' && <Devices />}
         {view === 'benchmark' && <Benchmarking />}
         {view === 'compare' && <Compare />}
         {view === 'pressure' && <Pressure />}
         {view === 'settings' && <Settings health={health} sendControl={sendControl} />}
+        </ViewBoundary>
       </main>
     </div>
   );
+}
+
+/**
+ * Without a boundary, one tab throwing during render unmounts the WHOLE
+ * app (React's default) — a blank page where even the tabs that work
+ * look broken. Contain the blast radius to the current view; switching
+ * tabs retries with a fresh subtree.
+ */
+class ViewBoundary extends Component<
+  { view: View; children: ReactNode },
+  { failed: string }
+> {
+  state = { failed: '' };
+
+  static getDerivedStateFromError(error: unknown) {
+    return { failed: error instanceof Error ? error.message : String(error) };
+  }
+
+  componentDidUpdate(previous: { view: View }) {
+    if (previous.view !== this.props.view && this.state.failed) {
+      this.setState({ failed: '' });
+    }
+  }
+
+  render() {
+    if (this.state.failed) {
+      return (
+        <div className="error-box">
+          This tab hit a rendering error: {this.state.failed}. The rest of
+          the app is unaffected — switch tabs to continue (coming back here
+          retries).
+        </div>
+      );
+    }
+    return this.props.children;
+  }
 }
 
 /**

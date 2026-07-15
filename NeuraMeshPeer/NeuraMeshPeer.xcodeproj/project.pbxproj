@@ -12,7 +12,26 @@
 		1A0000000000000000000016 /* PeerStatusView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000012 /* PeerStatusView.swift */; };
 		1A0000000000000000000019 /* NMP in Frameworks */ = {isa = PBXBuildFile; productRef = 1A0000000000000000000018 /* NMP */; };
 		1A000000000000000000001B /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A000000000000000000001A /* ChatView.swift */; };
+		1A0000000000000000000021 /* ModelManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000020 /* ModelManager.swift */; };
+		1A0000000000000000000023 /* ModelsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000022 /* ModelsView.swift */; };
+		1A0000000000000000000025 /* MeshUILocator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000024 /* MeshUILocator.swift */; };
+		93116321300774510062AC5B /* nmpshard.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 93116320300774510062AC5B /* nmpshard.xcframework */; };
+		93116322300774510062AC5B /* nmpshard.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 93116320300774510062AC5B /* nmpshard.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		93116323300774510062AC5B /* Embed Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+				93116322300774510062AC5B /* nmpshard.xcframework in Embed Frameworks */,
+			);
+			name = "Embed Frameworks";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		1A0000000000000000000006 /* NeuraMeshPeer.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = NeuraMeshPeer.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -21,6 +40,10 @@
 		1A0000000000000000000012 /* PeerStatusView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerStatusView.swift; sourceTree = "<group>"; };
 		1A0000000000000000000013 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		1A000000000000000000001A /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
+		1A0000000000000000000020 /* ModelManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelManager.swift; sourceTree = "<group>"; };
+		1A0000000000000000000022 /* ModelsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelsView.swift; sourceTree = "<group>"; };
+		1A0000000000000000000024 /* MeshUILocator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeshUILocator.swift; sourceTree = "<group>"; };
+		93116320300774510062AC5B /* nmpshard.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = nmpshard.xcframework; path = ../Vendor/ios/nmpshard.xcframework; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -28,6 +51,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				93116321300774510062AC5B /* nmpshard.xcframework in Frameworks */,
 				1A0000000000000000000019 /* NMP in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -40,6 +64,7 @@
 			children = (
 				1A0000000000000000000004 /* Sources */,
 				1A0000000000000000000013 /* Info.plist */,
+				9311631F300774510062AC5B /* Frameworks */,
 				1A0000000000000000000003 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -58,9 +83,20 @@
 				1A0000000000000000000010 /* NeuraMeshPeerApp.swift */,
 				1A0000000000000000000011 /* PeerViewModel.swift */,
 				1A0000000000000000000012 /* PeerStatusView.swift */,
+				1A0000000000000000000020 /* ModelManager.swift */,
+				1A0000000000000000000022 /* ModelsView.swift */,
+				1A0000000000000000000024 /* MeshUILocator.swift */,
 				1A000000000000000000001A /* ChatView.swift */,
 			);
 			path = Sources;
+			sourceTree = "<group>";
+		};
+		9311631F300774510062AC5B /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				93116320300774510062AC5B /* nmpshard.xcframework */,
+			);
+			name = Frameworks;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -73,6 +109,7 @@
 				1A0000000000000000000007 /* Sources */,
 				1A0000000000000000000008 /* Frameworks */,
 				1A0000000000000000000009 /* Resources */,
+				93116323300774510062AC5B /* Embed Frameworks */,
 			);
 			buildRules = (
 			);
@@ -140,6 +177,9 @@
 				1A0000000000000000000014 /* NeuraMeshPeerApp.swift in Sources */,
 				1A0000000000000000000015 /* PeerViewModel.swift in Sources */,
 				1A0000000000000000000016 /* PeerStatusView.swift in Sources */,
+				1A0000000000000000000021 /* ModelManager.swift in Sources */,
+				1A0000000000000000000023 /* ModelsView.swift in Sources */,
+				1A0000000000000000000025 /* MeshUILocator.swift in Sources */,
 				1A000000000000000000001B /* ChatView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

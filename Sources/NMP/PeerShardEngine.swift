@@ -29,6 +29,11 @@ public final class NMPPeerShardEngine {
     /// requestID, layers computed, pure compute seconds.
     public var onInferenceServed: ((UInt32, Range<Int>, TimeInterval) -> Void)?
     public var onDiagnostic: ((String) -> Void)?
+    /// The coordinator assigned a DIFFERENT model than this engine loaded
+    /// (the assign was rejected). Carries the mesh's model tag so the app
+    /// can follow it — switch to a matching local file or fall back to
+    /// vault streaming — instead of staying shard-less forever.
+    public var onModelMismatch: ((String) -> Void)?
 
     // MARK: State
 
@@ -86,10 +91,23 @@ public final class NMPPeerShardEngine {
             return
         }
 
+        // Future Plan #3: a vault-backed engine holds no model until now — stream
+        // its assigned slice from the coordinator BEFORE validating dimensions
+        // (which then genuinely checks the fetched slice against the assign).
+        if assign.startLayer != assign.endLayer,
+           let provisionable = engine as? NMPVaultProvisioning {
+            do { try provisionable.provision(for: assign) }
+            catch { onDiagnostic?("vault provision failed: \(error) — assignment will be rejected") }
+        }
+
         let status: NMPShardAck.Status
-        if assign.modelTag != modelTag {
+        // A wildcard modelTag ("*") means the peer holds no model of its own and
+        // trusts the coordinator's (it streams that model's slices) — skip the tag gate.
+        if modelTag != NMPVaultShardComputeEngine.wildcardModelTag,
+           assign.modelTag != modelTag {
             status = .rejectedModelMismatch
             onDiagnostic?("SHARD_ASSIGN for model '\(assign.modelTag)' but loaded '\(modelTag)'")
+            onModelMismatch?(assign.modelTag)
         } else if assign.startLayer == assign.endLayer {
             // Mesh 2.8 standby assignment: the coordinator explicitly told
             // this peer it holds 0 layers this plan (the model fits without

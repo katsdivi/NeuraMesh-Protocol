@@ -124,8 +124,14 @@ public struct NMPChatMessage: Equatable, Sendable {
 /// resends the whole conversation each turn, and the template makes the
 /// engine treat it as dialogue.
 ///
-/// Two templates, chosen by engine:
-/// - llama engines get the Llama-2-chat instruction format
+/// Three templates, chosen by MODEL family first, engine second — the
+/// template a model was trained on is a property of the model, not of
+/// which engine happens to run it (the shard engine runs qwen2/qwen3,
+/// the classic llama engine runs llama-2; both are "llama*" engines):
+/// - qwen models get ChatML (`<|im_start|>role … <|im_end|>`). The
+///   markers are real special tokens — the shim tokenizes with
+///   parse_special, and generation stops at `<|im_end|>` (qwen's EOS).
+/// - other llama-engine models get the Llama-2-chat instruction format
 ///   (`[INST] … [/INST]`, system folded into the first instruction via
 ///   `<<SYS>>`), which the validated llama-2-7b-chat model was trained
 ///   on. No literal `<s>` tokens — the tokenizer adds BOS itself.
@@ -135,10 +141,31 @@ public struct NMPChatMessage: Equatable, Sendable {
 public enum NMPChatPrompt {
 
     public static func format(messages: [NMPChatMessage],
-                              engine: String) -> String {
-        engine.hasPrefix("llama")
+                              engine: String,
+                              model: String = "") -> String {
+        if model.lowercased().contains("qwen") {
+            return chatMLFormat(messages)
+        }
+        return engine.hasPrefix("llama")
             ? llamaChatFormat(messages)
             : transcriptFormat(messages)
+    }
+
+    /// ChatML, exactly as qwen2.5-instruct's chat template renders it —
+    /// including the default system turn the official template injects
+    /// when the client sends none.
+    static func chatMLFormat(_ messages: [NMPChatMessage]) -> String {
+        var out = ""
+        if !messages.contains(where: { $0.role == .system }) {
+            out += "<|im_start|>system\nYou are Qwen, created by Alibaba "
+                 + "Cloud. You are a helpful assistant.<|im_end|>\n"
+        }
+        for message in messages {
+            out += "<|im_start|>\(message.role.rawValue)\n"
+                 + "\(message.content)<|im_end|>\n"
+        }
+        out += "<|im_start|>assistant\n"
+        return out
     }
 
     static func llamaChatFormat(_ messages: [NMPChatMessage]) -> String {

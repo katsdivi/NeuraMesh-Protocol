@@ -89,9 +89,11 @@ export interface MeshTotals {
   devices: number;
   devices_alive: number;
   layers_assigned: number;
-  requests_served: number;
-  net_bytes_per_sec: number;
-  generation_in_flight: boolean;
+  /** Absent in shard mode (the real-shard coordinator doesn't track these
+   * mesh-wide yet) — the UI hides the cards instead of showing zeros. */
+  requests_served?: number;
+  net_bytes_per_sec?: number;
+  generation_in_flight?: boolean;
 }
 
 export interface ShardingObjective {
@@ -223,6 +225,29 @@ export interface ChatMessage {
   content: string;
 }
 
+/** An installed model in ~/models, with the flags the picker needs. */
+export interface ModelInfo {
+  path: string;
+  name: string;
+  arch: string;
+  size_mb: number;
+  params: number;
+  layers: number;
+  bits_per_weight: number;
+  /** The shard shim runs this architecture (qwen2/qwen3 only, today). */
+  compatible: boolean;
+  /** This host has the RAM to hold it. */
+  fits_host: boolean;
+  /** compatible AND fits_host — safe to select. */
+  usable: boolean;
+  /** The highest-quality usable model (the mesh's own pick). */
+  recommended: boolean;
+  /** The model the mesh is serving right now. */
+  active: boolean;
+  /** Empty when usable; otherwise why it can't run here. */
+  note: string;
+}
+
 async function post<T>(path: string, body: unknown): Promise<T> {
   const response = await fetch(path, {
     method: 'POST',
@@ -302,6 +327,20 @@ export const api = {
     objective: string,
   ): Promise<{ status: string; objective: string; summary: string }> =>
     post('/api/mesh/objective', { objective }),
+
+  /** The installed models with compatibility flags (sharded engine only). */
+  models: (): Promise<{ models: ModelInfo[] }> =>
+    fetch('/api/models').then((r) => {
+      if (!r.ok) throw new Error(`${r.status}`);
+      return r.json();
+    }),
+
+  /** Switch the active model — the mesh relaunches onto it and the page
+   *  reconnects. Rejects (throws) for incompatible / too-big / missing. */
+  selectModel: (
+    path: string,
+  ): Promise<{ status: string; summary: string; reconnecting: boolean }> =>
+    post('/api/models/select', { path }),
 };
 
 /** Live event stream (the Phase 6 dashboard WebSocket). */

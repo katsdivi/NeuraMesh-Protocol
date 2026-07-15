@@ -390,6 +390,48 @@ final class ChatPromptTests: XCTestCase {
                        "system prompt rides the FIRST instruction only")
     }
 
+    func testQwenModelGetsChatMLRegardlessOfEngine() {
+        // The shard engine is "llamaShard" — engine prefix alone would
+        // wrongly pick the Llama-2 [INST] template for a qwen model
+        // (which echoes the alien markers back: the "[INST]Hi" bug).
+        let prompt = NMPChatPrompt.format(
+            messages: [msg(.user, "Hi")],
+            engine: "llamaShard",
+            model: "qwen2.5-0.5b-instruct")
+        XCTAssertEqual(prompt,
+                       "<|im_start|>system\nYou are Qwen, created by Alibaba "
+                       + "Cloud. You are a helpful assistant.<|im_end|>\n"
+                       + "<|im_start|>user\nHi<|im_end|>\n"
+                       + "<|im_start|>assistant\n")
+        XCTAssertFalse(prompt.contains("[INST]"))
+    }
+
+    func testQwenChatMLKeepsClientSystemTurnAndFullTranscript() {
+        let prompt = NMPChatPrompt.format(
+            messages: [msg(.system, "Be brief."),
+                       msg(.user, "One"),
+                       msg(.assistant, "1"),
+                       msg(.user, "Two")],
+            engine: "llamaShard",
+            model: "Qwen3-4B")
+        XCTAssertEqual(prompt,
+                       "<|im_start|>system\nBe brief.<|im_end|>\n"
+                       + "<|im_start|>user\nOne<|im_end|>\n"
+                       + "<|im_start|>assistant\n1<|im_end|>\n"
+                       + "<|im_start|>user\nTwo<|im_end|>\n"
+                       + "<|im_start|>assistant\n")
+        XCTAssertEqual(prompt.components(separatedBy: "<|im_start|>system").count, 2,
+                       "the client's system turn replaces the default, not adds to it")
+    }
+
+    func testNonQwenLlamaModelKeepsInstructionTemplate() {
+        let prompt = NMPChatPrompt.format(
+            messages: [msg(.user, "Hi")],
+            engine: "llamaCpp",
+            model: "llama-2-7b-chat")
+        XCTAssertEqual(prompt, "[INST] Hi [/INST]")
+    }
+
     func testTranscriptTemplateForReferenceEngine() {
         let prompt = NMPChatPrompt.format(
             messages: [msg(.system, "Talk like a pirate."),

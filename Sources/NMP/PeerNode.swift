@@ -45,6 +45,10 @@ public final class NMPPeerNode {
     /// requestID, layer range served, pure compute seconds.
     public var onServed: ((UInt32, Range<Int>, TimeInterval) -> Void)?
     public var onDiagnostic: ((String) -> Void)?
+    /// The mesh runs a DIFFERENT model than this node loaded (its shard
+    /// assignment was rejected). Carries the mesh's model tag — the app
+    /// should re-pick its engine to match and restart the node.
+    public var onModelMismatch: ((String) -> Void)?
 
     // MARK: State
 
@@ -157,6 +161,11 @@ public final class NMPPeerNode {
             shardEngine.onInferenceServed = { [weak self] requestID, layers, seconds in
                 self?.servedCount += 1
                 self?.onServed?(requestID, layers, seconds)
+            }
+            shardEngine.onModelMismatch = { [weak self] meshTag in
+                self?.onStatus?("mesh runs '\(meshTag)' but this peer loaded a "
+                                + "different model — assignment rejected")
+                self?.onModelMismatch?(meshTag)
             }
             shardEngine.onDiagnostic = { [weak self] message in
                 self?.onDiagnostic?(message)

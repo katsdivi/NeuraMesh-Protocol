@@ -88,13 +88,37 @@ re-decides on churn:
 - `nmp-dashboard --engine llamaShard` (no `--model`) auto-selects the best
   model from `~/models` for the host and shows the choice + reason.
 
-### Remaining (needs the target model + real devices)
+### Cross-device coordinator + live re-selection (2026-07-14, verified)
 
-- **Live re-selection in the running dashboard**: today it auto-selects at
-  startup; wiring the controller to reload models on live join/leave is the
-  last integration step, best validated on the real 14B across a Mac + iPhone.
-- **The 14B end-to-end run**, measured (the selector/shim are arch-generic for
-  qwen2/qwen3; llama-arch models need a NORMAL-RoPE shim variant first).
+- **Real sharded llama over the network** (not just in-process): `nmp-coordinator
+  --engine llamaShard --model M.gguf` splits ONE GGUF across the coordinator +
+  every real `nmp-peer --engine llamaShard` over UDP (Bonjour discovery, Noise
+  IK, float32 residual hand-off). The coordinator holds a shard AND tokenizes;
+  each device partial-loads only its range. Verified on Qwen-0.5B: 2-way (Mac
+  holds 0–11, peer 12–23) and 3-way splits both produce IDENTICAL, deterministic
+  text ("Paris. It is the largest city in Europe…"), no device holding the whole
+  model. One-command launcher: `scripts/run_sharded_mesh.sh`.
+- **Live re-selection is wired**: `nmp-dashboard` now runs `NMPAdaptiveModel
+  controller` on every REAL device join/leave (driven only by real
+  capabilities — the local host + real LAN peers, never the in-process
+  stand-ins), reports the decision (switch / reshard / degrade / no-fit) as a
+  mesh event, and exposes it at `GET /api/devices/metrics → adaptive_model`.
+  Bug fixed along the way: Bonjour TXT records now carry `storageFreeMB`, so the
+  selector can actually tell whether a discovered device has disk for a model
+  file (before, every peer read as 0 disk).
+
+### Remaining
+
+- **Real compute ON the iPhone**: the app now auto-selects the real shard
+  engine when a `.gguf` is in its Documents AND the ggml shard shim framework
+  is embedded (`scripts/setup_shard_ios.sh` builds `nmpshard.xcframework`; the
+  shim is CPU-only so no Metal shaders, and its source compiles for arm64-iOS).
+  The framework build + on-device run need a physical device + Apple signing to
+  validate — that is the last unproven link for the Mac + iPhone topology.
+- **The 14B end-to-end run**, measured. Download is one command
+  (`scripts/setup_qwen14b.sh`); Qwen2.5-14B is qwen2 arch, which the shim runs
+  (llama-arch models still need a NORMAL-RoPE shim variant first). Gated only on
+  devices with enough disk for the file.
 
 ### The earlier fake (preserved in history)
 
@@ -207,9 +231,33 @@ slab of VRAM," not for "keep it fully on my own devices."
 
 ## 3. Weight-vault role — disaggregate storage from compute
 
-**Status: not built. Depends conceptually on #1.**
+**Status: ✅ BUILT (2026-07-14). Each device now stores ≈ only its layers.**
 
-### The idea
+### What shipped
+
+The coordinator (which holds the full GGUF) is the vault. When it assigns a
+peer a layer range, it **slices the model in-process** (`NMPGGUFSlicer`, a
+zero-dependency Swift GGUF writer) and **streams only that shard's bytes** over
+the LAN (`NMPVaultServer`, plain HTTP — trusted-LAN, like the dashboard). A peer
+holding no local model (`NMPVaultShardComputeEngine`) fetches its slice on
+`SHARD_ASSIGN`, caches it on disk, opens it with the real ggml shard shim, and
+computes. So **disk ≈ RAM**: a phone stores ~its layers, not the whole model.
+
+Key property that made it cheap: **no C shim or compute-engine changes.** A
+slice keeps global block names + the full `block_count` and includes only the
+tensors that shard needs (mirroring the shim's `want()`), so it loads in the
+existing shim as-is. Weights move **once per range** (cached across joins),
+never per token — the per-token wire is still just the float32 residual.
+
+**Proven:** a 2-shard 0.5B run from per-shard slices is **bit-identical** to the
+whole-model run (`LlamaShardTests.testShardedGenerationFromSlicesMatchesFullModel`);
+live, a `nmp-peer` with **no model** streamed only its 209 MB slice (of a 469 MB
+model) and produced the correct deterministic output. The vault endpoint rides
+on `SHARD_ASSIGN` (backward-compatible trailing field); peers with a local
+`--model` ignore it. iOS streams the same way (`NSAllowsLocalNetworking` for the
+cleartext LAN fetch); the app's Models tab shows the shard cache.
+
+### Original idea (for reference)
 
 Three resources, not two: **storage** (flash — the iPhone has plenty),
 **RAM** (where weights must be resident to compute — scarce), and **compute**

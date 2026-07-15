@@ -63,6 +63,9 @@ struct CoordinatorArguments {
     /// Zero-trim token-state tensors (lossless, ~99% smaller llama
     /// messages). Requires a Phase 9 nmp-peer on the other end.
     var zeroTrim = false
+    /// Future Plan #3: TCP port for the weight-vault HTTP server (llamaShard).
+    /// 0 ⇒ an OS-chosen port (advertised to peers via SHARD_ASSIGN).
+    var vaultPort = 0
 
     static func parse() -> CoordinatorArguments {
         var arguments = CoordinatorArguments()
@@ -85,6 +88,7 @@ struct CoordinatorArguments {
             case "--speculation": arguments.speculation = true
             case "--draft-model": arguments.draftModelPath = value()
             case "--zero-trim": arguments.zeroTrim = true
+            case "--vault-port": arguments.vaultPort = value().flatMap(Int.init) ?? arguments.vaultPort
             case "--help", "-h":
                 print("""
                 usage: nmp-coordinator [--peers N] [--layers N] [--hidden N] \
@@ -111,8 +115,43 @@ var modelTag = arguments.modelTag
 /// Set in llamaCpp mode: the coordinator's VOCAB-ONLY handle (tokenizer +
 /// metadata, no weights — the remote peer owns those).
 var llamaModel: NMPLlamaModel?
+/// Set in llamaShard mode: the coordinator's tokenizer (vocab-only) plus its
+/// OWN sharded compute engine — the coordinator holds a layer sub-range too,
+/// so a Mac + iPhone genuinely splits the model (neither holds it whole).
+var llamaShardVocab: NMPLlamaModel?
+var llamaShardEngine: NMPLlamaShardComputeEngine?
+/// Future Plan #3: kept alive for the process lifetime so peers can stream slices.
+var retainedVaultServer: NMPVaultServer?
 
-if arguments.engineKind == "llamaCpp" {
+if arguments.engineKind == "llamaShard" {
+    guard let modelPath = arguments.modelPath ?? arguments.ggufPath else {
+        FileHandle.standardError.write(Data(
+            "--engine llamaShard requires --model path.gguf\n".utf8))
+        exit(2)
+    }
+    do {
+        let shardEngine = try NMPLlamaShardComputeEngine(modelPath: modelPath)
+        let vocab = try NMPLlamaModel(modelPath: modelPath, vocabOnly: true)
+        engine = shardEngine
+        llamaShardEngine = shardEngine
+        llamaShardVocab = vocab
+        // The tag the shard peers derive from the SAME GGUF (general.name),
+        // so their SHARD_ASSIGN accepts instead of rejecting on mismatch.
+        modelTag = shardEngine.modelTag
+        print("[coordinator] llamaShard (real ggml graph surgery): "
+              + "\(shardEngine.modelTag) — \(shardEngine.layerCount) layers × "
+              + "\(shardEngine.hiddenSize) hidden, vocab \(vocab.vocabSize)")
+        print("[coordinator] the coordinator holds a shard AND tokenizes; each "
+              + "device partial-loads ONLY its assigned layer range.")
+    } catch {
+        FileHandle.standardError.write(Data("""
+        failed to start llamaShard engine: \(error)
+        checklist: brew install ggml && scripts/setup_shard.sh, brew install llama.cpp && scripts/setup_llama.sh, and --model must point at a qwen2/qwen3 .gguf
+        \n
+        """.utf8))
+        exit(1)
+    }
+} else if arguments.engineKind == "llamaCpp" {
     guard let modelPath = arguments.modelPath else {
         FileHandle.standardError.write(Data("--engine llamaCpp requires --model path.gguf\n".utf8))
         exit(2)
@@ -329,6 +368,127 @@ func runLlamaGenerations(model: NMPLlamaModel) -> Never {
 
 if let llamaModel {
     runLlamaGenerations(model: llamaModel)
+}
+
+// MARK: - Phase 10: REAL sharded llama across devices
+
+/// Splits ONE real GGUF across the coordinator + every ready peer: each
+/// device partial-loads ONLY its assigned layer range (real ggml graph
+/// surgery), and just the residual (n_embd) crosses the wire per token.
+/// This is the true cross-device path — no single device holds the whole
+/// model. Never returns.
+func runLlamaShardGenerations(vocab: NMPLlamaModel,
+                              shardEngine: NMPLlamaShardComputeEngine) -> Never {
+    // The residual hand-off between shards must be lossless, or downstream
+    // shards compute on corrupted input (see LlamaShardEngine.swift).
+    node.orchestrator.activationWireFormat = .float32
+
+    // Future Plan #3: serve this model's slices so a peer holding no local model
+    // streams ONLY its assigned layers (disk ≈ RAM). The vault endpoint rides on
+    // every SHARD_ASSIGN; peers with a local --model ignore it.
+    let vaultServer = NMPVaultServer(modelPath: shardEngine.modelPath, modelTag: modelTag)
+    vaultServer.onDiagnostic = { print("[coordinator] \($0)") }
+    do {
+        try vaultServer.start(port: UInt16(arguments.vaultPort))
+        node.orchestrator.vaultEndpoint = "\(NMPLANIdentity.localHostname()):\(vaultServer.boundPort)"
+        retainedVaultServer = vaultServer
+        print("[coordinator] weight vault: http://\(node.orchestrator.vaultEndpoint)/vault "
+              + "— peers stream only their layers")
+    } catch {
+        print("[coordinator] vault server unavailable (\(error)) — peers must hold the model locally")
+    }
+
+    // Plan over the coordinator + all ready peers, then assign. planAndAssign
+    // includes localCapabilities, so the coordinator holds a shard too.
+    let planned = DispatchSemaphore(value: 0)
+    var plan: [NMPShardPlanEntry] = []
+    node.planAndAssign { result in
+        switch result {
+        case .failure(let error):
+            FileHandle.standardError.write(Data(
+                "shard assignment failed: \(error)\n".utf8))
+            exit(1)
+        case .success(let assigned):
+            plan = assigned
+            planned.signal()
+        }
+    }
+    planned.wait()
+
+    // Partial-load the coordinator's OWN range up front so its loaded MB is
+    // honest immediately (peers load their range lazily on first runLayers and
+    // print it in their own log).
+    var coordinatorLoadedMB = 0
+    if let mine = plan.first(where: { $0.peerID == node.localPeerID }) {
+        coordinatorLoadedMB = ((try? shardEngine.preload(
+            start: mine.startLayer, end: mine.endLayer)) ?? 0) / 1_048_576
+    }
+
+    let fileMB = ((try? FileManager.default.attributesOfItem(
+        atPath: shardEngine.modelPath)[.size] as? Int) ?? nil).map { $0 / 1_048_576 }
+
+    print("\n=== Sharded llama plan (model '\(modelTag)', "
+          + "\(shardEngine.layerCount) layers) ===")
+    for entry in plan {
+        let who = entry.peerID == node.localPeerID
+            ? "coordinator (this device, \(coordinatorLoadedMB) MB loaded)"
+            : "peer \(hex(entry.peerID))"
+        print("  shard \(entry.shardIndex): layers "
+              + "\(entry.startLayer)..<\(entry.endLayer) "
+              + "(\(entry.layerSpan) layers) → \(who)")
+    }
+    if let fileMB {
+        print("  whole model on disk: \(fileMB) MB — no single device holds it "
+              + "all in RAM (each loads only its \(plan.count)-way slice) ✅")
+    }
+    print("  wire: float32 residual (\(shardEngine.hiddenSize) floats/token), "
+          + "lossless — only the activation crosses the network, never weights.")
+
+    let service = NMPPromptInferenceService(
+        orchestrator: node.orchestrator,
+        codec: NMPLlamaShardPromptCodec(model: vocab))
+
+    print("\n=== \(arguments.runs) generation(s): \"\(arguments.prompt)\" "
+          + "(up to \(arguments.tokens) tokens) ===")
+    var texts: [String] = []
+    var bestTokensPerSecond = 0.0
+    for run in 1...max(1, arguments.runs) {
+        let done = DispatchSemaphore(value: 0)
+        service.run(prompt: arguments.prompt, maxTokens: arguments.tokens) { result in
+            switch result {
+            case .failure(let error):
+                FileHandle.standardError.write(Data("generation failed: \(error)\n".utf8))
+                exit(1)
+            case .success(let generation):
+                let tokensPerSecond = Double(generation.tokenCount)
+                    / max(generation.totalSeconds, 0.001)
+                bestTokensPerSecond = max(bestTokensPerSecond, tokensPerSecond)
+                texts.append(generation.text)
+                print("  run \(run): \(generation.tokenCount) tokens in "
+                      + "\(ms(generation.totalSeconds)) ms "
+                      + "(\(String(format: "%.2f", tokensPerSecond)) tok/s, "
+                      + "payload \(generation.networkPayloadBytes) B)")
+                print("    → \(generation.text)")
+            }
+            done.signal()
+        }
+        done.wait()
+    }
+
+    print("\n=== Results ===")
+    print("  engine: llamaShard (real model, TRUE layer sharding across "
+          + "\(plan.count) device-shard(s))")
+    print("  best throughput: \(String(format: "%.2f", bestTokensPerSecond)) tokens/s")
+    let deterministic = Set(texts).count == 1
+    print("  determinism: \(arguments.runs) runs "
+          + (deterministic ? "IDENTICAL output ✓ (greedy sampling)" : "DIVERGED ✗"))
+    print("  (single-device oracle: `nmp-dashboard --engine llamaShard "
+          + "--model <same.gguf>` and POST the same prompt — must match.)")
+    exit(deterministic ? 0 : 1)
+}
+
+if let llamaShardVocab, let llamaShardEngine {
+    runLlamaShardGenerations(vocab: llamaShardVocab, shardEngine: llamaShardEngine)
 }
 
 // MARK: - Shard assignment

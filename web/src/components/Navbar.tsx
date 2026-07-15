@@ -4,6 +4,7 @@ export type View =
   | 'dashboard'
   | 'run'
   | 'chat'
+  | 'models'
   | 'devices'
   | 'benchmark'
   | 'compare'
@@ -14,6 +15,7 @@ const TABS: { id: View; label: string }[] = [
   { id: 'dashboard', label: 'Mesh' },
   { id: 'run', label: 'Run' },
   { id: 'chat', label: 'Chat' },
+  { id: 'models', label: 'Models' },
   { id: 'devices', label: 'Devices' },
   { id: 'benchmark', label: 'Benchmark' },
   { id: 'compare', label: 'Compare' },

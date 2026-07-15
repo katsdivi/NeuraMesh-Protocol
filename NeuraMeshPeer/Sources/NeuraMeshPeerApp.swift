@@ -18,6 +18,10 @@ import Combine
 @main
 struct NeuraMeshPeerApp: App {
     @StateObject private var model = PeerViewModel()
+    @StateObject private var models = ModelManager()
+    // One Bonjour answer to "where is the mesh UI?", shared by Chat
+    // (generations) and Models (mesh-wide model switching).
+    @StateObject private var meshUI = MeshUILocator()
 
     var body: some Scene {
         WindowGroup {
@@ -25,10 +29,22 @@ struct NeuraMeshPeerApp: App {
                 PeerStatusView()
                     .environmentObject(model)
                     .tabItem { Label("Peer", systemImage: "antenna.radiowaves.left.and.right") }
+                ModelsView()
+                    .environmentObject(models)
+                    .environmentObject(model)
+                    .environmentObject(meshUI)
+                    .tabItem { Label("Models", systemImage: "shippingbox") }
                 ChatView()
+                    .environmentObject(meshUI)
                     .tabItem { Label("Chat", systemImage: "bubble.left.and.bubble.right") }
             }
-            .onAppear { model.start() }
+            .onAppear {
+                // Mesh-follow moves the selection when the mesh's model
+                // changes under us — the peer needs the store to do it.
+                model.modelStore = models
+                model.start()
+                meshUI.start()
+            }
         }
     }
 }

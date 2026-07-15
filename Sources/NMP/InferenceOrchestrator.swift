@@ -169,7 +169,18 @@ public final class NMPInferenceOrchestrator {
     private var measurements: [UInt32: Double] = [:]
     private var shares: [UInt32: Double] = [:]
     private var wireFormat: NMPActivationWireFormat = .float32
+    private var vaultEndpointValue = ""
     private let measurementsLock = NSLock()
+
+    /// Future Plan #3: "host:port" of the coordinator's weight-vault HTTP
+    /// server, stamped into every SHARD_ASSIGN so peers with no local model can
+    /// stream only their layers. Empty ⇒ peers must already hold the model.
+    public var vaultEndpoint: String {
+        get { measurementsLock.lock(); defer { measurementsLock.unlock() }
+              return vaultEndpointValue }
+        set { measurementsLock.lock(); defer { measurementsLock.unlock() }
+              vaultEndpointValue = newValue }
+    }
 
     private let localPeerID: UInt32
     private let engine: NMPShardComputeEngine
@@ -185,6 +196,9 @@ public final class NMPInferenceOrchestrator {
     private var reassemblers: [UInt32: NMPTensorReassembler] = [:]
 
     // Assignment round state.
+    /// The plan of the in-flight assignment round — committed to `plan`
+    /// only when every remote peer acks (see assignShards).
+    private var pendingPlan: [NMPShardPlanEntry]?
     private var pendingAcks: Set<UInt32> = []
     private var assignCompletion: ((Result<Void, NMPOrchestrationError>) -> Void)?
     private var assignTimer: DispatchSourceTimer?
@@ -277,22 +291,33 @@ public final class NMPInferenceOrchestrator {
             }
 
             // Notify standby members (fire-and-forget; never blocks the round).
+            let vault = vaultEndpoint
             let idle = NMPShardAssign(
                 shardIndex: 0, pipelineLength: UInt16(newPlan.count),
                 startLayer: 0, endLayer: 0,
                 totalLayers: UInt16(engine.layerCount),
-                hiddenSize: UInt32(engine.hiddenSize), modelTag: modelTag)
+                hiddenSize: UInt32(engine.hiddenSize), modelTag: modelTag,
+                vaultEndpoint: vault)
             for peerID in idlePeers where peerID != localPeerID {
                 connections[peerID]?.sendAsync(
                     packetType: .shardAssign, priority: .critical,
                     payload: idle.encode())
             }
 
-            plan = newPlan
+            // Stage the plan; commit only once every remote peer acks.
+            // Committing here (the old behavior) left a live divergence
+            // when a peer never acked: callers kept the previous plan
+            // (planAndAssign reported failure) while THIS routing table
+            // already pointed at the unassigned peer — every generation
+            // then died with notAssigned until the next successful
+            // re-shard. On failure the old plan keeps serving.
+            pendingPlan = newPlan
             pendingAcks = Set(remote.map(\.peerID))
             assignCompletion = completion
 
             guard !pendingAcks.isEmpty else {
+                plan = newPlan
+                pendingPlan = nil
                 assignCompletion = nil
                 completion(.success(()))
                 return
@@ -306,7 +331,7 @@ public final class NMPInferenceOrchestrator {
                     endLayer: UInt16(entry.endLayer),
                     totalLayers: UInt16(engine.layerCount),
                     hiddenSize: UInt32(engine.hiddenSize),
-                    modelTag: modelTag)
+                    modelTag: modelTag, vaultEndpoint: vault)
                 connections[entry.peerID]?.sendAsync(
                     packetType: .shardAssign,
                     priority: .critical,
@@ -335,6 +360,10 @@ public final class NMPInferenceOrchestrator {
     private func finishAssignment(_ result: Result<Void, NMPOrchestrationError>) {
         assignTimer?.cancel(); assignTimer = nil
         pendingAcks.removeAll()
+        if case .success = result, let staged = pendingPlan {
+            plan = staged
+        }
+        pendingPlan = nil
         let completion = assignCompletion
         assignCompletion = nil
         completion?(result)

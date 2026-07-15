@@ -273,4 +273,74 @@ final class LlamaShardTests: XCTestCase {
         XCTAssertFalse(first.isEmpty)
         XCTAssertEqual(first, second, "greedy shard generation must be deterministic")
     }
+
+    // MARK: Weight vault (Future Plan #3) — slice a model into per-shard GGUFs
+
+    /// A full-range slice with nothing dropped round-trips: same tensors and
+    /// same metadata. This validates the GGUF WRITER byte layout independently
+    /// of any device (the risky part of the slicer).
+    func testFullRangeSliceRoundTrips() throws {
+        let path = try ShardTestSupport.requireModelPath()
+        let original = try NMPGGUFModel.load(path: path)
+        let n = try XCTUnwrap(original.layerCount)
+
+        let out = NSTemporaryDirectory() + "nmp-slice-roundtrip-\(getpid()).gguf"
+        defer { try? FileManager.default.removeItem(atPath: out) }
+        try NMPGGUFSlicer.slice(modelPath: path, start: 0, end: n, to: out, dropKeys: [])
+
+        let round = try NMPGGUFModel.load(path: out)
+        XCTAssertEqual(Set(round.tensors.map(\.name)),
+                       Set(original.tensors.map(\.name)),
+                       "every tensor survives a full-range slice")
+        let origByName = Dictionary(uniqueKeysWithValues: original.tensors.map { ($0.name, $0) })
+        for t in round.tensors {
+            let o = try XCTUnwrap(origByName[t.name])
+            XCTAssertEqual(t.dimensions, o.dimensions, "\(t.name) dims")
+            XCTAssertEqual(t.ggmlTypeID, o.ggmlTypeID, "\(t.name) type")
+        }
+        XCTAssertEqual(round.metadata, original.metadata, "metadata survives verbatim")
+    }
+
+    /// THE PROOF: two engines built from PER-SHARD SLICES (each holding only its
+    /// layers) produce the exact whole-model greedy continuation — bit-identical
+    /// to running from the full file. This is disk ≈ RAM: no slice holds it all.
+    func testShardedGenerationFromSlicesMatchesFullModel() throws {
+        let path = try ShardTestSupport.requireModelPath()
+        let n = try NMPLlamaShard(modelPath: path, start: 0, end: -1).layerCount
+        let split = n / 2
+
+        let dir = NSTemporaryDirectory()
+        let loPath = dir + "nmp-vault-lo-\(getpid()).gguf"
+        let hiPath = dir + "nmp-vault-hi-\(getpid()).gguf"
+        defer {
+            try? FileManager.default.removeItem(atPath: loPath)
+            try? FileManager.default.removeItem(atPath: hiPath)
+        }
+        try NMPGGUFSlicer.slice(modelPath: path, start: 0, end: split, to: loPath)
+        try NMPGGUFSlicer.slice(modelPath: path, start: split, end: n, to: hiPath)
+
+        // Each slice is strictly smaller than the whole model — the disk win.
+        let fullBytes = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: path)[.size] as? Int)
+        let loBytes = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: loPath)[.size] as? Int)
+        let hiBytes = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: hiPath)[.size] as? Int)
+        XCTAssertLessThan(loBytes, fullBytes, "lo slice must not hold the whole model")
+        XCTAssertLessThan(hiBytes, fullBytes, "hi slice must not hold the whole model")
+
+        let loEngine = try NMPLlamaShardComputeEngine(modelPath: loPath)
+        let hiEngine = try NMPLlamaShardComputeEngine(modelPath: hiPath)
+        // Slices preserve the FULL block_count, so the engines agree on N.
+        XCTAssertEqual(loEngine.layerCount, n)
+        XCTAssertEqual(hiEngine.layerCount, n)
+
+        let got = try ShardTestSupport.generate(
+            engines: [(loEngine, 0, split), (hiEngine, split, n)],
+            prompt: ShardTestSupport.promptTokens,
+            count: ShardTestSupport.goldenContinuation.count,
+            hiddenSize: loEngine.hiddenSize)
+        XCTAssertEqual(got, ShardTestSupport.goldenContinuation,
+                       "sharded-from-slices output must match the whole-model oracle")
+    }
 }

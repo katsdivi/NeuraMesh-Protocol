@@ -4,17 +4,14 @@
 //
 //  Chat with the mesh from the phone that powers it. The coordinator's
 //  web server owns the generation pipeline (POST /api/chat assembles the
-//  engine's template server-side — same one the web UI uses); this view
-//  finds it via the `_neuramesh-ui._tcp` Bonjour advert, whose TXT record
-//  carries the UI's real host + port (the advert itself sits on a
-//  throwaway ephemeral listener).
+//  engine's template server-side — same one the web UI uses); the shared
+//  MeshUILocator finds it via the `_neuramesh-ui._tcp` Bonjour advert.
 //
 //  The conversation lives in this view; the mesh is stateless — every
 //  turn resends the whole transcript.
 //
 
 import SwiftUI
-import Network
 
 @MainActor
 final class MeshChatModel: ObservableObject {
@@ -29,44 +26,9 @@ final class MeshChatModel: ObservableObject {
     @Published var turns: [Turn] = []
     @Published var draft = ""
     @Published var generating = false
-    @Published var statusLine = "Looking for the mesh UI…"
     @Published var lastStats = ""
-    @Published private(set) var baseURL: URL?
 
-    private var browser: NWBrowser?
-    private let browseQueue = DispatchQueue(label: "nmp.peer.chat.browse")
-
-    func start() {
-        guard browser == nil else { return }
-        let browser = NWBrowser(
-            for: .bonjourWithTXTRecord(
-                type: "_neuramesh-ui._tcp", domain: nil),
-            using: NWParameters())
-        browser.browseResultsChangedHandler = { [weak self] results, _ in
-            // First advert wins; the TXT record names the real UI socket.
-            guard case .bonjour(let txt)? = results.first?.metadata,
-                  let host = txt.dictionary["host"],
-                  let port = txt.dictionary["port"],
-                  let url = URL(string: "http://\(host):\(port)") else {
-                Task { @MainActor [weak self] in
-                    self?.baseURL = nil
-                    self?.statusLine = results.isEmpty
-                        ? "Looking for the mesh UI…"
-                        : "Mesh found, but its advert has no host — "
-                          + "update the coordinator"
-                }
-                return
-            }
-            Task { @MainActor [weak self] in
-                self?.baseURL = url
-                self?.statusLine = "Mesh: \(host):\(port)"
-            }
-        }
-        browser.start(queue: browseQueue)
-        self.browser = browser
-    }
-
-    func send() {
+    func send(to baseURL: URL?) {
         let content = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !content.isEmpty, !generating, let baseURL else { return }
         turns.append(Turn(role: .user, text: content))
@@ -128,15 +90,22 @@ final class MeshChatModel: ObservableObject {
 }
 
 struct ChatView: View {
+    @EnvironmentObject private var mesh: MeshUILocator
     @StateObject private var model = MeshChatModel()
+    // Keyboard focus is explicit so it can always be RELEASED: dragging
+    // the conversation, tapping outside the composer, the keyboard's Done
+    // button, and sending all dismiss it — without this, the keyboard
+    // covered the tab bar with no way down (the composer's multiline
+    // TextField swallows Return as a newline, so onSubmit never fires).
+    @FocusState private var composing: Bool
 
     var body: some View {
         VStack(spacing: 0) {
             HStack {
                 Circle()
-                    .fill(model.baseURL == nil ? .orange : .green)
+                    .fill(mesh.baseURL == nil ? .orange : .green)
                     .frame(width: 8, height: 8)
-                Text(model.statusLine)
+                Text(mesh.statusLine)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -177,6 +146,9 @@ struct ChatView: View {
                     }
                     .padding(.vertical, 8)
                 }
+                .scrollDismissesKeyboard(.immediately)
+                .contentShape(Rectangle())
+                .onTapGesture { composing = false }
                 .onChange(of: model.turns) { _ in
                     if let last = model.turns.last {
                         withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
@@ -196,20 +168,27 @@ struct ChatView: View {
                           axis: .vertical)
                     .lineLimit(1...4)
                     .textFieldStyle(.roundedBorder)
-                    .onSubmit { model.send() }
+                    .focused($composing)
                 Button {
-                    model.send()
+                    composing = false
+                    model.send(to: mesh.baseURL)
                 } label: {
                     Image(systemName: "arrow.up.circle.fill")
                         .font(.title2)
                 }
-                .disabled(model.generating || model.baseURL == nil
+                .disabled(model.generating || mesh.baseURL == nil
                           || model.draft.trimmingCharacters(
                                 in: .whitespacesAndNewlines).isEmpty)
             }
             .padding()
         }
-        .onAppear { model.start() }
+        .toolbar {
+            ToolbarItemGroup(placement: .keyboard) {
+                Spacer()
+                Button("Done") { composing = false }
+            }
+        }
+        .onAppear { mesh.start() }
     }
 
     @ViewBuilder

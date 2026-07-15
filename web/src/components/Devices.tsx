@@ -169,16 +169,20 @@ export function Devices() {
               <div className="metric-value">{totals.layers_assigned}</div>
               <div className="metric-sub">across all shards</div>
             </div>
-            <div className="metric-card">
-              <div className="metric-label">Mesh traffic</div>
-              <div className="metric-value">{fmtBps(totals.net_bytes_per_sec)}</div>
-              <div className="metric-sub">live, both directions, measured on the wire</div>
-            </div>
-            <div className="metric-card">
-              <div className="metric-label">Requests served</div>
-              <div className="metric-value">{totals.requests_served.toLocaleString()}</div>
-              <div className="metric-sub">shard computations since startup</div>
-            </div>
+            {totals.net_bytes_per_sec !== undefined && (
+              <div className="metric-card">
+                <div className="metric-label">Mesh traffic</div>
+                <div className="metric-value">{fmtBps(totals.net_bytes_per_sec)}</div>
+                <div className="metric-sub">live, both directions, measured on the wire</div>
+              </div>
+            )}
+            {totals.requests_served !== undefined && (
+              <div className="metric-card">
+                <div className="metric-label">Requests served</div>
+                <div className="metric-value">{totals.requests_served.toLocaleString()}</div>
+                <div className="metric-sub">shard computations since startup</div>
+              </div>
+            )}
           </div>
         </>
       )}

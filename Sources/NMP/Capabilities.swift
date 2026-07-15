@@ -313,6 +313,10 @@ public struct NMPCapabilities: Equatable, Sendable {
             "load": String(Int(currentLoadPercent.clamped(to: 0...100).rounded())),
             "tps": String(format: "%.2f", maxInferenceTokensPerSecond),
             "fmt": modelFormats.joined(separator: ","),
+            // Free storage (MB) so the adaptive model selector can tell whether
+            // a discovered device has disk for a model FILE (e.g. the 14B GGUF)
+            // — without it every peer reads as 0 disk and can host nothing.
+            "disk": String(storageFreeMB),
         ]
         if udpPort != 0 { dict["port"] = String(udpPort) }
         if let key = noiseStaticPublicKey { dict["pk"] = key.base64EncodedString() }
@@ -345,7 +349,8 @@ public struct NMPCapabilities: Equatable, Sendable {
             maxInferenceTokensPerSecond: dict["tps"].flatMap(Double.init) ?? 0,
             modelFormats: formats,
             udpPort: dict["port"].flatMap(UInt16.init) ?? 0,
-            noiseStaticPublicKey: publicKey
+            noiseStaticPublicKey: publicKey,
+            storageFreeMB: dict["disk"].flatMap(UInt32.init) ?? 0
         )
     }
 }

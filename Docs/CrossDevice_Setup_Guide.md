@@ -200,6 +200,90 @@ weights before that), all three devices serving, and the same
 
 ---
 
+## Level 4 — Real sharded LLM (Qwen-14B), no single device holds it whole
+
+Levels 1–3 run the weightless reference engine (proves transport + sharding).
+This level runs a **real quantized model** split across devices via the ggml
+graph-surgery shim: each device partial-loads ONLY its assigned layer range,
+and just the residual (one activation vector) crosses the wire per token.
+
+### 4.0 One-time: build the shim (Mac)
+
+```bash
+brew install ggml llama.cpp
+cd NeuraMeshProtocol
+scripts/setup_shard.sh          # → Vendor/llama/libnmpshard.dylib (ggml graph surgery)
+scripts/setup_llama.sh          # → Vendor/llama/libnmpllama.dylib (tokenizer)
+```
+
+### 4.1 Smoke test on the 0.5B first (verified)
+
+One command starts a coordinator + a local shard peer over real UDP and splits
+the model — a genuine multi-process split, no second machine needed:
+
+```bash
+scripts/run_sharded_mesh.sh                 # 0.5B, coordinator + 1 local peer
+```
+
+**You should see** a plan like `shard 0: layers 0..<12 → coordinator`,
+`shard 1: layers 12..<24 → peer …`, `no single device holds it all ✅`, real
+text (`Paris. It is the largest city in Europe…`), and `determinism: IDENTICAL
+✓`. That is real layer sharding across two processes.
+
+### 4.2 Download Qwen-14B (storage-aware)
+
+```bash
+scripts/setup_qwen14b.sh q4_k_m             # ~8.9 GB → ~/models (q3_k_m / q2_k = smaller)
+```
+
+**Storage rule:** each device that HOSTS a shard needs free disk for the WHOLE
+GGUF (it reads its layers from the full file), even though it only loads its
+slice into RAM. Pick a quant that fits your *smallest* hosting device's disk.
+
+### 4.3 Split the 14B across devices
+
+Only the **coordinator Mac** needs the full GGUF. Every other device streams
+**only its assigned layers** from the coordinator's weight vault (Future Plan #3)
+and stores ≈ its layers, not the whole model — so a phone with little free space
+still hosts a shard of a 14B model.
+
+- **Mac + another Mac**: on the 2nd Mac, either copy the GGUF and run
+  `swift run nmp-peer --engine llamaShard --model <same.gguf>`, **or** run it with
+  **no** `--model` — `swift run nmp-peer --engine llamaShard` — to stream its
+  slice from the coordinator instead of storing the whole file. On this Mac:
+  `swift run nmp-coordinator --engine llamaShard --model ~/models/Qwen2.5-14B-Instruct-Q4_K_M.gguf --peers 1 --wait 60`.
+- **Mac + iPhone** (real phone compute — see § below): the phone runs the
+  NeuraMeshPeer app with the shard shim framework embedded; it **streams** its
+  shard automatically — no model file to place.
+
+### 4.4 The dashboard picks the model for you (adaptive tiering)
+
+`swift run nmp-dashboard` now re-picks the OPTIMAL model in `~/models` on every
+real device join/leave — storage + RAM aware, driven only by real devices. As
+your iPhone joins, watch the event log: *"🧠 adaptive model … → Qwen2.5-14B …"*
+(or a smaller model if a device lacks disk). The choice is in
+`GET /api/devices/metrics` → `adaptive_model`.
+
+### Real compute on iPhone (the one remaining native step)
+
+The iPhone app streams its shard automatically once the ggml shard shim
+framework is embedded — **no model file to place.** Build + embed the framework:
+
+```bash
+scripts/setup_shard_ios.sh                  # → Vendor/ios/nmpshard.xcframework (needs cmake)
+```
+
+Then in Xcode: NeuraMeshPeer target → *Frameworks, Libraries, and Embedded
+Content* → add `nmpshard.xcframework` → **Embed & Sign**; build to your device
+with your signing team. On join, the phone streams **only its assigned layers**
+from the coordinator's vault, caches them, and reports *"vault mode — streaming
+its layers"* → then computes for real. (If you prefer, you can still download a
+full model in the app's Models tab for standalone use — but it's optional.) The
+framework build + on-device run require your device and Apple signing — validate
+there.
+
+---
+
 ## FAQ
 
 **Where's the real 7B model in all this?** Phase 5 runs the mesh with a

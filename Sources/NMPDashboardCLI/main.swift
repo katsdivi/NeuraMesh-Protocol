@@ -667,6 +667,74 @@ func runLlamaDashboard(model: NMPLlamaModel, arguments: DashboardArguments) -> N
 
 // MARK: - Phase 10: llamaShard engine mode (TRUE cross-device sharding)
 
+/// The installed models in ~/models with the compatibility flags the web UI
+/// needs to let you pick ANY model and honestly flag the ones that won't work:
+///   • compatible — the shard shim runs its architecture (qwen2/qwen3 only)
+///   • fits_host  — this Mac has the RAM to hold it (the in-process split loads
+///                  the whole model across shards on THIS box)
+///   • recommended — the highest-quality compatible model that fits
+///   • active     — the model this mesh is currently serving
+func shardModelCatalogJSON(currentPath: String) -> [[String: Any]] {
+    let hostRAM = Int(NMPSystemCapabilityProbe.measure(peerID: 0x0000_0001).ramMB)
+    let fitsRAM: (NMPModelCandidate) -> Bool = { Double($0.fileMB) <= Double(hostRAM) * 0.7 }
+    let all = NMPModelCatalog.scan(directory: "~/models")   // highest quality first
+    let recommendedPath = all.first {
+        $0.architecture.hasPrefix("qwen") && fitsRAM($0)
+    }?.path
+    let activeExpanded = (currentPath as NSString).expandingTildeInPath
+
+    return all.map { c in
+        let compatible = c.architecture.hasPrefix("qwen")
+        let fits = fitsRAM(c)
+        var notes: [String] = []
+        if !compatible {
+            notes.append("architecture ‘\(c.architecture)’ isn’t supported yet "
+                         + "(the shard shim runs qwen2/qwen3 only)")
+        }
+        if !fits {
+            notes.append("needs ~\(c.fileMB) MB in RAM; this host has \(hostRAM) MB "
+                         + "— add a device or use a smaller quant")
+        }
+        return [
+            "path": c.path,
+            "name": c.name,
+            "arch": c.architecture,
+            "size_mb": c.fileMB,
+            "params": c.totalParameters,
+            "layers": c.layerCount,
+            "bits_per_weight": (c.bitsPerWeight * 10).rounded() / 10,
+            "compatible": compatible,
+            "fits_host": fits,
+            "usable": compatible && fits,
+            "recommended": c.path == recommendedPath,
+            "active": (c.path as NSString).expandingTildeInPath == activeExpanded,
+            "note": notes.joined(separator: "; "),
+        ]
+    }
+}
+
+/// Re-exec THIS dashboard process onto a different --model. Keeps the same PID
+/// (so the launching `start.sh` / terminal Ctrl-C still owns it) and the same
+/// cwd (so the dlopen'd shim in Vendor/ still resolves). Used by the web UI's
+/// model picker — the mesh restarts and the page's WebSocket reconnects.
+enum NMPProcessRelaunch {
+    static func relaunch(withModel modelPath: String) {
+        var args = CommandLine.arguments
+        if let i = args.firstIndex(of: "--model"), i + 1 < args.count {
+            args[i + 1] = modelPath
+        } else {
+            args.append(contentsOf: ["--model", modelPath])
+        }
+        // execv wants a NULL-terminated C argv; strdup each (leaked, but we're
+        // about to replace the whole image anyway).
+        let cArgs: [UnsafeMutablePointer<CChar>?] = args.map { strdup($0) } + [nil]
+        execv(args[0], cArgs)
+        // Only reached if execv failed — stay honest and exit loudly.
+        perror("nmp-dashboard: model-switch relaunch failed (execv)")
+        exit(1)
+    }
+}
+
 /// Real sharded dashboard: N in-process peers, each partial-loading ONLY its
 /// layer range via the ggml graph-surgery shim, chained over the full NMP
 /// stack. The Devices panel shows each peer's MEASURED layer range and loaded
@@ -675,54 +743,39 @@ func runLlamaDashboard(model: NMPLlamaModel, arguments: DashboardArguments) -> N
 /// shim (for the tokenizer). Never returns.
 func runLlamaShardDashboard(modelPath: String, selectionReason: String? = nil,
                             arguments: DashboardArguments) -> Never {
-    let shardCount: Int
-    if case .sharded(let n) = arguments.placement { shardCount = max(2, n) } else { shardCount = 2 }
-
-    // Engines in shardIndex order (engine[0] is reused by the testbed as peer 0).
-    var shardEngines: [NMPLlamaShardComputeEngine] = []
+    // The coordinator runs the ggml shard engine on its OWN layer range AND
+    // tokenizes; real LAN peers (a second Mac's nmp-peer, or the iPhone app)
+    // join over UDP via Bonjour and are handed their own sub-ranges. The split
+    // RE-SHARDS live on every join/leave, a peer with no local model streams
+    // only its layers from the weight vault, and all of it is visible in the
+    // browser (Mesh/Devices tabs). Needs the shard shim + the tokenizer shim.
+    let expandedPath = (modelPath as NSString).expandingTildeInPath
+    let coordinatorEngine: NMPLlamaShardComputeEngine
     let vocab: NMPLlamaModel
-    let testbed: NMPLlamaTestbed
-    let plan: [NMPShardPlanEntry]
     do {
-        let first = try NMPLlamaShardComputeEngine(modelPath: modelPath)
-        shardEngines.append(first)
+        coordinatorEngine = try NMPLlamaShardComputeEngine(modelPath: modelPath)
         vocab = try NMPLlamaModel(modelPath: modelPath, vocabOnly: true)
-        print("[nmp-dashboard] llamaShard engine: \(first.modelTag) — "
-              + "\(first.layerCount) layers × \(first.hiddenSize) hidden, "
-              + "\(shardCount)-way split")
-        testbed = try NMPLlamaTestbed(
-            engine: first, modelTag: first.modelTag,
-            placement: .sharded(shardCount: shardCount),
-            engineFactory: {
-                let extra = try NMPLlamaShardComputeEngine(modelPath: modelPath)
-                shardEngines.append(extra)
-                return extra
-            })
-        plan = try testbed.startSync()
     } catch {
         fatalError("llamaShard mesh assembly failed: \(error) "
                    + "(needs scripts/setup_shard.sh + scripts/setup_llama.sh)")
     }
+    let modelTag = coordinatorEngine.modelTag
+    let layerCount = coordinatorEngine.layerCount
+    print("[nmp-dashboard] llamaShard engine: \(modelTag) — "
+          + "\(layerCount) layers × \(coordinatorEngine.hiddenSize) hidden; "
+          + "real LAN peers join live and re-shard")
 
-    // Partial-load each peer's range up front so loaded MB is real immediately,
-    // and print the honest split.
-    let fullModelBytes = (try? FileManager.default
-        .attributesOfItem(atPath: (modelPath as NSString).expandingTildeInPath)[.size] as? Int) ?? nil
-    var loadedByPeer: [UInt32: Int] = [:]
-    for (i, entry) in plan.enumerated() where i < shardEngines.count {
-        let bytes = (try? shardEngines[i].preload(start: entry.startLayer, end: entry.endLayer)) ?? 0
-        loadedByPeer[entry.peerID] = bytes
-    }
-    let devices = NMPShardReport.devices(plan: plan, loadedBytesByPeer: loadedByPeer)
-    print("[nmp-dashboard] real sharding — each peer holds ONLY its layers:")
-    for device in devices {
-        print("  - peer 0x\(String(device.peerID, radix: 16)) shard \(device.shardIndex): \(device.summary)")
-    }
-    if let full = fullModelBytes {
-        let honest = NMPShardReport.noPeerHoldsWholeModel(devices, fullModelBytes: full)
-        print("  (whole model \(String(format: "%.1f", Double(full) / 1_048_576)) MB — "
-              + (honest ? "no peer holds it all ✅" : "⚠️ a peer holds the whole model"))
-    }
+    // Honest per-peer loaded MB: the shim partial-loads exactly its blocks, so a
+    // shard's RAM ≈ its layer span × the model's measured bytes/layer.
+    let fullModelBytes = ((try? FileManager.default
+        .attributesOfItem(atPath: expandedPath)[.size]) as? Int) ?? 0
+    let perLayerBytes = NMPModelCatalog.candidate(path: expandedPath)?.bytesPerLayer
+        ?? (layerCount > 0 ? fullModelBytes / layerCount : 0)
+
+    let nodeQueue = DispatchQueue(label: "nmp.dashboard.shard.node")
+    let node = NMPCoordinatorNode(engine: coordinatorEngine, modelTag: modelTag, queue: nodeQueue)
+    node.orchestrator.activationWireFormat = .float32 // lossless residual hand-off
+    node.onStatus = { print("[nmp-dashboard] \($0)") }
 
     let server = NMPDashboardServer()
     server.onDiagnostic = { print("[nmp-dashboard] \($0)") }
@@ -730,28 +783,169 @@ func runLlamaShardDashboard(modelPath: String, selectionReason: String? = nil,
     catch { fatalError("dashboard server failed to start: \(error)") }
     print("[nmp-dashboard] dashboard running at http://localhost:\(server.boundPort)")
 
-    // Seed the Devices panel with real ranges + loaded MB.
-    server.updatePeerState(
-        peerID: testbed.coordinatorID, name: "coordinator (tokenizer)",
-        latencyMS: 0, loadPercent: 0, assigned: "tokenizer only", alive: true)
-    for device in devices {
-        server.updatePeerState(
-            peerID: device.peerID, name: "shard-peer-\(device.shardIndex) (in-process)",
-            latencyMS: 0, loadPercent: 0, assigned: device.summary, alive: true)
+    // Weight vault (Future Plan #3): a peer with NO local model streams ONLY its
+    // assigned layers from here (disk ≈ RAM) — the iPhone path.
+    let vaultServer = NMPVaultServer(modelPath: expandedPath, modelTag: modelTag)
+    vaultServer.onDiagnostic = { print("[nmp-dashboard] \($0)") }
+    // Start the vault OFF the setup path — its NWListener can take a moment to
+    // come up, and the UI must wire immediately. `vaultEndpoint` is set well
+    // before any peer can realistically discover + join, and rides on each
+    // SHARD_ASSIGN, so peers with no local model stream their layers from here.
+    DispatchQueue.global(qos: .userInitiated).async {
+        do {
+            try vaultServer.start(port: 0)
+            let endpoint = "\(NMPLANIdentity.localHostname()):\(vaultServer.boundPort)"
+            node.orchestrator.vaultEndpoint = endpoint
+            print("[nmp-dashboard] weight vault: http://\(endpoint)/vault — peers stream only their layers")
+        } catch {
+            print("[nmp-dashboard] vault unavailable (\(error)) — peers must hold the model locally")
+        }
     }
-    testbed.onInferenceServed = { peerID, layers, seconds in
-        let idx = plan.firstIndex { $0.peerID == peerID }?.description ?? "?"
-        server.updatePeerState(
-            peerID: peerID, name: "shard-peer-\(idx) (in-process)",
-            latencyMS: Int(seconds * 1000), loadPercent: 0,
-            assigned: NMPShardReport.devices(plan: plan, loadedBytesByPeer: loadedByPeer)
-                .first { $0.peerID == peerID }?.summary
-                ?? "layers \(layers.lowerBound)-\(layers.upperBound - 1)",
-            alive: true)
+
+    // Live split + loaded bytes + membership + adaptive choice, all
+    // stateQueue-owned so the UI reads a consistent snapshot.
+    let stateQueue = DispatchQueue(label: "nmp.dashboard.shard.state")
+    let hostCaps = NMPSystemCapabilityProbe.measure(peerID: node.localPeerID)
+    var currentPlan: [NMPShardPlanEntry] = []
+    var loadedByPeer: [UInt32: Int] = [:]
+    var peerNames: [UInt32: String] = [node.localPeerID: "coordinator (this Mac)"]
+    var memberCaps: [UInt32: NMPCapabilities] = [hostCaps.peerID: hostCaps]
+    var adaptiveChoice: (name: String, reason: String, decision: String, devices: Int)?
+
+    // The adaptive controller needs a catalog scan of ~/models, which parses
+    // every GGUF there (seconds if a big model is present) — so build it in the
+    // BACKGROUND and report once it is ready, rather than blocking the UI wire.
+    var modelController: NMPAdaptiveModelController? // stateQueue-owned
+    DispatchQueue.global(qos: .utility).async {
+        let catalog = NMPModelCatalog.scan(directory: "~/models")
+            .filter { $0.architecture.hasPrefix("qwen") }
+        stateQueue.async {
+            modelController = NMPAdaptiveModelController(catalog: catalog)
+            reportAdaptive()
+        }
+    }
+
+    func shortName(_ id: UInt32) -> String {
+        peerNames[id] ?? "peer 0x\(String(id, radix: 16))"
+    }
+
+    // Push the current split to the Devices/Mesh tabs. MUST run on stateQueue.
+    func pushShardDevices() {
+        for device in NMPShardReport.devices(plan: currentPlan, loadedBytesByPeer: loadedByPeer) {
+            let isCoord = device.peerID == node.localPeerID
+            server.updatePeerState(
+                peerID: device.peerID,
+                name: isCoord ? "coordinator (tokenizer + shard)" : shortName(device.peerID),
+                latencyMS: 0, loadPercent: 0,
+                assigned: isCoord ? "\(device.summary) · tokenizer" : device.summary,
+                alive: true)
+        }
+    }
+
+    // Report which model the CURRENT real mesh would optimally run (surfaced in
+    // the UI; switching is a click in the Models tab, never auto-disruptive).
+    // MUST run on stateQueue (reads memberCaps, mutates adaptiveChoice).
+    func reportAdaptive() {
+        guard let modelController else { return }
+        let members = Array(memberCaps.values)
+        let word = members.count == 1 ? "device" : "devices"
+        switch modelController.evaluate(mesh: members) {
+        case .switchModel(_, let to):
+            adaptiveChoice = (to.model.name, to.reason, "switch", members.count)
+            if to.model.name != modelTag {
+                server.reportMeshEvent("🧠 adaptive: \(members.count) real \(word) → "
+                    + "\(to.model.name) now optimal (\(to.reason)) — switch in the Models tab")
+            }
+        case .reshard(let sel), .unchanged(let sel):
+            adaptiveChoice = (sel.model.name, sel.reason, "fits", members.count)
+        case .noModelFits:
+            adaptiveChoice = nil
+        }
+    }
+
+    // (Re)plan across the coordinator + all ready peers and push the new split
+    // to the UI. Called on startup and on every real join/leave. The
+    // coordinator's own engine re-learns its range from the SHARD_ASSIGN and
+    // lazy-loads it on the next token (Phase A churn-safe re-prefill).
+    func reshard(trigger: String, attempt: Int = 0) {
+        node.planAndAssign { result in
+            switch result {
+            case .failure(let error):
+                if case .assignmentRejected(let peerID, .rejectedModelMismatch) = error {
+                    server.reportMeshEvent("⚠️ \(shortName(peerID)) holds a DIFFERENT "
+                        + "model than this mesh (\(modelTag)) — it stays connected but "
+                        + "shard-less. Select the same model on both devices, or remove "
+                        + "the phone's local model so it streams layers from the vault.")
+                } else {
+                    server.reportMeshEvent("⚠️ re-shard failed (\(trigger)): \(error)")
+                }
+                // The orchestrator kept the previous plan, so inference
+                // still runs — but a joined peer would stay shard-less
+                // until the next join/leave. One delayed retry covers the
+                // common transient (a slow first vault stream on a phone).
+                // A rejection is deterministic (e.g. the peer holds a
+                // DIFFERENT model) — retrying can't change its answer.
+                if case .assignmentRejected = error { return }
+                if attempt < 1 {
+                    stateQueue.asyncAfter(deadline: .now() + 5) {
+                        reshard(trigger: "\(trigger) · retry", attempt: attempt + 1)
+                    }
+                }
+            case .success(let plan):
+                stateQueue.async {
+                    currentPlan = plan
+                    loadedByPeer = Dictionary(uniqueKeysWithValues:
+                        plan.map { ($0.peerID, max(0, $0.layerSpan) * perLayerBytes) })
+                    pushShardDevices()
+                    server.meshInfo.shardCount = plan.count
+                    let split = plan.map {
+                        "L\($0.startLayer)–\($0.endLayer - 1)→\(shortName($0.peerID))"
+                    }.joined(separator: "  ")
+                    let honest = fullModelBytes > 0 && plan.count > 1
+                        ? " (no device holds all \(fullModelBytes / 1_048_576) MB)" : ""
+                    server.reportMeshEvent("🧩 re-sharded (\(trigger)) → "
+                        + "\(plan.count) shard(s): \(split)\(honest)")
+                    reportAdaptive()
+                }
+                // Replace the coordinator's estimate with its REAL loaded bytes:
+                // partial-loading its range also brings token_embd (first shard),
+                // output (last shard), or the whole model when it is the only
+                // shard — so the number can't under-report what this Mac holds.
+                if let mine = plan.first(where: { $0.peerID == node.localPeerID }) {
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        _ = try? coordinatorEngine.preload(start: mine.startLayer, end: mine.endLayer)
+                        let real = coordinatorEngine.loadedBytes
+                        guard real > 0 else { return }
+                        stateQueue.async {
+                            loadedByPeer[node.localPeerID] = real
+                            pushShardDevices()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    node.onPeerReady = { caps in
+        stateQueue.async {
+            memberCaps[caps.peerID] = caps
+            peerNames[caps.peerID] = caps.deviceName
+        }
+        server.reportMeshEvent("📱 \(caps.deviceName) joined "
+            + "(\(caps.computeClass.label), \(caps.ramMB) MB) — re-sharding to include it")
+        reshard(trigger: "join: \(caps.deviceName)")
+    }
+    node.onPeerLost = { id in
+        stateQueue.async {
+            memberCaps[id] = nil
+            peerNames[id] = nil
+        }
+        server.reportMeshEvent("📴 peer 0x\(String(id, radix: 16)) left — re-sharding")
+        reshard(trigger: "leave: 0x\(String(id, radix: 16))")
     }
 
     let promptService = NMPPromptInferenceService(
-        orchestrator: testbed.orchestrator,
+        orchestrator: node.orchestrator,
         codec: NMPLlamaShardPromptCodec(model: vocab))
     promptService.onProgress = { done, total in
         server.updateInferenceProgress(
@@ -764,10 +958,11 @@ func runLlamaShardDashboard(modelPath: String, selectionReason: String? = nil,
     }
 
     server.onInferenceRequest = { request, respond in
+        let shards = stateQueue.sync { currentPlan.count }
         server.reportGenerationStarted(
             prompt: request.prompt, maxTokens: request.maxTokens, speculative: false)
         server.reportMeshEvent("🌐 sharded inference: up to \(request.maxTokens) token(s) "
-                               + "across \(shardCount) shard(s)")
+                               + "across \(shards) shard(s)")
         promptService.run(prompt: request.prompt, maxTokens: request.maxTokens) { result in
             switch result {
             case .success(let generation):
@@ -789,66 +984,158 @@ func runLlamaShardDashboard(modelPath: String, selectionReason: String? = nil,
         }
     }
 
+    // Benchmark tab + the measured NMP-vs-TCP/QUIC transport race both drive the
+    // SAME real sharded pipeline (they take a run-inference closure), so they
+    // work unchanged in shard mode. (Packet-loss injection is NOT wired here: the
+    // shard coordinator is a REAL UDP mesh, not the in-process loopback, so loss
+    // testing is `sudo scripts/loss_lab.sh`, per Docs.)
+    wireBenchmark(server: server) { prompt, maxTokens, completion in
+        promptService.run(prompt: prompt, maxTokens: maxTokens, completion: completion)
+    }
+    wireComparisonRun(server: server) { request, completion in
+        promptService.run(prompt: request.prompt, maxTokens: request.maxTokens,
+                          completion: completion)
+    }
+
     server.onDeviceMetricsRequest = { respond in
         let sample = resourceMonitor.sample()
-        var peers: [[String: Any]] = [[
-            "id": String(testbed.coordinatorID, radix: 16),
-            "name": "coordinator (tokenizer)", "alive": true,
-            "assigned": "tokenizer only", "compute_share": 1.0,
-            "computing": false, "is_coordinator": true,
-            "link": "local — no network hop",
-        ]]
-        for device in devices {
+        let (planSnap, loadedSnap, namesSnap, choiceSnap) = stateQueue.sync {
+            (currentPlan, loadedByPeer, peerNames, adaptiveChoice)
+        }
+        var peers: [[String: Any]] = []
+        for device in NMPShardReport.devices(plan: planSnap, loadedBytesByPeer: loadedSnap) {
+            let isCoord = device.peerID == node.localPeerID
             peers.append([
                 "id": String(device.peerID, radix: 16),
-                "name": "shard-peer-\(device.shardIndex) (in-process)",
+                "name": isCoord ? "coordinator (tokenizer + shard)"
+                    : (namesSnap[device.peerID] ?? "peer 0x\(String(device.peerID, radix: 16))"),
                 "alive": true,
-                "assigned": device.summary,
+                "assigned": isCoord ? "\(device.summary) · tokenizer" : device.summary,
                 "layers_loaded": device.layerCount,
                 "loaded_mb": device.loadedMB,
-                "compute_share": 1.0,
+                "compute_share": Double(device.layerCount) / Double(max(1, layerCount)),
                 "computing": false,
-                "is_coordinator": false,
-                "link": "in-process link (full NMP stack: Noise IK, AES-GCM, FEC, NACK)",
+                "is_coordinator": isCoord,
+                "link": isCoord ? "local — tokenizer + its own shard"
+                    : "Wi-Fi/UDP (Noise IK, AES-GCM, FEC, NACK) — streams its layers from the vault",
             ])
         }
-        respond([
+        var payload: [String: Any] = [
             "host": sample.asJSONObject,
-            "host_note": "all mesh peers run in-process — each partial-loads ONLY "
-                + "its layer range (real ggml graph surgery), so no peer holds the "
-                + "whole model (see loaded_mb per device)",
+            "host_note": "the coordinator tokenizes AND holds a shard; every other device "
+                + "holds ONLY its layer range (partial ggml load / vault stream), so once a "
+                + "peer joins no single device holds the whole \(fullModelBytes / 1_048_576) MB model. "
+                + "the coordinator's loaded_mb is MEASURED; a remote peer's is COMPUTED from its "
+                + "layer range × the model's bytes/layer.",
             "generation_in_flight": false,
             "allocation_supported": false,
-            "allocation_note": "re-sharding a live shard plan is future work; "
-                + "the split is fixed for this run",
+            "allocation_note": "the split auto-balances by each device's measured speed and "
+                + "capacity, and re-shards automatically when a device joins or leaves.",
             "peers": peers,
             "totals": [
                 "devices": peers.count,
                 "devices_alive": peers.count,
-                "layers_assigned": shardEngines.first?.layerCount ?? 0,
+                "layers_assigned": layerCount,
             ] as [String: Any],
-        ])
+        ]
+        if let choice = choiceSnap {
+            payload["adaptive_model"] = [
+                "name": choice.name, "reason": choice.reason,
+                "decision": choice.decision, "devices": choice.devices,
+            ] as [String: Any]
+        }
+        respond(payload)
+    }
+
+    // GET /api/models — the installed catalog with compatibility flags, so the
+    // UI can offer any model and flag the ones that won't work here.
+    server.onModelsListRequest = { respond in
+        respond(shardModelCatalogJSON(currentPath: modelPath))
+    }
+    // POST /api/models/select — validate then relaunch the mesh onto the model.
+    // Accepts a path (the web UI) or a bare filename / GGUF model name (the
+    // iPhone app, which knows models by name, not by this Mac's paths).
+    server.onModelSelectRequest = { requestedPath, reply in
+        var expanded = (requestedPath as NSString).expandingTildeInPath
+        if !FileManager.default.fileExists(atPath: expanded),
+           !requestedPath.contains("/") {
+            let wanted = requestedPath.lowercased()
+            let catalog = NMPModelCatalog.scan(directory: "~/models")
+            if let match = catalog.first(where: {
+                $0.name.lowercased() == wanted
+                    || ($0.path as NSString).lastPathComponent.lowercased() == wanted
+            }) {
+                expanded = match.path
+            } else {
+                reply(.failure(NMPDashboardServer.BenchmarkFailure(
+                    "this Mac has no ‘\(requestedPath)’ in ~/models — the coordinator "
+                        + "needs the file (it tokenizes and serves the vault). Installed: "
+                        + (catalog.isEmpty ? "none"
+                            : catalog.map(\.name).joined(separator: ", ")))))
+                return
+            }
+        }
+        guard FileManager.default.fileExists(atPath: expanded),
+              let candidate = NMPModelCatalog.candidate(path: expanded) else {
+            reply(.failure(NMPDashboardServer.BenchmarkFailure(
+                "no readable GGUF at \(requestedPath)")))
+            return
+        }
+        guard candidate.architecture.hasPrefix("qwen") else {
+            reply(.failure(NMPDashboardServer.BenchmarkFailure(
+                "‘\(candidate.name)’ is a \(candidate.architecture) model — the shard "
+                    + "shim runs qwen2/qwen3 only (a llama-arch variant is future work)")))
+            return
+        }
+        let hostRAM = Int(NMPSystemCapabilityProbe.measure(peerID: 0x0000_0001).ramMB)
+        guard Double(candidate.fileMB) <= Double(hostRAM) * 0.7 else {
+            reply(.failure(NMPDashboardServer.BenchmarkFailure(
+                "‘\(candidate.name)’ needs ~\(candidate.fileMB) MB in RAM; this host "
+                    + "has \(hostRAM) MB — add a device or pick a smaller quant")))
+            return
+        }
+        reply(.success("switching to \(candidate.name) — the mesh restarts and the page "
+                       + "reconnects in a few seconds"))
+        server.reportMeshEvent("🔄 switching model → \(candidate.name); relaunching mesh")
+        // Let the HTTP response flush, release the listener, then re-exec this
+        // process onto the new --model (same PID, so start.sh/Ctrl-C still own it).
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.8) {
+            server.stop()
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.4) {
+                NMPProcessRelaunch.relaunch(withModel: expanded)
+            }
+        }
     }
 
     var shardMeshInfo = NMPDashboardServer.MeshInfo()
     shardMeshInfo.engine = "llamaShard"
-    shardMeshInfo.modelName = shardEngines.first?.modelTag ?? "?"
-    shardMeshInfo.shardCount = shardCount
-    shardMeshInfo.wireFormat = testbed.orchestrator.activationWireFormat.rawValue
+    shardMeshInfo.modelName = modelTag
+    shardMeshInfo.shardCount = max(1, stateQueue.sync { currentPlan.count })
+    shardMeshInfo.wireFormat = node.orchestrator.activationWireFormat.rawValue
     server.meshInfo = shardMeshInfo
 
     if dashboardArguments.ui {
         var summary = [
-            "Mesh: llamaShard — \(shardEngines.first?.modelTag ?? "?")",
-            "Split: \(shardCount)-way, each peer partial-loads only its layers",
-            "Wire format: \(shardMeshInfo.wireFormat)",
+            "Mesh: llamaShard — \(modelTag) (REAL cross-device sharding)",
+            "Coordinator tokenizes + holds a shard; LAN peers join live and re-shard",
+            "Wire: float32 residual (lossless) — only the activation crosses the network",
         ]
         if let selectionReason { summary.append("Model choice: \(selectionReason)") }
         activateWebUI(server: server, meshSummary: summary)
     }
     if let selectionReason { server.reportMeshEvent("model choice — \(selectionReason)") }
 
-    print("[nmp-dashboard] Ctrl-C to stop")
+    // Assign the coordinator's OWN shard right away (no peer needed) so the mesh
+    // is inferable immediately, THEN start Bonjour discovery in the background —
+    // its first browse can take a few seconds and must not block the UI. Real
+    // peers that join re-shard live (node.onPeerReady/onPeerLost → reshard).
+    reshard(trigger: "startup")
+    nodeQueue.async {
+        do { try node.start() }
+        catch { print("[nmp-dashboard] discovery failed to start: \(error) — LAN peers can't join") }
+    }
+    print("[nmp-dashboard] browsing for LAN shard peers (nmp-peer / iPhone app); "
+          + "the coordinator holds all layers until one joins. Ctrl-C to stop")
     dispatchMain()
 }
 
@@ -1172,6 +1459,56 @@ referenceMeshInfo.shardCount = testbed.failover.activePlan.count
 referenceMeshInfo.wireFormat = testbed.orchestrator.activationWireFormat.rawValue
 server.meshInfo = referenceMeshInfo
 
+// MARK: - Phase C: adaptive model selection on live churn
+//
+// As REAL devices join and leave, re-pick the optimal model (storage + RAM
+// aware) and report the decision. Driven ONLY by real device capabilities —
+// the local host (measured) plus real LAN peers — never the synthetic
+// in-process stand-ins, so the choice reflects the PHYSICAL mesh honestly.
+// The shard shim runs qwen2/qwen3, so only those are offered as reachable
+// targets (a llama-arch model would need a NORMAL-RoPE shim variant first).
+let modelCatalog = NMPModelCatalog.scan(directory: "~/models")
+    .filter { $0.architecture.hasPrefix("qwen") }
+let hostCapabilities = NMPSystemCapabilityProbe.measure(peerID: testbed.coordinatorID)
+let modelController = NMPAdaptiveModelController(catalog: modelCatalog)
+/// Real LAN peers' capabilities (stateQueue-owned) — the honest membership.
+var lanPeerCapabilities: [UInt32: NMPCapabilities] = [:]
+/// Latest adaptive choice for the API/UI (stateQueue-owned).
+var currentModelChoice: (name: String, reason: String, decision: String, devices: Int)?
+
+/// Re-runs the storage+RAM-aware selector over the REAL mesh and reports what
+/// changed. Safe to call from any queue (hops to stateQueue).
+func reevaluateModelSelection(trigger: String) {
+    guard !modelCatalog.isEmpty else { return }
+    stateQueue.async {
+        let mesh = [hostCapabilities] + Array(lanPeerCapabilities.values)
+        let word = mesh.count == 1 ? "device" : "devices"
+        switch modelController.evaluate(mesh: mesh) {
+        case .switchModel(let from, let to):
+            currentModelChoice = (to.model.name, to.reason, "switch", mesh.count)
+            server.reportMeshEvent("🧠 adaptive model (\(trigger)): \(mesh.count) real "
+                + "\(word) → \(to.model.name) [was \(from)] — \(to.reason)")
+        case .reshard(let sel):
+            currentModelChoice = (sel.model.name, sel.reason, "reshard", mesh.count)
+            server.reportMeshEvent("🧠 adaptive model (\(trigger)): \(sel.model.name) "
+                + "stays — re-split across \(mesh.count) \(word)")
+        case .unchanged(let sel):
+            currentModelChoice = (sel.model.name, sel.reason, "unchanged", mesh.count)
+        case .noModelFits:
+            currentModelChoice = nil
+            server.reportMeshEvent("🧠 adaptive model (\(trigger)): no model in "
+                + "~/models fits \(mesh.count) real \(word) — add a device or a model")
+        }
+    }
+}
+if modelCatalog.isEmpty {
+    print("[nmp-dashboard] adaptive model selection idle — no qwen GGUF in ~/models")
+} else {
+    print("[nmp-dashboard] adaptive model selection: \(modelCatalog.count) candidate(s) "
+          + "in ~/models, re-picked on every real join/leave")
+}
+reevaluateModelSelection(trigger: "startup")
+
 // Benchmark runs pause the heartbeat loop exactly like API inference does.
 wireBenchmark(server: server) { prompt, maxTokens, completion in
     stateQueue.async { apiInferenceRunning = true }
@@ -1373,6 +1710,23 @@ server.onDeviceMetricsRequest = { respond in
                 ? "⚠️ \(shortfall) layer(s) fit on no device — the model is "
                     + "too big for this mesh. Add a device or a smaller model."
                 : "",
+            // Phase C: the storage+RAM-aware model the REAL mesh would run,
+            // re-picked on every physical join/leave (nil = no model fits).
+            "adaptive_model": currentModelChoice.map {
+                [
+                    "name": $0.name,
+                    "reason": $0.reason,
+                    "decision": $0.decision,
+                    "real_devices": $0.devices,
+                ] as [String: Any]
+            } ?? [
+                "name": "",
+                "reason": modelCatalog.isEmpty
+                    ? "no qwen GGUF in ~/models"
+                    : "no model fits the current real device(s)",
+                "decision": "none",
+                "real_devices": 0,
+            ],
             "peers": peers,
             "totals": totals,
         ])
@@ -1524,6 +1878,8 @@ func dialLANPeer(_ capabilities: NMPCapabilities) {
                         + "re-sharded to \(plan.count) shard(s)")
                     lanQueue.async { lanRedialDelay[peerID] = nil }
                     retireSimulatedPeersOnce()
+                    stateQueue.async { lanPeerCapabilities[capabilities.peerID] = capabilities }
+                    reevaluateModelSelection(trigger: "join: \(capabilities.deviceName)")
                     pushPeerStates()
                 case .failure(let error):
                     server.reportMeshEvent("📱 \(capabilities.deviceName) join failed: \(error)")
@@ -1562,6 +1918,7 @@ func dropLANPeer(_ peerID: UInt32, reason: String) {
     }
     stateQueue.async {
         guard lanConnections.removeValue(forKey: peerID) != nil else { return }
+        lanPeerCapabilities.removeValue(forKey: peerID)
         guard testbed.failover.activePeers.contains(where: { $0.peerID == peerID }) else {
             return
         }
@@ -1570,6 +1927,7 @@ func dropLANPeer(_ peerID: UInt32, reason: String) {
         testbed.failover.handlePeerDrop(peerID, timeout: 5) { _ in
             pushPeerStates()
         }
+        reevaluateModelSelection(trigger: "leave: 0x\(String(peerID, radix: 16))")
     }
 }
 

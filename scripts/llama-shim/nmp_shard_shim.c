@@ -118,7 +118,13 @@ static void nmp_shard_load_backends(void) {
     if (loaded) { pthread_mutex_unlock(&once_lock); return; }
     loaded = 1;
     pthread_mutex_unlock(&once_lock);
-#ifdef NMP_GGML_LIBEXEC
+#ifdef NMP_STATIC_BACKENDS
+    // iOS/tvOS: ggml-cpu is STATICALLY linked into the app's shim framework and
+    // self-registers via the backend registry — there are no dynamic backend
+    // dylibs to load (dlopen of arbitrary paths is blocked on device), and the
+    // shim computes on CPU, so nothing else is needed. See scripts/setup_shard_ios.sh.
+    return;
+#elif defined(NMP_GGML_LIBEXEC)
     DIR *dir = opendir(NMP_GGML_LIBEXEC);
     if (dir) {
         struct dirent *entry;

@@ -76,30 +76,39 @@ let engine: NMPShardComputeEngine
 var modelTag = arguments.modelTag
 /// Non-nil only for --engine llamaShard, so onServed can report loaded MB.
 var llamaShardEngine: NMPLlamaShardComputeEngine?
+/// Non-nil only in vault mode (--engine llamaShard with no --model).
+var vaultShardEngine: NMPVaultShardComputeEngine?
 
 if arguments.engineKind == "llamaShard" {
     // TRUE cross-device sharding: this peer loads ONLY the layer range the
     // coordinator assigns (ggml graph surgery), so a device too small for the
     // whole model still contributes. Needs the shard shim (scripts/setup_shard.sh).
-    guard let modelPath = arguments.modelPath ?? arguments.ggufPath else {
-        FileHandle.standardError.write(Data("--engine llamaShard requires --model path.gguf\n".utf8))
-        exit(2)
-    }
-    do {
-        let shardEngine = try NMPLlamaShardComputeEngine(modelPath: modelPath)
-        engine = shardEngine
-        llamaShardEngine = shardEngine
-        modelTag = shardEngine.modelTag
-        print("[peer] llamaShard engine: \(shardEngine.modelTag) — "
-              + "\(shardEngine.layerCount) layers × \(shardEngine.hiddenSize) hidden; "
-              + "will partial-load ONLY the assigned range (ctx \(shardEngine.maxContext))")
-    } catch {
-        FileHandle.standardError.write(Data("""
-        failed to start llamaShard engine: \(error)
-        checklist: brew install ggml && scripts/setup_shard.sh, and --model must point at a .gguf file
-        \n
-        """.utf8))
-        exit(1)
+    if let modelPath = arguments.modelPath ?? arguments.ggufPath {
+        do {
+            let shardEngine = try NMPLlamaShardComputeEngine(modelPath: modelPath)
+            engine = shardEngine
+            llamaShardEngine = shardEngine
+            modelTag = shardEngine.modelTag
+            print("[peer] llamaShard engine: \(shardEngine.modelTag) — "
+                  + "\(shardEngine.layerCount) layers × \(shardEngine.hiddenSize) hidden; "
+                  + "will partial-load ONLY the assigned range (ctx \(shardEngine.maxContext))")
+        } catch {
+            FileHandle.standardError.write(Data("""
+            failed to start llamaShard engine: \(error)
+            checklist: brew install ggml && scripts/setup_shard.sh, and --model must point at a .gguf file
+            \n
+            """.utf8))
+            exit(1)
+        }
+    } else {
+        // Future Plan #3: no local model — stream each assigned slice from the
+        // coordinator's vault (disk ≈ RAM). Accept whatever model it serves.
+        let vaultEngine = NMPVaultShardComputeEngine()
+        engine = vaultEngine
+        vaultShardEngine = vaultEngine
+        modelTag = NMPVaultShardComputeEngine.wildcardModelTag
+        print("[peer] llamaShard engine (VAULT mode): no local model — will stream "
+              + "ONLY the assigned layers from the coordinator and cache them on disk")
     }
 } else if arguments.engineKind == "llamaCpp" {
     guard let modelPath = arguments.modelPath else {
@@ -157,6 +166,14 @@ func stamp() -> String {
 node.onStatus = { print("[peer \(stamp())] \($0)") }
 node.onDiagnostic = { print("[peer \(stamp())] (diag) \($0)") }
 node.onAssigned = { assign in
+    if vaultShardEngine != nil {
+        let cached = vaultShardEngine?.cachedSliceBytes ?? 0
+        print("[peer \(stamp())] shard assigned: layers "
+              + "\(assign.startLayer)..<\(assign.endLayer) of \(assign.totalLayers) "
+              + String(format: "— streamed its slice from the vault (%.1f MB on disk, its range only)",
+                       Double(cached) / 1_048_576))
+        return
+    }
     guard llamaShardEngine != nil else { return }
     print("[peer \(stamp())] shard assigned: layers "
           + "\(assign.startLayer)..<\(assign.endLayer) of \(assign.totalLayers) "
@@ -166,9 +183,12 @@ node.onServed = { requestID, layers, seconds in
     // For a real shard peer, report the MEASURED loaded weights (only this
     // range), the honest proof it doesn't hold the whole model.
     let loaded = llamaShardEngine?.loadedBytes ?? 0
+    let vaultDisk = vaultShardEngine?.cachedSliceBytes ?? 0
     let loadedNote = loaded > 0
         ? String(format: ", loaded %.1f MB (its range only)", Double(loaded) / 1_048_576)
-        : ""
+        : (vaultDisk > 0
+           ? String(format: ", vault slice %.1f MB on disk (its range only)", Double(vaultDisk) / 1_048_576)
+           : "")
     print("[peer \(stamp())] served request \(requestID): layers "
           + "\(layers.lowerBound)..<\(layers.upperBound) in "
           + String(format: "%.2f", seconds * 1000) + " ms "

@@ -242,6 +242,19 @@ public final class NMPDashboardServer {
     public var onObjectiveRequest: ((String,
         @escaping (Result<String, BenchmarkFailure>) -> Void) -> Void)?
 
+    /// Handler for GET /api/models: the installed models with compatibility
+    /// flags (compatible / fits this host / recommended / active). The server
+    /// ships the array verbatim as JSON under "models". 503 when unwired.
+    public var onModelsListRequest: ((@escaping ([[String: Any]]) -> Void) -> Void)?
+
+    /// Handler for POST /api/models/select {"path": "..."}. Switch the active
+    /// model — the CLI relaunches itself onto it. Reply with a human summary
+    /// (the UI shows a brief "reconnecting…" while the mesh restarts) or a
+    /// failure reason (incompatible / won't fit / not found). Fires on the
+    /// server's queue; reply from any queue, exactly once.
+    public var onModelSelectRequest: ((String,
+        @escaping (Result<String, BenchmarkFailure>) -> Void) -> Void)?
+
     /// Static facts about the running mesh, surfaced by GET /health and
     /// the UI's dashboard. Set once by the CLI after assembly.
     public struct MeshInfo: Sendable {
@@ -755,6 +768,8 @@ public final class NMPDashboardServer {
                 handleComparisonPOST(body: body, client: client)
             case "/api/comparison/run":
                 handleComparisonRunPOST(body: body, client: client)
+            case "/api/models/select":
+                handleModelSelectPOST(body: body, client: client)
             default:
                 respond(client, status: "404 Not Found", body: "not found\n")
             }
@@ -777,6 +792,9 @@ public final class NMPDashboardServer {
             return
         case "/api/clients":
             handleClientsGET(client)
+            return
+        case "/api/models":
+            handleModelsGET(client)
             return
         default:
             break
@@ -960,6 +978,55 @@ public final class NMPDashboardServer {
                         "status": "ok",
                         "objective": objective,
                         "summary": summary,
+                    ])
+                case .failure(let failure):
+                    self.respondJSON(client, status: "400 Bad Request",
+                                     object: ["error": failure.message])
+                }
+            }
+        }
+    }
+
+    // MARK: GET /api/models + POST /api/models/select
+
+    private func handleModelsGET(_ client: Client) {
+        guard let handler = onModelsListRequest else {
+            respondJSON(client, status: "503 Service Unavailable",
+                        object: ["error": "no model catalog is wired to this server"])
+            return
+        }
+        handler { [weak self, weak client] models in
+            guard let self, let client else { return }
+            self.queue.async {
+                self.respondJSON(client, status: "200 OK", object: ["models": models])
+            }
+        }
+    }
+
+    private func handleModelSelectPOST(body: Data, client: Client) {
+        guard let handler = onModelSelectRequest else {
+            respondJSON(client, status: "503 Service Unavailable",
+                        object: ["error": "model switching is available only in the sharded engine (--engine llamaShard)"])
+            return
+        }
+        guard let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let path = object["path"] as? String, !path.isEmpty else {
+            respondJSON(client, status: "400 Bad Request",
+                        object: ["error": "body must be JSON with a non-empty 'path'"])
+            return
+        }
+        handler(path) { [weak self, weak client] result in
+            guard let self, let client else { return }
+            self.queue.async {
+                switch result {
+                case .success(let summary):
+                    self.respondJSON(client, status: "200 OK", object: [
+                        "status": "ok",
+                        "path": path,
+                        "summary": summary,
+                        // The mesh relaunches onto the new model; the UI should
+                        // show "reconnecting…" and poll /health until it's back.
+                        "reconnecting": true,
                     ])
                 case .failure(let failure):
                     self.respondJSON(client, status: "400 Bad Request",
@@ -1368,7 +1435,8 @@ public final class NMPDashboardServer {
         let maxTokens = (object["max_tokens"] as? Int) ?? 64
         let enableSpeculation = (object["enable_speculation"] as? Bool) ?? false
         let prompt = NMPChatPrompt.format(messages: messages,
-                                          engine: storedMeshInfo.engine)
+                                          engine: storedMeshInfo.engine,
+                                          model: storedMeshInfo.modelName)
 
         handler(InferenceRequest(prompt: prompt, maxTokens: maxTokens,
                                  enableSpeculation: enableSpeculation)) { [weak self, weak client] response in

@@ -14,5 +14,13 @@
         <string>_neuramesh._tcp</string>
         <string>_neuramesh-ui._tcp</string>
     </array>
+    <!-- Future Plan #3: the coordinator's weight-vault is plain HTTP on the LAN
+         (trusted-LAN only, like the dashboard). Allow cleartext to .local hosts
+         and IP literals so the phone can stream its shard's weights. -->
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
 </dict>
 </plist>

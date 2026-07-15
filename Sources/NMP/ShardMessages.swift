@@ -93,10 +93,15 @@ public struct NMPShardAssign: Equatable, Sendable {
     /// Model identity ("llama-7B-q4_K_M", GGUF general.name, or a hash) so
     /// a peer with the wrong model refuses instead of computing garbage.
     public var modelTag: String
+    /// Future Plan #3 (weight vault): "host:port" of the coordinator's HTTP
+    /// slice server, so a peer holding no local model can stream ONLY its
+    /// assigned layers. Empty ⇒ no vault (the peer must already hold the model).
+    /// Encoded as a backward-compatible trailing field (older peers ignore it).
+    public var vaultEndpoint: String
 
     public init(shardIndex: UInt16, pipelineLength: UInt16, startLayer: UInt16,
                 endLayer: UInt16, totalLayers: UInt16, hiddenSize: UInt32,
-                modelTag: String) {
+                modelTag: String, vaultEndpoint: String = "") {
         self.shardIndex = shardIndex
         self.pipelineLength = pipelineLength
         self.startLayer = startLayer
@@ -104,6 +109,7 @@ public struct NMPShardAssign: Equatable, Sendable {
         self.totalLayers = totalLayers
         self.hiddenSize = hiddenSize
         self.modelTag = modelTag
+        self.vaultEndpoint = vaultEndpoint
     }
 
     public func encode() -> Data {
@@ -118,6 +124,11 @@ public struct NMPShardAssign: Equatable, Sendable {
         let tag = Data(modelTag.utf8.prefix(255))
         out.append(UInt8(tag.count))
         out.append(tag)
+        // Backward-compatible trailing field: vault endpoint. Older decoders
+        // stop after the tag and ignore these bytes.
+        let vault = Data(vaultEndpoint.utf8.prefix(255))
+        out.append(UInt8(vault.count))
+        out.append(vault)
         return out
     }
 
@@ -137,6 +148,17 @@ public struct NMPShardAssign: Equatable, Sendable {
                                encoding: .utf8) else {
             throw NMPShardCodecError.invalidString
         }
+        // Optional backward-compatible trailing field: vault endpoint.
+        var vaultEndpoint = ""
+        let vaultLenIndex = 16 + tagLength
+        if bytes.count > vaultLenIndex {
+            let vaultLength = Int(bytes[vaultLenIndex])
+            if bytes.count >= vaultLenIndex + 1 + vaultLength, vaultLength > 0 {
+                vaultEndpoint = String(
+                    data: bytes.subdata(in: (vaultLenIndex + 1)..<(vaultLenIndex + 1 + vaultLength)),
+                    encoding: .utf8) ?? ""
+            }
+        }
         return NMPShardAssign(
             shardIndex: bytes.readBigEndianUInt16(at: 1),
             pipelineLength: bytes.readBigEndianUInt16(at: 3),
@@ -144,7 +166,7 @@ public struct NMPShardAssign: Equatable, Sendable {
             endLayer: bytes.readBigEndianUInt16(at: 7),
             totalLayers: bytes.readBigEndianUInt16(at: 9),
             hiddenSize: bytes.readBigEndianUInt32(at: 11),
-            modelTag: tag)
+            modelTag: tag, vaultEndpoint: vaultEndpoint)
     }
 }
 
