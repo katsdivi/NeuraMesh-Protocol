@@ -1,0 +1,115 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 620" width="1040" height="620" role="img" aria-label="NeuraMesh layered architecture: Transport, Reliability, Mesh, Inference, Memory.">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0B1020"/>
+      <stop offset="1" stop-color="#141A38"/>
+    </linearGradient>
+    <linearGradient id="memGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#123B3A"/>
+      <stop offset="1" stop-color="#1B2450"/>
+    </linearGradient>
+    <filter id="soft" x="-40%" y="-40%" width="180%" height="180%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <rect x="0" y="0" width="1040" height="620" rx="16" fill="url(#bg)"/>
+  <rect x="0.75" y="0.75" width="1038.5" height="618.5" rx="15.25" fill="none" stroke="#33407F" stroke-opacity="0.6" stroke-width="1.5"/>
+
+  <!-- title -->
+  <text x="48" y="52" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="24" font-weight="800" fill="#EAF0FF">Architecture</text>
+  <text x="48" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="13.5" fill="#97A3D6">Five layers, bottom &#8594; top. Every layer is Apple-native and fully local.</text>
+
+  <!-- ===== Layer bars (bottom->top drawn top-down) ===== -->
+  <!-- 5: Memory (highlighted, top) -->
+  <g filter="url(#soft)">
+    <rect x="48" y="96" width="944" height="72" rx="14" fill="url(#memGrad)" stroke="#3FE0C5" stroke-width="2"/>
+  </g>
+  <rect x="48" y="96" width="6" height="72" rx="3" fill="#3FE0C5"/>
+  <circle cx="86" cy="132" r="16" fill="#123B3A" stroke="#3FE0C5" stroke-width="1.5"/>
+  <text x="86" y="139" font-size="17" text-anchor="middle">&#129504;</text>
+  <text x="120" y="127" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="18" font-weight="700" fill="#EAF0FF">Memory</text>
+  <rect x="205" y="114" width="88" height="20" rx="10" fill="#123B3A" stroke="#3FE0C5" stroke-opacity="0.6"/>
+  <text x="249" y="128" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10.5" font-weight="700" fill="#3FE0C5" text-anchor="middle">new layer</text>
+  <text x="120" y="150" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#B7E9DF">per-device Supermemory &#183; seal &#8594; K-of-N shards &#8594; scatter &#183; quorum reconstruct</text>
+
+  <!-- 4: Inference -->
+  <g filter="url(#soft)">
+    <rect x="48" y="180" width="944" height="72" rx="14" fill="#1B2450" stroke="#33407F"/>
+  </g>
+  <circle cx="86" cy="216" r="16" fill="#213066" stroke="#6EA8FF" stroke-width="1.5"/>
+  <text x="86" y="223" font-size="16" text-anchor="middle">&#129513;</text>
+  <text x="120" y="211" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="18" font-weight="700" fill="#EAF0FF">Inference</text>
+  <text x="120" y="234" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#97A3D6">proportional LLM layer sharding &#183; pipeline &#183; weight vault (disk &#8776; RAM)</text>
+
+  <!-- 3: Mesh -->
+  <g filter="url(#soft)">
+    <rect x="48" y="264" width="944" height="72" rx="14" fill="#1B2450" stroke="#33407F"/>
+  </g>
+  <circle cx="86" cy="300" r="16" fill="#213066" stroke="#6EA8FF" stroke-width="1.5"/>
+  <text x="86" y="307" font-size="16" text-anchor="middle">&#128225;</text>
+  <text x="120" y="295" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="18" font-weight="700" fill="#EAF0FF">Mesh</text>
+  <text x="120" y="318" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#97A3D6">Bonjour discovery &#183; capability-based coordinator election</text>
+
+  <!-- 2: Reliability -->
+  <g filter="url(#soft)">
+    <rect x="48" y="348" width="944" height="72" rx="14" fill="#1B2450" stroke="#33407F"/>
+  </g>
+  <circle cx="86" cy="384" r="16" fill="#213066" stroke="#6EA8FF" stroke-width="1.5"/>
+  <text x="86" y="391" font-size="16" text-anchor="middle">&#128260;</text>
+  <text x="120" y="379" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="18" font-weight="700" fill="#EAF0FF">Reliability</text>
+  <text x="120" y="402" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#97A3D6">NACK retransmit &#183; XOR FEC (recover a loss, no round trip)</text>
+
+  <!-- 1: Transport (bottom) -->
+  <g filter="url(#soft)">
+    <rect x="48" y="432" width="944" height="72" rx="14" fill="#1B2450" stroke="#33407F"/>
+  </g>
+  <circle cx="86" cy="468" r="16" fill="#213066" stroke="#6EA8FF" stroke-width="1.5"/>
+  <text x="86" y="475" font-size="16" text-anchor="middle">&#128268;</text>
+  <text x="120" y="463" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="18" font-weight="700" fill="#EAF0FF">Transport</text>
+  <text x="120" y="486" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#97A3D6">UDP &#183; 20-byte header &#183; Noise IK 1-RTT handshake &#183; AES-256-GCM</text>
+
+  <!-- layer index numbers on right -->
+  <g font-family="ui-monospace, monospace" font-size="12" font-weight="700" text-anchor="middle" fill="#97A3D6">
+    <text x="966" y="136" fill="#3FE0C5">5</text>
+    <text x="966" y="220" fill="#6EA8FF">4</text>
+    <text x="966" y="304" fill="#6EA8FF">3</text>
+    <text x="966" y="388" fill="#6EA8FF">2</text>
+    <text x="966" y="472" fill="#6EA8FF">1</text>
+  </g>
+
+  <!-- ===== device chips row ===== -->
+  <g stroke="#6EA8FF" stroke-opacity="0.45" stroke-width="1.6">
+    <line x1="336" y1="556" x2="520" y2="556"/>
+    <line x1="520" y1="556" x2="704" y2="556"/>
+    <line x1="336" y1="556" x2="704" y2="556"/>
+  </g>
+  <g>
+    <g filter="url(#soft)">
+      <rect x="280" y="534" width="112" height="44" rx="12" fill="#1B2450" stroke="#33407F"/>
+    </g>
+    <text x="336" y="561" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="14" font-weight="600" fill="#EAF0FF" text-anchor="middle">&#128187; Mac</text>
+    <circle cx="336" cy="556" r="0"/>
+  </g>
+  <g>
+    <g filter="url(#soft)">
+      <rect x="464" y="534" width="112" height="44" rx="12" fill="#1B2450" stroke="#33407F"/>
+    </g>
+    <text x="520" y="561" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="14" font-weight="600" fill="#EAF0FF" text-anchor="middle">&#128187; Mac</text>
+  </g>
+  <g>
+    <g filter="url(#soft)">
+      <rect x="648" y="534" width="112" height="44" rx="12" fill="#1B2450" stroke="#33407F"/>
+    </g>
+    <text x="704" y="561" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="14" font-weight="600" fill="#EAF0FF" text-anchor="middle">&#128241; iPhone</text>
+  </g>
+  <!-- draw mesh nodes on top of lines -->
+  <g fill="#6EA8FF">
+    <circle cx="336" cy="556" r="4"/>
+    <circle cx="520" cy="556" r="4"/>
+    <circle cx="704" cy="556" r="4"/>
+  </g>
+
+  <!-- legend -->
+  <text x="520" y="600" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#97A3D6" text-anchor="middle">Apple-native &#183; Network.framework + CryptoKit &#183; zero third-party deps</text>
+</svg>

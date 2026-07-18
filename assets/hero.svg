@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" width="1200" height="320" role="img" aria-label="NeuraMesh — Distributed AI and resilient memory, meshed across your Apple devices, 100% local.">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0B1020"/>
+      <stop offset="1" stop-color="#141A38"/>
+    </linearGradient>
+    <linearGradient id="wordFill" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#B9C6FF"/>
+      <stop offset="0.55" stop-color="#6EA8FF"/>
+      <stop offset="1" stop-color="#3FE0C5"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.82" cy="0.4" r="0.55">
+      <stop offset="0" stop-color="#6EA8FF" stop-opacity="0.20"/>
+      <stop offset="1" stop-color="#6EA8FF" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="soft" x="-40%" y="-40%" width="180%" height="180%">
+      <feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#000000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <!-- own rounded background -->
+  <rect x="0" y="0" width="1200" height="320" rx="16" fill="url(#bg)"/>
+  <rect x="0" y="0" width="1200" height="320" rx="16" fill="url(#glow)"/>
+  <rect x="0.75" y="0.75" width="1198.5" height="318.5" rx="15.25" fill="none" stroke="#33407F" stroke-opacity="0.6" stroke-width="1.5"/>
+
+  <!-- decorative node-mesh motif (right third) -->
+  <g stroke="#6EA8FF" stroke-opacity="0.28" stroke-width="1.4" fill="none">
+    <line x1="905" y1="80" x2="1010" y2="132"/>
+    <line x1="1010" y1="132" x2="1112" y2="86"/>
+    <line x1="1010" y1="132" x2="965" y2="222"/>
+    <line x1="965" y1="222" x2="1075" y2="240"/>
+    <line x1="1075" y1="240" x2="1112" y2="86"/>
+    <line x1="905" y1="80" x2="965" y2="222"/>
+    <line x1="1075" y1="240" x2="1150" y2="170"/>
+    <line x1="1112" y1="86" x2="1150" y2="170"/>
+  </g>
+  <g fill="#6EA8FF">
+    <circle cx="905" cy="80" r="5" fill="#6EA8FF" fill-opacity="0.85">
+      <animate attributeName="r" values="5;7;5" dur="4s" begin="0s" repeatCount="indefinite" keyTimes="0;0.5;1" keySplines="0.4 0 0.2 1;0.4 0 0.2 1" calcMode="spline"/>
+      <animate attributeName="fill-opacity" values="0.5;0.95;0.5" dur="4s" begin="0s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="1010" cy="132" r="6" fill="#3FE0C5" fill-opacity="0.9"/>
+    <circle cx="1112" cy="86" r="5" fill="#6EA8FF" fill-opacity="0.8">
+      <animate attributeName="r" values="5;7.5;5" dur="4.6s" begin="1.2s" repeatCount="indefinite" keyTimes="0;0.5;1" keySplines="0.4 0 0.2 1;0.4 0 0.2 1" calcMode="spline"/>
+      <animate attributeName="fill-opacity" values="0.5;0.95;0.5" dur="4.6s" begin="1.2s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="965" cy="222" r="5" fill="#6EA8FF" fill-opacity="0.75">
+      <animate attributeName="r" values="5;7;5" dur="5.2s" begin="2.1s" repeatCount="indefinite" keyTimes="0;0.5;1" keySplines="0.4 0 0.2 1;0.4 0 0.2 1" calcMode="spline"/>
+      <animate attributeName="fill-opacity" values="0.45;0.9;0.45" dur="5.2s" begin="2.1s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="1075" cy="240" r="5.5" fill="#3FE0C5" fill-opacity="0.85">
+      <animate attributeName="fill-opacity" values="0.5;0.95;0.5" dur="3.6s" begin="0.6s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="1150" cy="170" r="4.5" fill="#6EA8FF" fill-opacity="0.7"/>
+  </g>
+
+  <!-- wordmark -->
+  <text x="80" y="150" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="76" font-weight="800" letter-spacing="-1.5" fill="url(#wordFill)" filter="url(#soft)">NeuraMesh</text>
+
+  <!-- tagline -->
+  <text x="82" y="205" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="22" font-weight="500" fill="#97A3D6">Distributed AI + resilient memory, meshed across your Apple devices — 100% local.</text>
+
+  <!-- small pill badges -->
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="600">
+    <rect x="82" y="240" width="168" height="30" rx="15" fill="#1B2450" stroke="#33407F"/>
+    <circle cx="100" cy="255" r="4" fill="#6EA8FF"/>
+    <text x="112" y="260" fill="#EAF0FF">Layer sharding</text>
+
+    <rect x="264" y="240" width="196" height="30" rx="15" fill="#1B2450" stroke="#33407F"/>
+    <circle cx="282" cy="255" r="4" fill="#3FE0C5"/>
+    <text x="294" y="260" fill="#EAF0FF">K-of-N memory shards</text>
+
+    <rect x="474" y="240" width="150" height="30" rx="15" fill="#1B2450" stroke="#33407F"/>
+    <circle cx="492" cy="255" r="4" fill="#FFC978"/>
+    <text x="504" y="260" fill="#EAF0FF">Apple-native</text>
+  </g>
+</svg>
