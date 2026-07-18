@@ -21,6 +21,7 @@ let package = Package(
         .executable(name: "nmp-peer", targets: ["NMPPeerCLI"]),
         .executable(name: "nmp-coordinator", targets: ["NMPCoordinatorCLI"]),
         .executable(name: "nmp-dashboard", targets: ["NMPDashboardCLI"]),
+        .executable(name: "nmp-memory-peer", targets: ["NMPMemoryPeerCLI"]),
     ],
     targets: [
         .target(
@@ -44,6 +45,11 @@ let package = Package(
             name: "NMPDashboardCLI",
             dependencies: ["NMP"],
             path: "Sources/NMPDashboardCLI"
+        ),
+        .executableTarget(
+            name: "NMPMemoryPeerCLI",
+            dependencies: ["NMP"],
+            path: "Sources/NMPMemoryPeerCLI"
         ),
         .testTarget(
             name: "NMPTests",

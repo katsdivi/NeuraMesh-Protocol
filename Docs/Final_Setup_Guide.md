@@ -184,3 +184,114 @@ tab shows which model was chosen and why.
 *Related: `Docs/Start_Here.md` (every mode + flag), `Docs/CrossDevice_Setup_Guide.md`
 (deeper device wiring), `Docs/Protocol_Comparison.md` (the transport-race
 methodology), `Docs/Future_Plans.md` (roadmap).*
+
+---
+
+## Distributed Memory Mesh (kill-a-peer demo)
+
+A memory layer where each peer runs its **own local Supermemory instance** and
+memories are sealed (LZFSE + AES-256-GCM) then erasure-coded into K-of-N shards
+scattered across peers. No single peer holds a complete readable copy —
+reconstruction needs a quorum. The demo below writes a memory, kills a real peer
+process, and shows recall still works from the survivors' shards. Design +
+honesty details: `Docs/Memory_Mesh.md`.
+
+This runbook uses **K=2 of N=3** on one Mac — three peers, each a simulated
+device with its own Supermemory instance on distinct ports (6767/6768/6769). On
+**real separate devices** each Supermemory is just `localhost:6767` and each
+peer's config points at its own localhost; the distinct ports here only simulate
+three devices on one machine. The control HTTP API is **loopback / trusted-LAN
+only** — no TLS, no auth (same stance as the dashboard); never port-forward it.
+
+**Prereqs (one time):** install the local Supermemory binary —
+`curl -fsSL https://supermemory.ai/install | bash` (installs
+`~/.supermemory/bin/supermemory-server`). Then `swift build`.
+
+**Fast path:** after step 1 boots the instances, `scripts/run_memory_demo.sh
+--launch` runs steps 2–7 in one shot (launch peers, write, prove one shard per
+peer, recall, `kill -9` a peer, recall again from a survivor); add `--kill-two`
+for the below-quorum failure. The manual steps below are the same thing, spelled
+out.
+
+1. **Stand up the three instances + configs:**
+   ```bash
+   scripts/setup_memory_mesh.sh start
+   ```
+   Boots sm1/sm2/sm3 (data dirs `~/.neuramesh-memdemo/sm{1,2,3}`) and writes
+   `~/.neuramesh-memdemo/peer{1,2,3}/config.json` (NMP UDP 9411/9412/9413,
+   control HTTP 9401/9402/9403). **First boot warms the in-process embedding
+   model — can take a minute or two; the script waits up to 180 s per instance
+   with progress dots.** If a foreign `supermemory-server` already holds port
+   6767 it refuses to reuse it: `lsof -nP -iTCP:6767 -sTCP:LISTEN` then
+   `kill <pid>`.
+
+2. **Start the three peers** (three terminals, or backgrounded):
+   ```bash
+   swift run nmp-memory-peer --config ~/.neuramesh-memdemo/peer1/config.json
+   swift run nmp-memory-peer --config ~/.neuramesh-memdemo/peer2/config.json
+   swift run nmp-memory-peer --config ~/.neuramesh-memdemo/peer3/config.json
+   ```
+   Each prints its NMP UDP port + loopback control API. They form a full mesh
+   automatically (lower peerID dials higher; static keys auto-generate into the
+   shared keyDir on first start) — start all three and the redial timer resolves
+   links within a few seconds.
+
+3. **Write a memory:**
+   ```bash
+   curl -s -X POST http://127.0.0.1:9401/remember \
+        -H 'Content-Type: application/json' \
+        -d '{"title":"...","content":"..."}'
+   ```
+   Returns a receipt with `memoryID`, `shardAcks`, and the "persisted NOWHERE"
+   note (each peer holds one opaque shard + the bounded plaintext index entry).
+
+4. **Confirm distribution:**
+   ```bash
+   curl -s http://127.0.0.1:9401/status
+   curl -s http://127.0.0.1:9402/status
+   curl -s http://127.0.0.1:9403/status
+   ```
+   Each shows `shardsHeld:1`.
+
+5. **Baseline recall (all alive):**
+   ```bash
+   curl -s "http://127.0.0.1:9401/recall?q=<terms>"
+   ```
+   Returns the full original content + `shardsUsed` (only K=2 shards fetched —
+   local + one peer over NMP; the third is "not needed").
+
+6. **Kill a peer for real:**
+   ```bash
+   kill -9 $(pgrep -f "nmp-memory-peer --config.*peer3")
+   ```
+
+7. **Recall again from a survivor (peer1)** — the money shot:
+   ```bash
+   curl -s "http://127.0.0.1:9401/recall?q=<terms>"
+   ```
+   **Still returns the full content**, reconstructed from the remaining 2 shards
+   (K=2). Peer 3 shows under `unreachablePeers` once its link retires (~15 s), or
+   `peersNotNeeded` if quorum was met before the link timed out. Real process
+   killed mid-demo, memory survives.
+
+8. **(Optional) Kill a second peer** → drop below quorum:
+   ```bash
+   kill -9 $(pgrep -f "nmp-memory-peer --config.*peer2")
+   curl -s "http://127.0.0.1:9401/recall?q=<terms>"
+   ```
+   Now recall returns **HTTP 503** with
+   `quorum_unavailable: have 1 of 2 required shards` — explicit failure, never
+   wrong output.
+
+9. **Teardown:**
+   ```bash
+   scripts/setup_memory_mesh.sh stop     # stops the Supermemory instances it started
+   ```
+   Ctrl-C the peers.
+
+> **Warmup note.** Supermemory ingestion is asynchronous. On a warm instance a
+> doc is searchable **~1.2 s** after write (measured); on a just-booted **cold**
+> instance the embedding model warms slowly and docs can sit at `queued` for
+> **40 s+** (measured). Warm the instances before demoing, or rely on the read
+> path's in-RAM keyword fallback for just-written memories (it bridges the
+> freshness gap until Supermemory has indexed — see `Docs/Memory_Mesh.md`).

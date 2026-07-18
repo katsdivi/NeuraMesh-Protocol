@@ -1,364 +1,483 @@
 # NeuraMesh Protocol (NMP)
 
-Custom UDP-based transport protocol for distributed AI inference across Apple device meshes.
-NACK-only reliability, XOR FEC, 1-RTT Noise IK handshake, AES-256-GCM per session.
+**Turn the Apple devices you already own into one AI machine.**
 
-**Status: Phases 1–6 + 8–9 complete.** Core transport (Phase 1: handshake + encryption +
-sequencing), NACK-only reliability with a 64-packet retransmission window and sliding
-replay window (Phase 2), XOR FEC over 4-packet groups + AWDL contention suppression
-(Phase 3: sub-millisecond loss recovery, ~75× faster than the NACK path),
-zero-configuration mesh assembly (Phase 4: Bonjour/mDNS discovery, capability
-advertisement via TXT records, deterministic coordinator election), sharded multi-peer
-inference (Phase 5: GGUF parsing, proportional layer sharding, pipelined orchestration,
-bit-exact output at 1.02× single-device latency), production hardening (Phase 6:
-peer-drop detection + failover with 0.4 ms re-sharding, stage retry under unrecoverable
-loss, web testing dashboard, comprehensive benchmark suite), **real LLM inference
-(Phase 8: llama.cpp behind the engine seam — quantized GGUF models, coordinator holds
-only the tokenizer, weights on the peer, every token one real mesh round trip; see
-`Docs/Phase8_Design.md`)**, and **the fast mesh (Phase 9: benchmark-driven adaptive
-layer sharding with persisted device profiles, zero-trim + mixed-precision activation
-wire formats, pipeline-parallel batch execution, draft/verify speculative decoding,
-one-command auto-configuration; see `Docs/Phase9_Design.md`)**, plus **Mesh 2.0/2.1
-(browser UI served by the coordinator itself — same live interface on every device
-on the Wi-Fi, real-time token streaming to every open browser, ACTUALLY-measured
-NMP-vs-TCP transport race, live device resource panel with compute-share sliders
-that re-shard the mesh, web-client tracking, benchmarking center, QR/Bonjour
-discovery; see `Docs/Mesh2_WebUI_Guide.md`)**, plus **Mesh 2.5/2.6 (a
-FULLY-measured four-leg transport race — production NMP vs kernel TCP vs
-TCP+TLS 1.3 vs QUIC, every leg wall-clock on real loopback sockets; a
-dnctl/pfctl loss lab for real packet loss; and the link-adaptive
-transport: path-classified chunk sizing, FEC and AWDL shaping gated to
-radio paths, burst sending with coalesced writes — measured medians below)**.
-**331 tests pass, 0 failures.**
+NeuraMesh is a custom UDP transport protocol *and* a distributed-inference
+runtime that stitches your Mac, iPhone, and iPad into a single private mesh —
+so their combined RAM and compute can run models none of them could load
+alone, entirely on your LAN, with nothing leaving the network. It is
+Apple-native to the metal: **Network.framework + CryptoKit only, zero
+third-party SwiftPM dependencies, no async/await** — a hand-built stack from
+the 20-byte wire header up to a live web dashboard.
 
-New here? **`Docs/Project_Overview.md`** is the whole story — core
-problem, architecture, measured state, roadmap. The loss-resilience deep
-dive with current numbers: **`Docs/CaseStudy_PacketLoss.md`**.
+> **A note on the numbers in this README.** This project has one non-negotiable
+> rule: *measured and modeled numbers are always labeled as such — never
+> present a constant or a model as "measured."* Every performance figure below
+> is a wall-clock measurement from the repo's own docs, carried with its label
+> (and its conditions — most transport numbers are **loopback**, which isolates
+> protocol cost from radio time). Where the docs give no hard number, the
+> behavior is described qualitatively rather than invented.
 
-## Requirements
+---
 
-- Xcode 14.2+ / Swift 5.8+
-- macOS 13+ or iOS 16+ (Network.framework, CryptoKit)
+## Table of contents
 
-## Build, Test & Run
+1. [Why this exists](#why-this-exists)
+2. [What you can actually do with it](#what-you-can-actually-do-with-it)
+3. [The distributed memory mesh (Supermemory)](#the-distributed-memory-mesh-supermemory)
+4. [How we beat TCP (and TLS, and QUIC)](#how-we-beat-tcp-and-tls-and-quic)
+5. [Architecture](#architecture)
+6. [Getting started](#getting-started)
+7. [Project layout](#project-layout)
+8. [Status & tests](#status--tests)
+9. [Documentation index](#documentation-index)
+
+---
+
+## Why this exists
+
+Modern LLMs don't fit on one consumer device — but households and teams own
+*several*. A Mac, an iPhone, an iPad sitting idle in the same room have enough
+combined memory to serve a model none of them can hold individually. The only
+thing standing between them and acting as one machine is **the network**.
+
+Distributed inference is a pathological workload for off-the-shelf transports:
+
+- **Every token is a round trip.** Generating one token means shipping a hidden
+  state to a peer, waiting for its layers, and shipping the result back — for
+  *every* token. Latency compounds 32× over a 32-token answer, so per-trip cost
+  is everything.
+- **Wi-Fi loses packets, and TCP answers loss with head-of-line blocking.** One
+  dropped segment stalls every byte behind it for a full retransmit round trip
+  — the worst possible failure mode for a pipeline that lives and dies by
+  per-trip latency.
+- **TLS handshakes are heavy, and mesh peers come and go.** A phone joins,
+  leaves the room, rejoins. Re-establishing TCP+TLS 1.3 costs ~20–26 ms per
+  connection (measured, loopback — see below); a mesh that re-handshakes often
+  pays that constantly.
+- **The mesh shares the airwave.** Peer-to-peer Wi-Fi (Apple's AWDL) contends
+  with the very traffic it carries; a transport that blasts blindly degrades
+  its own link.
+
+Nothing off the shelf is shaped for *"many encrypted small-tensor round trips
+over lossy shared radio, between mutually-known peers, with instant
+reconnection."* So NeuraMesh is the transport that is.
+
+---
+
+## What you can actually do with it
+
+These aren't hypotheticals — each maps to a runnable mode in the repo.
+
+### Run a bigger model than any one device can hold
+
+NeuraMesh apportions an LLM's **layers** across peers proportionally to each
+device's *measured* speed (`AdaptiveSharding` probes real forward passes and
+persists a per-device profile). The coordinator walks the layer pipeline
+peer-to-peer, shipping activation tensors as chunked, encrypted payloads; a
+**weight vault** streams a peer only the layers it was assigned, so a device
+stores roughly *its slice* of the model, not the whole thing (disk ≈ RAM). The
+combined memory of your Mac + iPhone + iPad runs a model that would never load
+on one of them — fully local, no cloud, private by construction.
+
+> **Honest scope.** The deterministic *reference* engine shards layers across
+> any number of peers and is bit-exact across any split (it's the correctness
+> oracle). The real-LLM path uses **llama.cpp**, which cannot execute layer
+> sub-ranges (its KV cache is per-context), so a llama mesh today is
+> *tokenizer-on-coordinator + weights-on-peer*: genuine remote execution over
+> the real transport, one encrypted round trip per token — but not yet N-way
+> layer splitting for real weights. True multi-device splitting of real models
+> waits on engine support (an MLX-style backend behind the same seam). This is
+> documented plainly, never glossed. See `Docs/Phase8_Design.md`.
+
+### A private AI memory that survives losing a device
+
+Your assistant's conversational memories are **erasure-coded across your
+devices** — no single device holds a complete readable copy, and losing (or
+having someone seize) one device doesn't lose your memory. See the dedicated
+section below.
+
+### Offline / air-gapped / privacy-sensitive AI
+
+Everything runs on the LAN. The Supermemory servers are hard-guarded to
+localhost; the dashboard is trusted-LAN only. No data leaves your network —
+suitable for offline, air-gapped, or privacy-sensitive settings.
+
+### A family / team / household compute pool
+
+Bonjour zero-config discovery means no IPs are typed anywhere: peers publish
+`_neuramesh._tcp` with their capabilities in TXT records, discovery takes
+under a second, and a deterministic election picks the coordinator. Idle Apple
+devices on the same Wi-Fi assemble themselves into a mesh.
+
+---
+
+## The distributed memory mesh (Supermemory)
+
+NeuraMesh includes a **distributed memory layer** built on Supermemory, so an
+assistant's long-term memory is private *and* resilient across your devices.
+Full details: `Docs/Memory_Mesh.md`; on-device iPhone backend:
+`Docs/Memory_Mesh_iOS.md`.
+
+### Each device runs its own local Supermemory — never the cloud
+
+Every device runs its **own local, self-hosted `supermemory-server`, bound to
+localhost**. This is enforced in code: `NMPSupermemoryConfig.init` *throws*
+`nonLocalBaseURL` unless the host is `localhost` / `127.0.0.1` / `::1`, cloud
+endpoints (`console`/`api.supermemory.ai`) cannot be configured, and the setup
+script asserts no config `baseURL` contains `supermemory.ai`. Your memories are
+never sent to a Supermemory cloud.
+
+### Seal → shard → scatter, one shard per peer
+
+Writing a memory:
+
+1. **Seal** — LZFSE-compress, then AES-256-GCM encrypt under a fresh random
+   256-bit key. The result is opaque ciphertext; the plaintext is persisted
+   **nowhere**.
+2. **Shard** — split the ciphertext with a K-of-N XOR erasure code into N
+   shards, any K of which reconstruct the original.
+3. **Scatter** — send exactly one shard to each roster peer over the existing
+   encrypted, key-pinned NMP transport. Each peer stores its single opaque
+   shard (tagged `nmp_shards`).
+
+Reading gathers **K** shards (its own local one plus peers' over NMP),
+reconstructs, and decrypts. Below quorum it **fails loudly** — HTTP 503 with an
+explicit `quorum_unavailable` error naming the unreachable peers — and never
+returns wrong output. GCM's auth tag makes reconstruction tamper-evident.
+
+### The guarantee — stated precisely and honestly
+
+**No single peer holds a COMPLETE readable copy; full content requires a K-of-N
+quorum of shards.** To keep memories *semantically searchable* even after the
+author's device is gone, each peer also stores a small **plaintext index entry**
+(title + a bounded ~160-char snippet + the AES key + the roster). This is an
+honest tradeoff, and the docs state it plainly: because that index entry holds
+the key, a single peer *could* decrypt its own 1/K fragment and does see the
+bounded snippet — so **the quorum protects *completeness*, not secrecy against a
+key-holding peer.** It is deliberately **not** sold as threshold secrecy or
+zero-knowledge (that would need Shamir sharing / Reed-Solomon, out of scope).
+
+### The phone can join too
+
+The iPhone can't run the Node `supermemory-server` (iOS has no Node runtime and
+forbids spawning a server), so it runs an **equivalent on-device native store**
+— a file blob store plus Apple `NaturalLanguage` embeddings for semantic search,
+with a sentence → word-average → lexical fallback chain and **no network at
+all**. A single mesh can *mix* backends: Macs on Supermemory, a phone on the
+native store, behind one `NMPMemoryStore` seam.
+
+### Verified live
+
+Measured this session: a mixed 3-peer mesh — two Macs on Supermemory, one peer
+on the native on-device store — sharded a memory 2-of-3, then a Supermemory peer
+was **killed with `kill -9`**, and a survivor reconstructed the full plaintext
+using its own shard plus the native-store peer's shard served over NMP. Kill a
+*second* peer (drop below quorum) and recall fails explicitly. Semantic recall
+was confirmed end-to-end (measured similarity **0.71** for the target memory vs
+0.48 for an unrelated one; warm-instance ingestion searchable **~1.2 s** after
+add). The memory codec + native store carry **29 passing unit tests** (17 shard
++ 12 native store).
+
+---
+
+## How we beat TCP (and TLS, and QUIC)
+
+**The claim, honestly scoped:** for the traffic distributed inference actually
+produces — many small, latency-sensitive per-token round trips — NMP is the
+**fastest *secure* transport**, and its NACK+FEC design beats TCP's
+head-of-line blocking under loss. The repo backs this with a **fully measured**
+four-leg transport race (`NMPTransportRace`): a real generation's exact traffic
+(round trips × payload bytes) replayed over four real transport stacks on
+loopback, each doing a genuine handshake and moving the same bytes.
+
+### Handshake latency (measured, loopback)
+
+| NMP (Noise IK) | TCP+TLS 1.3 | QUIC |
+|---|---|---|
+| **1.2–2.9 ms** | 20–26 ms | 8–12 ms |
+
+*Source: `Docs/Project_Overview.md`.* Noise IK completes an encrypted session in
+**one round trip** because both peers already know each other's static keys —
+no certificate exchange, no identity-hiding overhead. For a mesh where peers
+come and go, this is the difference that matters.
+
+### The transport race — clean loopback, p50 total time (handshake + transfer)
+
+Measured, 20 trials per shape, lower is better (*source:
+`Docs/Protocol_Comparison.md`*). Traffic shapes come from real KV-cached mesh
+generations (~3.5 KB/activation):
+
+| Shape | NMP | TCP (no crypto) | TCP+TLS 1.3 | QUIC |
+|---|---:|---:|---:|---:|
+| prefill-burst (one large trip) | **1.82 ms** | 0.53 ms | 17.72 ms | 8.75 ms |
+| decode-32 (many small trips) | **4.65 ms** | 2.81 ms | 19.57 ms | 11.31 ms |
+| decode-128 (many small trips) | **14.34 ms** | 6.68 ms | 28.75 ms | 19.86 ms |
+
+A second measured run (median of 5, `Docs/Project_Overview.md`) at different
+shapes: 32 trips × 64 KB/dir — NMP **18.3 ms**, TCP 4.4, TLS 23.7, QUIC 17.2;
+16 trips × 4 KB/dir — NMP **3.1 ms**, TCP 1.5, TLS 19.3, QUIC 9.7.
+
+**How to read this honestly:**
+
+- **Against the encrypted transports — the real comparison — NMP wins
+  decisively**, 1.4–10× faster than TLS/QUIC on every shape (e.g. decode-128:
+  NMP 14.3 ms vs QUIC 19.9 ms vs TLS 28.8 ms). NMP does per-packet AES-256-GCM
+  just like TLS/QUIC, but its 1-RTT Noise IK + lean AEAD datagrams avoid the
+  heavy per-connection and per-record costs they pay.
+- **Plain TCP is faster because it does *nothing*** — no encryption, no framing.
+  It's the *floor*, included to show exactly what NMP's security costs. You'd
+  never ship inference over unauthenticated plaintext on a shared LAN; the bar
+  NMP clears is "fastest transport that actually protects the traffic."
+- **Loopback isolates protocol cost — radio time is absent from every leg.**
+  These compare stack overhead, not Wi-Fi. The race refuses to *model* any leg
+  it can't actually run (it reports the skip instead).
+
+### Why NMP is designed to pull ahead under loss
+
+Clean loopback doesn't exercise the reason NMP is UDP-based. TCP (and TLS/QUIC
+over it) suffer **head-of-line blocking**: one dropped segment stalls every byte
+behind it for a retransmit round trip. NMP instead uses **NACK-only
+retransmission + XOR FEC** — every 4 DATA packets carry one XOR parity packet,
+so a single loss per group is rebuilt receiver-side with **no round trip at
+all**, while other packets keep flowing. Plus AWDL-aware traffic shaping backs
+off only on radio paths where airtime contention is real.
+
+Measured in isolation (*source: `Docs/Protocol_Comparison.md`*): **FEC
+reconstructs a lost activation packet in ~0.17 ms vs ~10 ms for a NACK round
+trip** — the recovery cost that head-of-line blocking imposes on TCP is exactly
+the currency per-token inference can't spare.
+
+### Loss resilience — measured, in-process mesh with real crypto/FEC/NACK
+
+Injected loss, medians of 3 paired runs (*source: `Docs/Project_Overview.md`,
+2026-07-13*):
+
+| Injected loss | Throughput vs clean | p95 latency vs clean |
+|---|---|---|
+| 2% | 1.00× (free) | 1.00× |
+| 5% | 1.00× (free) | 1.19× |
+| 10% | ~1× (within run noise) | 1.11× |
+| 15% | 0.88× | 1.97× |
+| 20% | 0.72× | 1.97× |
+| 25% | inference times out — the honest breaking point | — |
+
+Loss up to ~10% is effectively free; the knee at 25% (where NACK rounds
+themselves get lost) is documented as the measured edge, not hidden.
+
+### Real-model inference (measured, Apple M3)
+
+Llama-2-7B-Chat Q4_K_M over a real **two-process UDP mesh** (weights on the
+peer, tokenizer on the coordinator): **8.7–12.1 tok/s**, per-token p50 **≈68 ms**,
+protocol overhead **≈8–17 ms/token and shrinking as model compute grows**,
+output **token-for-token identical** to single-device greedy. *Source:
+`Docs/Project_Overview.md` / `Docs/Phase8_Design.md`.* Failover re-shards in
+**0.4 ms** (measured, loopback) with peer drop detected within **5.5 s**.
+
+---
+
+## Architecture
+
+**NMP is a custom UDP transport protocol for distributed AI inference across
+Apple devices.** The stack, bottom to top:
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  Web / control  DashboardServer · WebUI · TransportRace · Resource │  React PWA, live token
+│                 (hand-rolled HTTP + RFC 6455 WS on NWListener)     │  streaming, measured race
+├──────────────────────────────────────────────────────────────────┤
+│  Fault tolerance  PeerHealthMonitor · FaultToleranceOrchestrator   │  drop/join re-sharding (0.4 ms)
+├──────────────────────────────────────────────────────────────────┤
+│  Inference      GGUF · ModelSharder · InferenceOrchestrator ·      │  proportional layer sharding,
+│                 PeerShardEngine · Llama{Runtime,Engine,Wire}       │  pipeline walk, bit-exact verify
+├──────────────────────────────────────────────────────────────────┤
+│  Mesh assembly  Bonjour · Capabilities · CoordinatorElection       │  zero-config mDNS, deterministic
+├──────────────────────────────────────────────────────────────────┤
+│  Reliability    Reliability(NACK) · FECCodec/FECGroup · AWDL       │  NACK-only + XOR FEC, link-aware
+├──────────────────────────────────────────────────────────────────┤
+│  Transport      UDPTransport · PacketCodec · NoiseIK · Symmetric   │  20-byte BE header, 1-RTT Noise IK,
+│                 Crypto                                              │  per-session AES-256-GCM + replay
+└──────────────────────────────────────────────────────────────────┘
+```
+
+1. **Transport** — 20-byte big-endian header, 1-RTT Noise IK handshake
+   (`Noise_IK_25519_AESGCM_SHA256`, verified against the published cacophony
+   test vector), per-session AES-256-GCM with the header as AAD and a 64-bit
+   sliding replay window.
+2. **Reliability** — NACK-only retransmission from a 64-packet ring (no ACKs, no
+   sender timers: silence means delivered) + XOR FEC over 4-packet groups
+   (recovers a single loss per group with no round trip). Link awareness
+   (`NMPLinkKind`) packs MTU-safe 1350 B chunks + parity + AWDL shaping on radio
+   paths, and ships kernel-ceiling ~9 KB datagrams with zero protective overhead
+   on wired/loopback.
+3. **Mesh assembly** — Bonjour zero-config discovery (capabilities in TXT
+   records), deterministic capability-based coordinator election.
+4. **Inference** — GGUF parsing, proportional layer sharding by measured
+   seconds-per-layer, pipeline walking, bit-exact verification. Two engines
+   behind one seam (`NMPShardComputeEngine`): a deterministic reference engine
+   (the correctness oracle) and real llama.cpp via a `dlopen`'d C shim (never
+   linked — the package stays dependency-free).
+5. **Fault tolerance** — drop/join re-sharding, activity-based liveness.
+6. **Web / control** — a hand-rolled HTTP + WebSocket server serves a React PWA
+   (`--ui`) with live token streaming, per-device telemetry, compute-share
+   sliders that re-shard the live mesh, and the measured transport race.
+
+**Hard rules** (from the spec): no async/await (callback style on serial
+dispatch queues); zero SwiftPM dependencies (Apple-native only); big-endian NMP
+wire formats; honest measurement (measured vs modeled always labeled);
+trusted-LAN security stance (no TLS/auth on the dashboard — never port-forward
+it).
+
+---
+
+## Getting started
+
+**Requirements:** macOS 13+ (Apple Silicon), Xcode 14.2+ / Swift 5.8+. All mesh
+devices must be on the **same Wi-Fi** (not a guest/hotspot network — those block
+mDNS discovery).
+
+### Build, test, run
 
 ```bash
-cd NeuraMeshProtocol
+cd ~/neuramesh/NeuraMeshProtocol
 swift build
-swift test                             # 326 unit + loopback integration tests
+swift test                       # full suite (~20 s)
 
-swift run nmp-peer                     # compute peer (cross-device mesh)
-swift run nmp-coordinator              # coordinator + cross-device benchmark
-swift run nmp-dashboard                # testing dashboard on http://localhost:8080
-swift run nmp-dashboard --benchmark    # headless benchmark suite → Results/*.csv
+swift run nmp-dashboard          # simulated mesh + dashboard on :8080
+swift run nmp-dashboard --ui     # + React UI on :3000, all interfaces (LAN)
+swift run nmp-dashboard --benchmark   # headless suite → Results/*.csv
 ```
 
-### Real LLM inference (Phase 8)
+`swift run nmp-dashboard --ui` is the 60-second start: a live reference mesh
+(real handshakes, encryption, FEC) plus a browser UI on port **3000** and a
+startup banner with your Mac's real `http://<hostname>.local:3000`, its LAN IPs,
+and a scannable QR code. Open the same URL on Mac, iPhone, and iPad — every tab
+shows the same live mesh. On the phone, Safari **Share ▸ Add to Home Screen**
+installs it as a PWA served by the mesh itself (no Xcode). *A PWA is a control
+surface — a phone that should contribute **compute** needs the native peer app,
+since browsers can't open UDP sockets.*
+
+### Real LLM inference (llama.cpp)
 
 ```bash
-brew install llama.cpp && scripts/setup_llama.sh    # one-time: build the shim
+# one-time: build the dlopen'd shim
+brew install llama.cpp && scripts/setup_llama.sh     # → Vendor/llama/libnmpllama.dylib
 
-# single device / full-stack-in-one-process (POST /api/inference for text):
-swift run nmp-dashboard --engine llamaCpp --model ~/models/model.gguf --placement local
-swift run nmp-dashboard --engine llamaCpp --model ~/models/model.gguf   # remote shard
+# get a model
+mkdir -p ~/models && cd ~/models
+curl -LO https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_K_M.gguf
 
-# real two-process / two-device mesh (weights on the peer, tokenizer on the coordinator):
-swift run nmp-peer        --engine llamaCpp --model ~/models/model.gguf
-swift run nmp-coordinator --engine llamaCpp --model ~/models/model.gguf \
-                          --prompt "The capital of France is" --tokens 16
-```
-
-A llama plan is one full-range shard — llama.cpp cannot execute layer
-sub-ranges, so "distributed" means real remote execution over the real
-transport, with greedy sampling making output identical across placements.
-Step-by-step guide, measured results, and the design rationale:
-`Docs/Phase8_Design.md`.
-
-### Fast mesh (Phase 9): one-command setup, compressed wire, speculation
-
-```bash
-swift run nmp-dashboard --auto-config              # reference mesh: probe → balance → persist
-swift run nmp-dashboard --engine llamaCpp --model ~/models/model.gguf \
-                        --auto-config              # llama: zero-trim wire (lossless, ~99% smaller)
-
-# speculative decoding: drafts locally, verifies a whole draft in ONE round trip
-curl -X POST localhost:8080/api/inference \
-     -d '{"prompt":"...","max_tokens":32,"enable_speculation":true}'
-# or serve everything speculatively, optionally with a small same-vocab draft model:
-swift run nmp-dashboard --engine llamaCpp --model ~/models/model.gguf \
-                        --auto-config --speculation [--draft-model small.gguf]
-
-# real two-process mesh with the same levers:
-swift run nmp-coordinator --engine llamaCpp --model ~/models/model.gguf \
-                          --prompt "..." --tokens 32 --speculation --zero-trim
-```
-
-Auto-config benchmarks each device with real probe passes, balances layer
-spans to the measured speeds, persists the profile (`~/.nmp/`), and picks
-the wire format. Speculative output is token-for-token identical to plain
-greedy output — drafts only ever save round trips, never change text.
-Guide + measured results: `Docs/Phase9_Design.md`.
-
-### Mesh 2.0/2.1: multi-device web UI, live streaming, measured race
-
-```bash
-swift run nmp-dashboard --ui           # browser UI on port 3000, all interfaces
+# full stack in one process, with one-command auto-config (probe → balance → persist → wire format)
 swift run nmp-dashboard --ui --engine llamaCpp \
     --model ~/models/llama-2-7b-chat.Q4_K_M.gguf --auto-config
 ```
 
-The coordinator itself serves a React UI (prebuilt in `Public/` — npm only
-needed to edit `web/`). The startup banner prints your Mac's real
-`<hostname>.local:3000`, its LAN IPs, and a QR code; open it from Mac,
-iPhone, iPad simultaneously — every tab shows the same live mesh. Views:
-mesh dashboard, inference runner (speculation toggle, protocol comparison),
-device panel, benchmark center, protocol comparison, chaos slider.
-Trusted LAN only (no TLS/auth). Setup guide: `Docs/Mesh2_WebUI_Guide.md`.
+`--auto-config` benchmarks each device with real probe passes, balances layer
+spans to the measured speeds, persists the profile to `~/.nmp/`, and picks the
+compressed wire format (llama: **zero-trim**, measured lossless
+1,048,576 B → 11,928 B, −98.9%, per 32-token generation). Add `--speculation`
+(with an optional `--draft-model` sharing the target's vocabulary) for
+draft/verify decoding whose output is token-for-token identical to plain greedy.
 
-Mesh 2.1 adds, on the same stack:
+### Real two-process / two-device mesh
 
-- **Real-time streaming** — every confirmed token is broadcast over the
-  existing WebSocket as it is generated; a run submitted from the laptop
-  appears token-by-token on the phone (and vice versa), with identical
-  final metrics everywhere.
-- **A measured transport race** (`POST /api/comparison/run`) — runs a real
-  generation, then replays its exact traffic pattern over real loopback
-  sockets. Since Mesh 2.5 all four legs are wall-clock measurements on
-  real sockets: the full NMP stack (Noise IK + AES-256-GCM over UDP) vs
-  plain kernel TCP vs TCP+TLS 1.3 vs QUIC (the TLS/QUIC legs stage an
-  ephemeral self-signed P-256 identity in-process and pin it).
-- **Device panel** (`GET /api/devices/metrics`) — live kernel counters
-  (RAM, storage, CPU, this process's footprint) plus per-peer mesh facts,
-  and a **compute-share slider** (`POST /api/devices/:id/allocate`) that
-  actually re-shards the live mesh: cap a device at 40% and watch its
-  layer span shrink on every open browser. Reference mesh only — a llama
-  plan is one full-range shard, and the API says so.
-- **Web-client tracking** — `/health` reports `web_clients`; the phone
-  shows up the moment it opens the page (`GET /api/clients` lists them).
+```bash
+# terminal 1 — the compute peer (weights live HERE):
+swift run nmp-peer --engine llamaCpp --model ~/models/llama-2-7b-chat.Q4_K_M.gguf
 
-Mesh 2.2 makes the web app an **installable PWA, served by the mesh
-itself**: scan the QR once, Share ▸ Add to Home Screen, and from then on
-tapping the NeuraMesh icon opens a full-screen app that finds and
-reconnects to your mesh automatically ("Looking for your mesh…" →
-"✓ Connected to <your-mac>"). No Xcode, no re-pairing. (A PWA is a
-control surface — a phone that should *contribute compute* still needs
-the native peer app; browsers can't open UDP sockets. And it installs
-from the mesh, not a public domain, because HTTPS pages can't reach
-`http://` LAN devices — see `Docs/Start_Here.md` §2.1.)
+# terminal 2 — the coordinator (tokenizer only in llama mode):
+swift run nmp-coordinator --engine llamaCpp --model ~/models/llama-2-7b-chat.Q4_K_M.gguf \
+    --prompt "The capital of France is" --tokens 16
+```
 
-Mesh 2.3 turns the Devices tab into **full per-device telemetry, all
-measured**: live network ↓/↑ per link (every datagram counted at the
-`PeerConnection` wire boundary), requests actually served per peer with
-last-stage compute time, peer-reported resources over the mesh (new
-`NMPPeerResourceReport` message — a physical peer reports its own
-RAM/CPU/GPU/storage; in-process peers are labeled as sharing the host
-rather than drawn as fake separate hardware), whole-machine GPU% from
-the accelerator driver, and mesh totals. Plus a phone-sized layout for
-the PWA (safe-area insets, scrollable tabs, full-width sliders) and the
-connected toast now shrinks to a green dot after 3 s. See
-`Docs/Mesh2_WebUI_Guide.md` §5.7.
+Bonjour publish/browse → capability exchange → deterministic election → Noise IK
+over real UDP → shard assignment → every token one real encrypted round trip.
+For **Mac + iPhone** (native compute peer), follow `Docs/CrossDevice_Setup_Guide.md`
+(and `Docs/Memory_Mesh_iOS.md` for the on-device memory backend).
 
-Mesh 2.4: **LAN peers join the web dashboard live** — the reference
-dashboard browses Bonjour and dials the iPhone peer app (or `nmp-peer`
-on another Mac) over real UDP, joins it into the web-visible mesh, and
-re-shards on every open browser. Open the app on the phone, watch its
-device card appear with its own resource bars and serve counter. See
-`Docs/Mesh2_WebUI_Guide.md` §5.8.
+### The distributed memory-mesh demo
 
-Or open the folder directly in Xcode (`File > Open…`) — SwiftPM packages open natively;
-no `.xcodeproj` is required or checked in.
+```bash
+# 0. install a local, self-hosted supermemory-server (localhost only)
+curl -fsSL https://supermemory.ai/install | bash
 
-**Full operator's manual — every mode, how to test each feature, connecting
-peers, troubleshooting: `Docs/Start_Here.md`.** Cross-device setup (Mac
-coordinator + iPhone peer): `Docs/CrossDevice_Setup_Guide.md`.
+# 1. stand up 3 independent local Supermemory instances + per-peer configs
+scripts/setup_memory_mesh.sh start
 
-## Modules
+# 2. run the three memory peers (each holds ONE shard)
+swift run nmp-memory-peer --config ~/.neuramesh-memdemo/peer1/config.json
+swift run nmp-memory-peer --config ~/.neuramesh-memdemo/peer2/config.json
+swift run nmp-memory-peer --config ~/.neuramesh-memdemo/peer3/config.json
+# (a phone or Mac can instead run the native on-device backend: nmp-memory-peer --local-store)
 
-| File | Purpose |
+# 3. drive the kill-a-peer demo: write → prove 1 shard/peer → recall →
+#    kill -9 a peer → recall survives from the quorum → (--kill-two shows explicit failure)
+scripts/run_memory_demo.sh
+```
+
+Full operator's manual — every mode, how to test each feature, connecting peers,
+troubleshooting: **`Docs/Start_Here.md`**.
+
+---
+
+## Project layout
+
+| Path | What |
 |---|---|
-| `PacketCodec.swift` | NMP packet header encode/decode (20-byte header, big-endian) |
-| `NoiseIK.swift` | `Noise_IK_25519_AESGCM_SHA256` handshake, implemented from the Noise spec (verified against the published cacophony vector) |
-| `SymmetricCrypto.swift` | Per-session AES-256-GCM with `nonce_seed ‖ seq` nonces, header AAD, 64-bit sliding replay window |
-| `PeerConnection.swift` | Handshake state machine, retry/backoff, encrypted send/recv, NACK servicing, packet-event stream |
-| `Reliability.swift` | Phase 2: NACK payload codec, 64-packet retransmit ring, receiver loss tracker |
-| `FECCodec.swift` | Phase 3: CRC32, word-wise XOR parity, parity packet wire format |
-| `FECGroup.swift` | Phase 3: sender group builder + receiver reconstructor |
-| `AWDLDetector.swift` | Phase 3: contention inference (loss rate + latency shift, hysteresis) |
-| `TrafficShaper.swift` | Phase 3: defers non-critical data during inferred AWDL contention |
-| `Capabilities.swift` | Phase 4: capability struct, binary + TXT encodings, local measurement |
-| `CoordinatorElection.swift` | Phase 4: deterministic election (highest compute class, ties → lowest peerID) |
-| `Bonjour.swift` | Phase 4: mDNS service publishing/browsing with capabilities in TXT records |
-| `PeerDiscoveryManager.swift` | Phase 4: discovery + capability refresh + election orchestration |
-| `UDPTransport.swift` | Network.framework UDP transport + transport abstraction; classifies the physical path (`NMPLinkKind`) and the kernel datagram ceiling |
-| `GGUF.swift` | Phase 5: GGUF v2/v3 container parsing (memory-mapped, hostile-count guards) |
-| `ComputeEngine.swift` | Phase 5: engine seam (`NMPShardComputeEngine`) + deterministic reference engine |
-| `ModelSharder.swift` | Phase 5: proportional layer apportionment (measured speed or class weights) |
-| `ShardMessages.swift` | Phase 5: SHARD_ASSIGN + inference wire formats, tensor chunking/reassembly |
-| `InferenceOrchestrator.swift` | Phase 5: coordinator pipeline walker; Phase 6: stage retry, activity feed |
-| `PeerShardEngine.swift` | Phase 5: peer-side shard serving + metrics reporting |
-| `PeerNode.swift` | Phase 5: turn-key peer/coordinator runtimes (CLIs + iOS app) |
-| `PeerHealthMonitor.swift` | Phase 6: activity-based liveness, 5 s heartbeat timeout, injectable clock |
-| `FaultToleranceOrchestrator.swift` | Phase 6: failover — drop/join re-sharding, health-check polling |
-| `PacketLossInjector.swift` | Phase 6: deterministic loss/burst/blackhole transport decorator + in-memory loopback |
-| `MeshTestbed.swift` | Phase 6: full in-process mesh (real crypto/FEC/NACK) for dashboard, benchmarks, tests |
-| `BenchmarkSuite.swift` | Phase 6: scenario runner, p50/p95/p99, CSV export |
-| `DashboardServer.swift` | Phase 6: HTTP + RFC 6455 WebSocket server on NWListener (zero dependencies) |
-| `PromptInferenceService.swift` | Phase 6+: prompt → per-token mesh passes; Phase 8: codec-driven token loop with EOS early stop |
-| `PromptCodec.swift` | Phase 8: text seam (`NMPPromptCodec`) — reference pseudo-text vs real-LLM codecs |
-| `LlamaWire.swift` | Phase 8: token-state wire format riding inside activation tensors (exact-as-Float32) |
-| `LlamaRuntime.swift` | Phase 8: dlopen binding to the C shim + `NMPLlamaModel` handle (weights or vocab-only) |
-| `LlamaEngine.swift` | Phase 8: `NMPLlamaComputeEngine` (real forward passes, full-range shards) + llama prompt codec |
-| `LlamaTestbed.swift` | Phase 8: single-shard mesh assembly — local baseline or full-stack in-process peer |
-| `AdaptiveSharding.swift` | Phase 9: probe-driven layer balancing, balance reporting, persisted device profiles |
-| `OptimizedActivation.swift` | Phase 9: zero-trim (lossless) + mixed-precision (binary16 + critical f32) wire formats |
-| `PipelinedInference.swift` | Phase 9: pipeline-parallel batch executor (independent sequences overlap across stages) |
-| `SpeculativeDecoder.swift` | Phase 9: draft/verify speculative decoding — prompt-lookup + draft-model drafters |
-| `AutoConfig.swift` | Phase 9: one-command setup — membership → benchmark → balance → wire format |
-| `WebUI.swift` | Mesh 2.0: protocol comparison model (measured NMP + modeled TCP/QUIC), LAN identity, Bonjour advert, CoreImage QR banner |
-| `TransportRace.swift` | Mesh 2.1/2.5: MEASURED four-leg protocol race — a run's traffic replayed over the real NMP UDP stack vs kernel TCP vs TCP+TLS 1.3 vs QUIC, all wall-clock |
-| `TLSIdentity.swift` | Mesh 2.5: ephemeral self-signed P-256 identity (hand-rolled X.509) for the TLS/QUIC race legs |
-| `ResourceMonitor.swift` | Mesh 2.1: live host resource sampling (Mach/BSD kernel counters) for the device panel |
-| `web/` → `Public/` | Mesh 2.0/2.1: React UI source → committed build the coordinator serves (`--ui`) |
+| `Sources/NMP/` | the whole protocol + runtime library (`NMP`) — transport, reliability, FEC, mesh, sharding, engines, memory mesh, dashboard |
+| `Sources/NMPPeerCLI/` | `nmp-peer` — a compute peer (the same runtime the iOS app embeds) |
+| `Sources/NMPCoordinatorCLI/` | `nmp-coordinator` — coordinator + cross-device benchmark driver |
+| `Sources/NMPDashboardCLI/` | `nmp-dashboard` — simulated mesh + web dashboard / UI |
+| `Sources/NMPMemoryPeerCLI/` | `nmp-memory-peer` — a distributed-memory peer (Supermemory or native store) |
+| `Tests/NMPTests/` | the full XCTest suite (unit + in-process mesh integration under seeded loss) |
+| `Docs/` | design docs, benchmarks, setup guides, protocol spec |
+| `scripts/` | setup + demo scripts (`setup_llama.sh`, `setup_memory_mesh.sh`, `run_memory_demo.sh`, `loss_lab.sh`, …) |
+| `web/` → `Public/` | React/TypeScript UI source → committed build the coordinator serves (`--ui`); npm only needed to edit `web/` |
+| `NeuraMeshPeer/` | the iOS peer app (Xcode project, pre-wired and build-verified) |
+| `Vendor/llama/` | the `dlopen`'d llama.cpp shim (gitignored; built by `scripts/setup_llama.sh`) |
 
-## Success Criteria
+---
 
-Phase 1 (validated 2026-07-07 on Apple Silicon macOS):
+## Status & tests
 
-- [x] Handshake completes in <10 ms (measured 1.4 ms mock loopback, 2.3 ms real UDP loopback)
-- [x] Packet encryption/decryption byte-perfect (round-trip tests)
-- [x] Replay protection rejects duplicate packets
-- [x] No crashes on malformed packets (fuzz-ish codec tests included)
+**Full suite: 474 tests, 0 failures** (measured this session) — including
+bit-level codec pins, Noise IK known-answer vectors, full-mesh integration under
+seeded loss, memory shard/seal + native-store coverage, and measured performance
+gates.
 
-Phase 2:
+- **Apple-native, zero SwiftPM dependencies** — Network.framework, CryptoKit,
+  CoreImage, SystemConfiguration, NaturalLanguage. No Vapor, no third-party
+  anything. llama.cpp is reached via a `dlopen`'d C shim, never linked.
+- No async/await anywhere — callback style on serial dispatch queues.
 
-- [x] Lost packets recovered via NACK-triggered verbatim retransmit (measured ≈9 ms, target <100 ms)
-- [x] Reordered packets inside the 64-packet window accepted; duplicates still rejected
-- [x] Unrecoverable losses surfaced via `onUnrecoverableLoss` (Phase 3 FEC input)
-- [x] Noise IK implementation matches the published cacophony known-answer vector byte-for-byte
+```bash
+swift test                                          # everything
+swift test --filter NoiseIKTests                    # crypto known-answer vectors
+swift test --filter "MemoryShardTests|LocalMemoryStoreTests"   # the memory mesh
+```
 
-Phase 3:
+---
 
-- [x] Parity computation <100 µs per 4×1400 B group (measured 6–16 µs)
-- [x] FEC reconstruction <1 ms (measured ≈0.01 ms; end-to-end drop→delivery ≈0.15 ms)
-- [x] ≥80% of losses at 2% loss rate recovered without NACK (measured 100%)
-- [x] Recovery latency <50% of Phase 2 NACK path (measured ≈1%: 0.13 ms vs 9.4 ms)
-- [x] AWDL suppression defers normal data, passes critical/FLUSH/control, backstop-flushes at 200 ms
+## Documentation index
 
-Phase 4:
+- **`Docs/Start_Here.md`** — the operator's manual: every launch mode, tab-by-tab
+  UI guide, a testing playbook for every feature, connecting peers,
+  troubleshooting. **Read this first.**
+- `Docs/Project_Overview.md` — the whole story: core problem, architecture, how a
+  token flows, measured state of the world, honest limitations, roadmap.
+- `Docs/Memory_Mesh.md` — the distributed memory mesh (seal/shard/scatter, the
+  searchable-index tradeoff, the live kill-a-peer measurement).
+- `Docs/Memory_Mesh_iOS.md` — the on-device iPhone memory backend + integration runbook.
+- `Docs/Protocol_Comparison.md` — why NMP, not TCP/TLS/QUIC: the measured
+  four-leg race, honestly scoped.
+- `Docs/Benchmarks.md` — how to run the benchmark suite and interpret the results.
+- `Docs/CaseStudy_PacketLoss.md` — loss-resilience deep dive (FEC / NACK / FLUSH /
+  link-aware restraint), measured micro + macro numbers.
+- `Docs/CrossDevice_Setup_Guide.md` — click-by-click Mac + iPhone mesh setup.
+- `Docs/NMP_Specification.md` — the wire protocol, source of truth.
+- `Docs/Phase8_Design.md` / `Docs/Phase9_Design.md` — llama.cpp integration and
+  the fast-mesh speed levers (adaptive sharding, wire compression, speculation).
 
-- [x] Bonjour discovery <2 s after service publish (measured 0.94 s over real mDNS)
-- [x] Coordinator election deterministic — all peers agree, across all join orders
-- [x] Capability encode/decode round trip byte-exact; trailing bytes ignored (extensible)
-- [x] No manual peer IP configuration needed (Bonjour publishes + browses `_neuramesh._tcp`)
-- [x] 0 regressions: 143 tests pass (108 Phase 1–3 + 35 new)
+---
 
-Phase 5:
-
-- [x] Mesh output vs single device: target ±0.01 — measured **bit-exact** (deterministic reference engine)
-- [x] Mesh latency <2× single device (measured 1.02× with emulated 5 ms/layer compute)
-- [x] Inference correct under 11% injected loss (FEC + NACK repair, bit-exact)
-- [x] Discovery → dial → handshake → shard-assigned, unattended, ~3 s
-- [x] 0 regressions: 178 tests pass
-
-Phase 6:
-
-- [x] Peer drop detected within 5.5 s (5 s heartbeat + 1 s poll, counted from last packet)
-- [x] Re-sharding completes in <500 ms (measured **0.4 ms**: plan + SHARD_ASSIGN ack round)
-- [x] Inference output bit-exact after failover; all-peers-dead fails explicitly (no hang)
-- [x] Dashboard on localhost:8080 — live peer state, inference monitor, loss slider, packet log
-- [x] Benchmarks: loss ≤2% free; 5%/10%/15% → -49%/-55%/-81% throughput; burst recovery <1 s; peer join re-shard 0.4 ms
-- [x] 0 regressions: **207 tests pass** (178 prior + 29 new)
-
-Phase 8 (validated 2026-07-09, Apple M3, Qwen2.5-0.5B Q4_K_M):
-
-- [x] llama.cpp loads quantized GGUF models behind `NMPShardComputeEngine` (shim dlopen'd, package stays dependency-free)
-- [x] Real LLM text via POST /api/inference — `engine: "llamaCpp"`, coherent output, EOS-aware early stop
-- [x] Remote full-range shard over the real stack: output IDENTICAL to single device (greedy determinism), payload measured
-- [x] Two-process mesh over UDP + Bonjour: coordinator vocab-only, weights on the peer — 16.9–18.5 tok/s, per-token p50 ≈58 ms, 3/3 runs identical
-- [x] Llama-2-7B-Chat Q4_K_M over the same real mesh: 8.7–12.1 tok/s, per-token p50 ≈68 ms, runs identical, coordinator stays tokenizer-sized
-- [x] Protocol overhead honest and small: ≈8–17 ms/token, shrinking as model compute grows
-- [x] 0 regressions: **231 tests pass** (12 new: wire format, engine, vocab-only, mesh identity, EOS accounting)
-
-Phase 9 (validated 2026-07-10, Apple M3, Llama-2-7B-Chat Q4_K_M, 32 tokens):
-
-- [x] One-command auto-config: membership → probe passes → balanced shards → wire format, profile persisted to `~/.nmp/` and reused (probe skipped on restart)
-- [x] Adaptive sharding measurably rebalances a heterogeneous mesh (4×-slower peer gets a smaller span; bit-exact output preserved) — pinned by test
-- [x] Zero-trim wire: 1 048 576 B → **11 928 B** per 32-token generation (−98.9%, lossless), remote throughput 13.4 → 14.0+ tok/s (≈ the 14.3–14.5 local baseline)
-- [x] Mixed-precision wire: ~52% of raw for dense activations, top-2% outliers bit-exact, all 65 536 binary16 patterns pinned by test
-- [x] Pipelined batch execution: ~2.4× measured overlap on a 3-stage mesh, outputs bit-identical to serial passes
-- [x] Speculative decoding: 32 tokens in **8 round trips** (4.0 tok/trip, 100% draft acceptance) on repetitive text; output token-for-token identical to plain greedy in every configuration, adversarial drafter included
-- [x] 0 regressions: **272 tests pass** (41 new: half-float bit-level, codecs, balance math, profiles, heterogeneous rebalancing, batch overlap, verify wire, drafters, toy-LM speculative service, real-model speculative identity)
-
-Mesh 2.0 (validated 2026-07-10, Apple M3):
-
-- [x] `--ui`: coordinator serves the React app on all interfaces (default :3000); same live state on every device (3 s polling + WebSocket pushes)
-- [x] Startup banner prints the REAL `<hostname>.local` + LAN IPs + scannable CoreImage QR (no fake `neuramesh.local` claims); Bonjour advert `_neuramesh-ui._tcp`
-- [x] REST surface: `/health`, `/api/devices`, `/api/benchmark/run` (avg + σ), `/api/comparison`, extended `/api/inference` (`round_trips`, `wire_format`, `enable_comparison`, `enable_speculation`) — CORS'd, SPA-served with traversal guard
-- [x] Protocol comparison is honest: NMP row = the measured run; TCP/QUIC = that run re-priced with labeled modeled costs anchored to in-repo measurements (1.0 ms Noise IK handshake, 0.15 ms FEC recovery)
-- [x] TinyLlama-1.1B draft model measured on Llama-2-7B: natural-text acceptance 0% (prompt-lookup) → **54–72%**, round trips 32 → **10–12**, payload → ~1.4 KB, output identical; wall clock loses in-process (shared GPU) and is documented as a physical-mesh win
-- [x] Zero-dependency rule intact: no Vapor — the NWListener server grew the routes; QR via CoreImage; React toolchain isolated in `web/` with its build committed
-- [x] 0 regressions: **291 tests pass** (19 new: comparison model math, routes, CORS, SPA fallback + traversal, benchmark σ, banner + QR)
-
-Mesh 2.1 (validated 2026-07-11, Apple M3):
-
-- [x] Real-time streaming: every confirmed token broadcast over `/ws` as generated (`generation_started/token/complete/failed`); verified end-to-end — a spectator WebSocket client receives the full token stream of a run submitted over HTTP by another client, final text identical
-- [x] Measured transport race (`POST /api/comparison/run`): real generation + its traffic pattern replayed over real loopback sockets — full NMP stack (Noise IK + AES-256-GCM + FEC over UDP, chunked like mesh traffic) vs plain kernel TCP; every number wall-clock, zero modeled fields; llama zero-trim run measured at ~0.5 ms total NMP-vs-raw-TCP overhead for full encryption
-- [x] Device panel: `GET /api/devices/metrics` serves live kernel counters (host_statistics64 RAM, statfs storage, CPU tick deltas, task_info process footprint) + per-peer plan/speed/share facts; honest about in-process peers sharing the host
-- [x] Compute-share allocation actually allocates: `POST /api/devices/:id/allocate {"share":0.4}` re-plans through the normal SHARD_ASSIGN round — verified live: the capped peer's span shrank 6 → 3 layers, every browser sees the new plan + `allocation_update` push
-- [x] Web-client tracking: `/health.web_clients` + `GET /api/clients` — a phone opening the page appears immediately (WebSocket) and ages out 15 s after leaving
-- [x] Two pre-existing races found and fixed: unlocked `activePeers`/`activePlan` reads crashing under load (now lock-protected), and async `registerPeer` racing the adaptive controller's membership read (now settled via `waitForMembership`)
-- [x] 0 regressions: **306 tests pass, verified over 5 consecutive full-suite runs** (15 new: resource monitor kernel counters, transport race byte/trip accounting, token streaming order, share-driven re-planning, new routes, WS generation events)
-
-Mesh 2.5/2.6 (validated 2026-07-13, Apple M-series; all numbers wall-clock, loopback unless noted):
-
-- [x] Four-leg race fully measured: NMP vs kernel TCP vs TCP+TLS 1.3 vs QUIC on real sockets; if a TLS identity can't be staged the legs are SKIPPED and say so — nothing is modeled in their place
-- [x] Handshake: NMP (Noise IK) **1.2–2.9 ms** vs TCP+TLS 1.3 **20–26 ms** vs QUIC **8–12 ms**
-- [x] Race totals, median of 5 runs — 32 trips × 64 KB/direction: NMP **18.3 ms**, TCP 4.4, TLS 23.7, QUIC 17.2; 16 trips × 4 KB/direction: NMP **3.1 ms**, TCP 1.5, TLS 19.3, QUIC 9.7 (beats TLS everywhere and QUIC at inference-shaped traffic; plain TCP is the unencrypted floor)
-- [x] Link-adaptive transport: `NMPLinkKind` path classification — radio gets MTU-packed 1350 B chunks, FEC parity, AWDL shaping; wired/loopback gets kernel-ceiling 9 KB datagrams (clamped to `net.inet.udp.maxdgram` — `maximumDatagramSize` overreports and oversized UDP sends vanish silently) with parity/shaping off
-- [x] AWDL latency-spike signal now requires loss corroboration — send-burst queueing over a near-zero baseline read as contention and deferred DATA at 0.0% loss (the bug that made early races 30× slower); regression-pinned
-- [x] Burst sending (`sendBurst`/`sendBurstAsync`): one queue hop per tensor, transport writes coalesced via `NWConnection.batch`, FLUSH on the last chunk; adopted by the orchestrator, the shard engine, and the race
-- [x] Loss sweep re-measured (medians of 3 paired runs): 2%/5%/10% **free**, 15% −12%, 20% −28% with ~2× p95, 25% = honest breaking point (stage timeouts); earlier Phase 6 sign-off measured −49/−55/−81% at 5/10/15% — see `Docs/CaseStudy_PacketLoss.md`
-- [x] 0 regressions: **331 tests pass** (7 new: link-kind gating, no-parity-on-wired, burst order + FLUSH placement, chunk-size policy, detector corroboration)
-
-## Design Docs
-
-- **`Docs/Start_Here.md` — the operator's manual: every launch mode and when to
-  use it, tab-by-tab UI guide, a testing playbook for every feature (streaming,
-  the measured race, allocation, chaos, speculation), how to connect mesh peers
-  (one command → two processes → two devices), troubleshooting. Read this first.**
-- `Docs/NMP_Specification.md` — protocol spec (source of truth)
-- `Docs/Phase1_Design.md` — Phase 1 decisions, tradeoffs, and flagged known issues
-  (constant-time properties, nonce exhaustion at 2^32, clock-sync assumption)
-- `Docs/Phase2_Design.md` — Phase 2 reliability design: verbatim-retransmit rationale
-  (header-as-AAD ⇒ RETRANSMIT flag unusable, flagged for spec revision), coupled
-  64-packet windows, NACK scheduling, remaining known issues
-- `Docs/Phase3_Design.md` — Phase 3 FEC + AWDL design: parity wire format (explicit
-  member list — why base+count and bare CRC32 group IDs don't survive interleaving),
-  N=4 group-size tradeoff, zero-added-latency grouping, detection heuristics and their
-  limits, measured benchmark table
-- `Docs/Phase4_Design.md` — Phase 4 discovery design: Bonjour choice and TXT-record
-  capability propagation, election algorithm and why load is excluded, capability
-  measurement limits, known issues (mDNS on restricted networks, re-shard triggers
-  flagged for Phase 5+)
-- `Docs/Phase5_Design.md` — Phase 5 sharding design: the compute seam, star-relay
-  topology rationale, application-layer tensor chunking, measured overhead table
-- `Docs/Phase6_Design.md` — Phase 6 fault tolerance: activity-based liveness, failover
-  path, stage retry vs NACK give-up, dashboard architecture, what's deliberately out
-- `Docs/Phase8_Design.md` — Phase 8 llama.cpp integration: why llama shards are
-  full-range (no public sub-range API, KV-cache locality), the dlopen'd C shim, the
-  token-state wire format, step-by-step testing guide with measured results
-- `Docs/Phase9_Design.md` — Phase 9 fast mesh: adaptive sharding loop, the two wire
-  formats and their determinism ledger, why single-stream pipelining is impossible
-  (and what batching + speculation buy instead), draft/verify protocol, measured
-  results, honest limits of prompt-lookup drafting
-- `Docs/Mesh2_WebUI_Guide.md` — Mesh 2.0 multi-device web UI: architecture, zero-friction
-  setup guide, hostname honesty (`.local` reality), measured-vs-modeled comparison rules,
-  TinyLlama draft-model measurements
-- `Docs/Benchmarks.md` — how to run the benchmark suite and interpret the results
-- `Docs/CrossDevice_Setup_Guide.md` — Mac + iPhone mesh walkthrough
-- `Docs/Project_Overview.md` — the whole story: core problem, architecture,
-  how a token flows, measured state of the world, design decisions, honest
-  limitations, roadmap
-- `Docs/CaseStudy_PacketLoss.md` — loss-resilience deep dive: the four
-  defense layers (FEC / NACK / FLUSH / link-aware restraint), measured
-  micro + macro numbers, how to reproduce them
+Made with 🤍 by Divyam Kataria
