@@ -57,7 +57,10 @@ struct PeerArguments {
                 print("""
                 usage: nmp-peer [--layers N] [--hidden N] [--gguf path] \
                 [--tag modelTag] [--slow msPerLayer] \
-                [--engine reference|llamaCpp|llamaShard] [--model path.gguf] [--gpu-layers N]
+                [--engine \(NMPPluginRegistry.usageList)] [--model path.gguf] [--gpu-layers N]
+
+                plugins:
+                \(NMPPluginRegistry.helpBlock)
                 """)
                 exit(0)
             default:
@@ -72,6 +75,19 @@ struct PeerArguments {
 // MARK: - Engine setup
 
 let arguments = PeerArguments.parse()
+
+// Every plugin id is validated against the ONE registry (NMPPlugin.swift);
+// an unknown --engine fails fast with the catalog instead of silently
+// falling back to the reference engine.
+guard NMPPluginRegistry.descriptor(id: arguments.engineKind) != nil else {
+    FileHandle.standardError.write(Data("""
+    unknown --engine '\(arguments.engineKind)'. available:
+    \(NMPPluginRegistry.helpBlock)
+
+    """.utf8))
+    exit(2)
+}
+
 let engine: NMPShardComputeEngine
 var modelTag = arguments.modelTag
 /// Non-nil only for --engine llamaShard, so onServed can report loaded MB.
@@ -132,25 +148,25 @@ if arguments.engineKind == "llamaShard" {
         """.utf8))
         exit(1)
     }
-} else if let path = arguments.ggufPath {
+} else {
+    // Pure-compute plugins (reference, hashShard) are built from generic
+    // context through the ONE registry factory — no plugin-specific code here.
+    let descriptor = NMPPluginRegistry.descriptor(id: arguments.engineKind)!
+    let context = NMPPluginContext(
+        layers: arguments.layers, hiddenSize: arguments.hidden,
+        ggufPath: arguments.ggufPath, modelTag: arguments.modelTag,
+        slowSecondsPerLayer: arguments.slowMillisPerLayer / 1000)
     do {
-        let gguf = try NMPGGUFModel.load(path: path)
-        let referenceEngine = try NMPReferenceComputeEngine(gguf: gguf)
-        referenceEngine.simulatedSecondsPerLayer = arguments.slowMillisPerLayer / 1000
-        engine = referenceEngine
-        if let name = gguf.modelName { modelTag = name }
-        print("[peer] loaded GGUF: \(gguf.modelName ?? path) — "
-              + "\(referenceEngine.layerCount) layers × \(referenceEngine.hiddenSize) hidden "
-              + "(\(gguf.tensors.count) tensors, \(gguf.architecture ?? "?") arch)")
+        let instance = try descriptor.makeGeneric!(context)
+        engine = instance.engine
+        modelTag = instance.modelTag
+        print("[peer] \(descriptor.id) engine: \(modelTag) — "
+              + "\(engine.layerCount) layers × \(engine.hiddenSize) hidden")
     } catch {
-        FileHandle.standardError.write(Data("failed to load GGUF at \(path): \(error)\n".utf8))
+        FileHandle.standardError.write(Data(
+            "failed to start \(descriptor.id) engine: \(error)\n".utf8))
         exit(1)
     }
-} else {
-    let referenceEngine = NMPReferenceComputeEngine(
-        layerCount: arguments.layers, hiddenSize: arguments.hidden)
-    referenceEngine.simulatedSecondsPerLayer = arguments.slowMillisPerLayer / 1000
-    engine = referenceEngine
 }
 
 // MARK: - Run

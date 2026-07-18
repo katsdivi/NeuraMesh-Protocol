@@ -151,14 +151,20 @@ public final class NMPDashboardServer {
         /// Mesh 2.0: {"enable_comparison": true} — attach the protocol
         /// comparison (measured NMP + modeled TCP/QUIC) to the response.
         public let enableComparison: Bool
+        /// Which route asked for the generation ("inference" | "chat" |
+        /// "comparison") — carried onto the WS generation_* events so
+        /// clients can delimit transcripts per surface.
+        public let source: String
 
         public init(prompt: String, maxTokens: Int,
                     enableSpeculation: Bool = false,
-                    enableComparison: Bool = false) {
+                    enableComparison: Bool = false,
+                    source: String = "inference") {
             self.prompt = prompt
             self.maxTokens = maxTokens
             self.enableSpeculation = enableSpeculation
             self.enableComparison = enableComparison
+            self.source = source
         }
     }
 
@@ -192,9 +198,16 @@ public final class NMPDashboardServer {
     }
 
     /// Why a benchmark run failed, surfaced verbatim to the API caller.
+    /// `status` is the HTTP status the route answers with: 500 (default)
+    /// for genuine server faults, 429 for busy contention, 409 for
+    /// nothing-to-do refusals, 404 for unknown resources, 400 for bad input.
     public struct BenchmarkFailure: Error, Sendable {
         public let message: String
-        public init(_ message: String) { self.message = message }
+        public let status: Int
+        public init(_ message: String, status: Int = 500) {
+            self.message = message
+            self.status = status
+        }
     }
 
     /// Handler for POST /api/benchmark/run: run `runs` sequential
@@ -242,27 +255,64 @@ public final class NMPDashboardServer {
     public var onObjectiveRequest: ((String,
         @escaping (Result<String, BenchmarkFailure>) -> Void) -> Void)?
 
+    /// Handler for POST /api/mesh/autobalance {"enabled": bool}. Switches the
+    /// mesh between auto layer-balancing (split by measured speed + capacity)
+    /// and manual allocation (the operator's per-device compute shares drive
+    /// the split). Reply with a human summary or a failure. 503 when unwired
+    /// (e.g. an engine mode that doesn't support live re-sharding).
+    public var onAutoBalanceRequest: ((Bool,
+        @escaping (Result<String, BenchmarkFailure>) -> Void) -> Void)?
+
+    /// Handler for GET /api/mesh/plans: the candidate shard plans (speed /
+    /// balanced / capacity) with per-device footprints, for the pre-shard
+    /// preview. Ships the dict verbatim as JSON. 503 when unwired.
+    public var onPlansRequest: ((@escaping ([String: Any]) -> Void) -> Void)?
+
+    /// Handler for POST /api/mesh/strategy {"strategy": "speed|balanced|
+    /// capacity"}: apply a previewed plan (re-shards the mesh).
+    public var onPlanStrategyRequest: ((String,
+        @escaping (Result<String, BenchmarkFailure>) -> Void) -> Void)?
+
     /// Handler for GET /api/models: the installed models with compatibility
     /// flags (compatible / fits this host / recommended / active). The server
     /// ships the array verbatim as JSON under "models". 503 when unwired.
     public var onModelsListRequest: ((@escaping ([[String: Any]]) -> Void) -> Void)?
 
+    /// What POST /api/models/select hands back on success: the human
+    /// summary and whether the mesh is actually restarting (false for
+    /// the selecting-the-already-active-model no-op).
+    public struct ModelSelectOutcome: Sendable {
+        public let summary: String
+        public let reconnecting: Bool
+        public init(summary: String, reconnecting: Bool = true) {
+            self.summary = summary
+            self.reconnecting = reconnecting
+        }
+    }
+
     /// Handler for POST /api/models/select {"path": "..."}. Switch the active
     /// model — the CLI relaunches itself onto it. Reply with a human summary
     /// (the UI shows a brief "reconnecting…" while the mesh restarts) or a
-    /// failure reason (incompatible / won't fit / not found). Fires on the
-    /// server's queue; reply from any queue, exactly once.
+    /// failure reason (incompatible / won't fit / not found / vault slice).
+    /// Fires on the server's queue; reply from any queue, exactly once.
     public var onModelSelectRequest: ((String,
-        @escaping (Result<String, BenchmarkFailure>) -> Void) -> Void)?
+        @escaping (Result<ModelSelectOutcome, BenchmarkFailure>) -> Void) -> Void)?
 
     /// Static facts about the running mesh, surfaced by GET /health and
     /// the UI's dashboard. Set once by the CLI after assembly.
     public struct MeshInfo: Sendable {
         public var engine = "reference"
         public var modelName = ""
+        /// The active model's human display name (catalog name), used for
+        /// saved-chat stamping. Falls back to `modelName` when empty.
+        public var modelDisplayName = ""
         public var shardCount = 0
         public var wireFormat = "float32"
         public var speculationAvailable = false
+        /// BUG-12: true only once the REAL engine + model are live and a
+        /// plan is committed (the CLI flips it). `/health.status` stays
+        /// plain HTTP liveness; gate functionality on `ready`.
+        public var ready = false
 
         public init() {}
     }
@@ -272,6 +322,22 @@ public final class NMPDashboardServer {
         set { queue.async { self.storedMeshInfo = newValue } }
     }
 
+    /// Updates ONLY the live shard count, async (never the sync getter).
+    /// `server.meshInfo.shardCount = n` is a get-modify-set that calls the
+    /// getter's `queue.sync` — a deadlock when invoked from another queue
+    /// (e.g. the re-shard on stateQueue) while a metrics request holds the
+    /// server queue waiting on that same stateQueue. Use this instead.
+    public func updateShardCount(_ count: Int) {
+        queue.async { self.storedMeshInfo.shardCount = count }
+    }
+
+    /// Flips ONLY the readiness flag, async (same get-modify-set deadlock
+    /// rationale as `updateShardCount`). The CLI calls this once the real
+    /// engine + model can actually serve a generation.
+    public func setReady(_ ready: Bool) {
+        queue.async { self.storedMeshInfo.ready = ready }
+    }
+
     /// Directory of the built web UI (web/ → Public/). When set, GET
     /// serves files from it with an index.html fallback for SPA routes;
     /// when nil, the legacy embedded dashboard page is served at /.
@@ -279,6 +345,12 @@ public final class NMPDashboardServer {
         get { queue.sync { storedPublicDirectory } }
         set { queue.async { self.storedPublicDirectory = newValue } }
     }
+
+    /// Local chat history for this device. When set, the CRUD routes under
+    /// /api/chats persist and serve saved conversations; when nil, chat is
+    /// ephemeral (the pre-history behavior). The store is internally
+    /// serialized, so it needs no extra guarding here.
+    public var chatStore: NMPChatStore?
 
     private var storedMeshInfo = MeshInfo()
     private var storedPublicDirectory: URL?
@@ -429,6 +501,13 @@ public final class NMPDashboardServer {
         broadcast(json)
     }
 
+    /// Drops a device's row entirely (a peer that LEFT the mesh, vs
+    /// `alive: false` for one that dropped but should stay visible). Keeps
+    /// GET /api/devices derived from current membership, never stale rows.
+    public func removePeerState(peerID: UInt32) {
+        queue.async { [self] in peerSnapshots.removeValue(forKey: peerID) }
+    }
+
     public func updatePeerState(peerID: UInt32, name: String, latencyMS: Int,
                                 loadPercent: Int, assigned: String, alive: Bool) {
         queue.async { [self] in
@@ -495,32 +574,39 @@ public final class NMPDashboardServer {
     // MARK: Mesh 2.1 broadcasts
 
     /// A generation began (any client, any device sees it start).
+    /// `source` says which surface asked ("inference" | "chat" |
+    /// "benchmark" | "comparison") so WS clients can delimit transcripts.
     public func reportGenerationStarted(prompt: String, maxTokens: Int,
-                                        speculative: Bool) {
+                                        speculative: Bool,
+                                        source: String = "inference") {
         broadcast(object: [
             "type": "generation_started",
             "prompt": prompt,
             "max_tokens": maxTokens,
             "speculative": speculative,
+            "source": source,
         ])
     }
 
     /// One confirmed token, streamed live to every open browser.
     public func reportGenerationToken(text: String, index: Int,
-                                      count: Int, requested: Int) {
+                                      count: Int, requested: Int,
+                                      source: String = "inference") {
         broadcast(object: [
             "type": "generation_token",
             "text": text,
             "index": index,
             "count": count,
             "requested": requested,
+            "source": source,
         ])
     }
 
     /// The generation finished; ships the same metrics /api/inference
     /// returns so every browser converges on identical numbers.
     public func reportGenerationComplete(
-        _ result: NMPPromptInferenceService.GenerationResult
+        _ result: NMPPromptInferenceService.GenerationResult,
+        source: String = "inference"
     ) {
         let tokensPerSec = result.totalSeconds > 0
             ? Double(result.tokenCount) / result.totalSeconds : 0
@@ -534,6 +620,7 @@ public final class NMPDashboardServer {
             "round_trips": result.speculation?.meshRoundTrips
                 ?? result.perTokenSeconds.count,
             "engine": result.engine,
+            "source": source,
         ]
         if let stats = result.speculation {
             object["acceptance_rate"] = (stats.acceptanceRate * 1000).rounded() / 1000
@@ -541,8 +628,10 @@ public final class NMPDashboardServer {
         broadcast(object: object)
     }
 
-    public func reportGenerationFailed(_ message: String) {
-        broadcast(object: ["type": "generation_failed", "error": message])
+    public func reportGenerationFailed(_ message: String,
+                                       source: String = "inference") {
+        broadcast(object: ["type": "generation_failed", "error": message,
+                           "source": source])
     }
 
     /// A device's compute share changed (slider moved on SOME device —
@@ -755,13 +844,23 @@ public final class NMPDashboardServer {
                 handleAllocatePOST(path: path, body: body, client: client)
                 return
             }
+            if path.hasPrefix("/api/chats/") && path.hasSuffix("/delete") {
+                handleChatDeletePOST(path: path, client: client)
+                return
+            }
             switch path {
             case "/api/inference":
                 handleInferencePOST(body: body, client: client)
             case "/api/chat":
                 handleChatPOST(body: body, client: client)
+            case "/api/chats":
+                handleChatSavePOST(body: body, client: client)
             case "/api/mesh/objective":
                 handleObjectivePOST(body: body, client: client)
+            case "/api/mesh/autobalance":
+                handleAutoBalancePOST(body: body, client: client)
+            case "/api/mesh/strategy":
+                handlePlanStrategyPOST(body: body, client: client)
             case "/api/benchmark/run":
                 handleBenchmarkPOST(body: body, client: client)
             case "/api/comparison":
@@ -780,9 +879,19 @@ public final class NMPDashboardServer {
             return
         }
 
+        if path.hasPrefix("/api/chats/") {
+            handleChatLoadGET(path: path, client: client)
+            return
+        }
         switch path {
         case "/health":
             handleHealthGET(client)
+            return
+        case "/api/mesh/plans":
+            handlePlansGET(client)
+            return
+        case "/api/chats":
+            handleChatListGET(client)
             return
         case "/api/devices":
             handleDevicesGET(client)
@@ -908,7 +1017,12 @@ public final class NMPDashboardServer {
     private func handleHealthGET(_ client: Client) {
         let info = storedMeshInfo
         respondJSON(client, status: "200 OK", object: [
+            // "ok" = this HTTP server is up. It says NOTHING about the
+            // engine — gate functionality on "ready" instead (BUG-12).
             "status": "ok",
+            // True only once the real engine + model are live and a shard
+            // plan is committed — i.e. a generation would actually work.
+            "ready": info.ready,
             // Which machine the PWA just found ("Connected to <host>").
             "hostname": NMPLANIdentity.localHostname(),
             "mesh": [
@@ -919,6 +1033,11 @@ public final class NMPDashboardServer {
                 "speculation_available": info.speculationAvailable,
                 "peers": peerSnapshots.count,
                 "peers_alive": peerSnapshots.values.filter(\.alive).count,
+                // How these two are counted, so cross-endpoint numbers can
+                // be compared for the same definition (BUG-18).
+                "peers_note": "peers = device rows served by /api/devices "
+                    + "(coordinator included); peers_alive = those rows "
+                    + "currently alive",
                 "web_clients": activeWebClientsLocked().count,
             ],
         ])
@@ -987,6 +1106,83 @@ public final class NMPDashboardServer {
         }
     }
 
+    /// POST /api/mesh/autobalance {"enabled": bool} — auto (measured) vs
+    /// manual (operator shares) layer balancing.
+    private func handleAutoBalancePOST(body: Data, client: Client) {
+        guard let handler = onAutoBalanceRequest else {
+            respondJSON(client, status: "503 Service Unavailable",
+                        object: ["error": "this engine mode can't switch balancing live"])
+            return
+        }
+        guard let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let enabled = object["enabled"] as? Bool else {
+            respondJSON(client, status: "400 Bad Request",
+                        object: ["error": "body must be JSON with a boolean 'enabled'"])
+            return
+        }
+        handler(enabled) { [weak self, weak client] result in
+            guard let self, let client else { return }
+            self.queue.async {
+                switch result {
+                case .success(let summary):
+                    self.respondJSON(client, status: "200 OK", object: [
+                        "status": "ok",
+                        "auto_balance": enabled,
+                        "summary": summary,
+                    ])
+                case .failure(let failure):
+                    self.respondJSON(client, status: "400 Bad Request",
+                                     object: ["error": failure.message])
+                }
+            }
+        }
+    }
+
+    /// GET /api/mesh/plans — candidate shard plans with per-device footprints.
+    private func handlePlansGET(_ client: Client) {
+        guard let handler = onPlansRequest else {
+            respondJSON(client, status: "503 Service Unavailable",
+                        object: ["error": "plan preview needs the sharded engine"])
+            return
+        }
+        handler { [weak self, weak client] payload in
+            guard let self, let client else { return }
+            self.queue.async {
+                self.respondJSON(client, status: "200 OK", object: payload)
+            }
+        }
+    }
+
+    /// POST /api/mesh/strategy {"strategy": ...} — apply a previewed plan.
+    private func handlePlanStrategyPOST(body: Data, client: Client) {
+        guard let handler = onPlanStrategyRequest else {
+            respondJSON(client, status: "503 Service Unavailable",
+                        object: ["error": "this engine mode can't re-plan live"])
+            return
+        }
+        guard let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let strategy = object["strategy"] as? String, !strategy.isEmpty else {
+            respondJSON(client, status: "400 Bad Request",
+                        object: ["error": "body must be JSON with a 'strategy' "
+                            + "(speed | balanced | capacity)"])
+            return
+        }
+        handler(strategy) { [weak self, weak client] result in
+            guard let self, let client else { return }
+            self.queue.async {
+                switch result {
+                case .success(let summary):
+                    self.respondJSON(client, status: "200 OK", object: [
+                        "status": "ok", "strategy": strategy, "summary": summary,
+                    ])
+                case .failure(let failure):
+                    self.respondJSON(client, status: "400 Bad Request",
+                                     object: ["error": failure.message])
+                }
+            }
+        }
+    }
+
     // MARK: GET /api/models + POST /api/models/select
 
     private func handleModelsGET(_ client: Client) {
@@ -1019,18 +1215,21 @@ public final class NMPDashboardServer {
             guard let self, let client else { return }
             self.queue.async {
                 switch result {
-                case .success(let summary):
+                case .success(let outcome):
                     self.respondJSON(client, status: "200 OK", object: [
                         "status": "ok",
                         "path": path,
-                        "summary": summary,
-                        // The mesh relaunches onto the new model; the UI should
-                        // show "reconnecting…" and poll /health until it's back.
-                        "reconnecting": true,
+                        "summary": outcome.summary,
+                        // True: the mesh relaunches onto the new model; the UI
+                        // shows "reconnecting…" and polls /health until back.
+                        // False: selecting the already-active model — no-op.
+                        "reconnecting": outcome.reconnecting,
                     ])
                 case .failure(let failure):
-                    self.respondJSON(client, status: "400 Bad Request",
-                                     object: ["error": failure.message])
+                    self.respondJSON(
+                        client,
+                        status: "\(failure.status) \(Self.reasonPhrase(for: failure.status))",
+                        object: ["error": failure.message])
                 }
             }
         }
@@ -1052,9 +1251,10 @@ public final class NMPDashboardServer {
         guard let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
               let share = (object["share"] as? Double)
                 ?? (object["share"] as? Int).map(Double.init),
-              share > 0, share <= 1 else {
+              share >= 0, share <= 1 else {
             respondJSON(client, status: "400 Bad Request",
-                        object: ["error": "body must be JSON with 'share' in (0, 1]"])
+                        object: ["error": "body must be JSON with 'share' in [0, 1] "
+                            + "(0 excludes the device)"])
             return
         }
         handler(peerID, share) { [weak self, weak client] result in
@@ -1067,11 +1267,19 @@ public final class NMPDashboardServer {
                         "status": "ok",
                         "peer": String(peerID, radix: 16),
                         "share": share,
+                        // Explicit echo of what the caller asked for; the
+                        // summary shows the resulting layer assignment
+                        // (shares are re-planned into layer spans, so the
+                        // applied fraction can differ — BUG-19).
+                        "share_requested": share,
                         "summary": summary,
                     ])
                 case .failure(let failure):
-                    self.respondJSON(client, status: "500 Internal Server Error",
-                                     object: ["error": failure.message])
+                    // 404 unknown device (BUG-10); 500 for real re-plan faults.
+                    self.respondJSON(
+                        client,
+                        status: "\(failure.status) \(Self.reasonPhrase(for: failure.status))",
+                        object: ["error": failure.message])
                 }
             }
         }
@@ -1095,15 +1303,19 @@ public final class NMPDashboardServer {
         let request = InferenceRequest(
             prompt: prompt,
             maxTokens: (object["max_tokens"] as? Int) ?? 32,
-            enableSpeculation: (object["enable_speculation"] as? Bool) ?? false)
+            enableSpeculation: (object["enable_speculation"] as? Bool) ?? false,
+            source: "comparison")
 
         handler(request) { [weak self, weak client] result in
             guard let self, let client else { return }
             self.queue.async {
                 switch result {
                 case .failure(let failure):
-                    self.respondJSON(client, status: "500 Internal Server Error",
-                                     object: ["error": failure.message])
+                    // 429 busy, 409 nothing-to-race, 500 genuine faults.
+                    self.respondJSON(
+                        client,
+                        status: "\(failure.status) \(Self.reasonPhrase(for: failure.status))",
+                        object: ["error": failure.message])
                 case .success(let outcome):
                     self.respondJSON(client, status: "200 OK",
                                      object: Self.comparisonRunJSON(outcome))
@@ -1204,18 +1416,22 @@ public final class NMPDashboardServer {
                         object: ["error": "body must be JSON with a non-empty 'prompt'"])
             return
         }
+        let runsRequested = (object["runs"] as? Int) ?? 3
         let request = BenchmarkRequest(
             prompt: prompt,
             maxTokens: (object["max_tokens"] as? Int) ?? 32,
-            runs: min(max((object["runs"] as? Int) ?? 3, 1), 10))
+            runs: min(max(runsRequested, 1), 10))
 
         handler(request) { [weak self, weak client] result in
             guard let self, let client else { return }
             self.queue.async {
                 switch result {
                 case .failure(let failure):
-                    self.respondJSON(client, status: "500 Internal Server Error",
-                                     object: ["error": failure.message])
+                    // 429 busy contention; 500 genuine run failures.
+                    self.respondJSON(
+                        client,
+                        status: "\(failure.status) \(Self.reasonPhrase(for: failure.status))",
+                        object: ["error": failure.message])
                 case .success(let generations):
                     let latencies = generations.map { $0.totalSeconds * 1000 }
                     let throughputs = generations.map {
@@ -1232,6 +1448,11 @@ public final class NMPDashboardServer {
                             throughputs.reduce(0, +) / Double(max(1, throughputs.count))),
                         "avg_latency_ms": Self.round2(meanLatency),
                         "stddev_latency_ms": Self.round2(variance.squareRoot()),
+                        // Honest clamping (BUG-15): what the caller asked
+                        // for vs how many runs actually executed (runs is
+                        // clamped to 1...10 server-side).
+                        "runs_requested": runsRequested,
+                        "runs_completed": generations.count,
                         "runs": generations.enumerated().map { index, generation in
                             [
                                 "run": index + 1,
@@ -1294,20 +1515,34 @@ public final class NMPDashboardServer {
                         object: ["error": "body must be JSON with a non-empty 'prompt'"])
             return
         }
-        let maxTokens = (object["max_tokens"] as? Int) ?? 32
+        let requestedTokens = (object["max_tokens"] as? Int) ?? 32
+        // BUG-15: nonsense counts are an input error, not a silent clamp-to-1.
+        guard requestedTokens > 0 else {
+            respondJSON(client, status: "400 Bad Request",
+                        object: ["error": "max_tokens must be ≥ 1"])
+            return
+        }
+        // Over-cap requests ARE clamped — but the response says so via
+        // "max_tokens_effective" instead of clamping silently.
+        let maxTokens = min(requestedTokens,
+                            NMPPromptInferenceService.maxTokensPerRequest)
         let enableSpeculation = (object["enable_speculation"] as? Bool) ?? false
         let enableComparison = (object["enable_comparison"] as? Bool) ?? false
 
         handler(InferenceRequest(prompt: prompt, maxTokens: maxTokens,
                                  enableSpeculation: enableSpeculation,
-                                 enableComparison: enableComparison)) { [weak self, weak client] response in
+                                 enableComparison: enableComparison,
+                                 source: "inference")) { [weak self, weak client] response in
             guard let self, let client else { return }
             // The handler may reply from any queue; connection sends are
             // thread-safe, but client bookkeeping stays on our queue.
             self.queue.async {
                 switch response {
                 case .success(let result):
-                    let object = self.generationJSON(result)
+                    var object = self.generationJSON(result)
+                    if maxTokens != requestedTokens {
+                        object["max_tokens_effective"] = maxTokens
+                    }
                     // Mesh 2.5: "Compare protocols" runs the MEASURED
                     // transport race on the generation's real traffic
                     // pattern — the modeled re-pricing is gone from this
@@ -1432,14 +1667,22 @@ public final class NMPDashboardServer {
                         object: ["error": "the last message must be a non-empty user turn"])
             return
         }
-        let maxTokens = (object["max_tokens"] as? Int) ?? 64
+        let requestedTokens = (object["max_tokens"] as? Int) ?? 64
+        guard requestedTokens > 0 else {
+            respondJSON(client, status: "400 Bad Request",
+                        object: ["error": "max_tokens must be ≥ 1"])
+            return
+        }
+        let maxTokens = min(requestedTokens,
+                            NMPPromptInferenceService.maxTokensPerRequest)
         let enableSpeculation = (object["enable_speculation"] as? Bool) ?? false
         let prompt = NMPChatPrompt.format(messages: messages,
                                           engine: storedMeshInfo.engine,
                                           model: storedMeshInfo.modelName)
 
         handler(InferenceRequest(prompt: prompt, maxTokens: maxTokens,
-                                 enableSpeculation: enableSpeculation)) { [weak self, weak client] response in
+                                 enableSpeculation: enableSpeculation,
+                                 source: "chat")) { [weak self, weak client] response in
             guard let self, let client else { return }
             self.queue.async {
                 switch response {
@@ -1449,6 +1692,9 @@ public final class NMPDashboardServer {
                     // the transcript, so surface the real prompt for
                     // debugging/curiosity.
                     object["assembled_prompt_chars"] = prompt.count
+                    if maxTokens != requestedTokens {
+                        object["max_tokens_effective"] = maxTokens
+                    }
                     self.respondJSON(client, status: "200 OK", object: object)
                 case .failure(let status, let message):
                     self.respondJSON(
@@ -1456,6 +1702,150 @@ public final class NMPDashboardServer {
                         status: "\(status) \(Self.reasonPhrase(for: status))",
                         object: ["error": message])
                 }
+            }
+        }
+    }
+
+    // MARK: Chat history — CRUD over /api/chats (persistence, not the mesh)
+    //
+    // These persist THIS device's conversations via `chatStore`; generation
+    // still flows through the stateless /api/chat pipeline above. The client
+    // owns conversation identity (which turn belongs to which chat) and
+    // saves after each exchange. Absent a store, chat stays ephemeral.
+
+    private func chatSummaryJSON(_ s: NMPChatStore.Summary) -> [String: Any] {
+        [
+            "id": s.id,
+            "title": s.title,
+            "device": s.device,
+            "model": s.model,
+            "created_at": s.createdAt.timeIntervalSince1970,
+            "updated_at": s.updatedAt.timeIntervalSince1970,
+            "message_count": s.messageCount,
+            "compressed": s.compressed,
+        ]
+    }
+
+    /// GET /api/chats — the sidebar list (summaries only, newest first).
+    private func handleChatListGET(_ client: Client) {
+        guard let store = chatStore else {
+            respondJSONArray(client, status: "200 OK", array: [])
+            return
+        }
+        store.list { [weak self, weak client] summaries in
+            guard let self, let client else { return }
+            self.queue.async {
+                self.respondJSONArray(client, status: "200 OK",
+                                      array: summaries.map(self.chatSummaryJSON))
+            }
+        }
+    }
+
+    /// GET /api/chats/<id> — one full conversation (inflating if packed).
+    private func handleChatLoadGET(path: String, client: Client) {
+        let id = String(path.dropFirst("/api/chats/".count))
+        guard let store = chatStore, !id.isEmpty, !id.contains("/") else {
+            respondJSON(client, status: "404 Not Found",
+                        object: ["error": "unknown conversation"])
+            return
+        }
+        store.load(id: id) { [weak self, weak client] conversation in
+            guard let self, let client else { return }
+            self.queue.async {
+                guard let c = conversation else {
+                    self.respondJSON(client, status: "404 Not Found",
+                                     object: ["error": "unknown conversation"])
+                    return
+                }
+                self.respondJSON(client, status: "200 OK", object: [
+                    "id": c.id,
+                    "title": c.title,
+                    "device": c.device,
+                    "model": c.model,
+                    "created_at": c.createdAt.timeIntervalSince1970,
+                    "updated_at": c.updatedAt.timeIntervalSince1970,
+                    "messages": c.messages.map {
+                        ["role": $0.role.rawValue, "content": $0.content]
+                    },
+                ])
+            }
+        }
+    }
+
+    /// POST /api/chats — create (blank id) or replace a conversation.
+    /// Body: {id?, title?, model?, messages:[{role,content}]}.
+    private func handleChatSavePOST(body: Data, client: Client) {
+        guard let store = chatStore else {
+            respondJSON(client, status: "503 Service Unavailable",
+                        object: ["error": "chat history is not enabled on this device"])
+            return
+        }
+        guard let object = try? JSONSerialization.jsonObject(with: body)
+                as? [String: Any],
+              let rawMessages = object["messages"] as? [[String: Any]] else {
+            respondJSON(client, status: "400 Bad Request",
+                        object: ["error": "body must be JSON with a 'messages' array"])
+            return
+        }
+        var messages: [NMPChatMessage] = []
+        for raw in rawMessages {
+            guard let roleRaw = raw["role"] as? String,
+                  let role = NMPChatMessage.Role(rawValue: roleRaw),
+                  let content = raw["content"] as? String else {
+                respondJSON(client, status: "400 Bad Request",
+                            object: ["error": "each message needs a role and content"])
+                return
+            }
+            messages.append(NMPChatMessage(role: role, content: content))
+        }
+        let id = (object["id"] as? String) ?? ""
+        let title = (object["title"] as? String) ?? ""
+        // BUG-13: an empty conversation persists ONLY when the client names
+        // it explicitly (the web UI's new-chat button sends a title) —
+        // otherwise an accidental empty save is an input error, not a row.
+        guard !messages.isEmpty
+                || !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            respondJSON(client, status: "400 Bad Request",
+                        object: ["error": "refusing to save an empty conversation "
+                            + "— send at least one message, or an explicit "
+                            + "'title' to create a named empty chat"])
+            return
+        }
+        // BUG-14: always stamp the base model's display name — never a
+        // slug or an internal "…_sliced_a_b" artifact.
+        let model = Self.chatModelName(
+            requested: (object["model"] as? String) ?? "",
+            meshInfo: storedMeshInfo)
+        store.save(id: id, title: title, model: model, messages: messages) {
+            [weak self, weak client] summary in
+            guard let self, let client else { return }
+            self.queue.async {
+                guard let summary else {
+                    self.respondJSON(client, status: "500 Internal Server Error",
+                                     object: ["error": "could not save the conversation"])
+                    return
+                }
+                self.respondJSON(client, status: "200 OK",
+                                 object: self.chatSummaryJSON(summary))
+            }
+        }
+    }
+
+    /// POST /api/chats/<id>/delete — remove a conversation.
+    private func handleChatDeletePOST(path: String, client: Client) {
+        // /api/chats/<id>/delete
+        let middle = path.dropFirst("/api/chats/".count).dropLast("/delete".count)
+        let id = String(middle)
+        guard let store = chatStore, !id.isEmpty, !id.contains("/") else {
+            respondJSON(client, status: "404 Not Found",
+                        object: ["error": "unknown conversation"])
+            return
+        }
+        store.delete(id: id) { [weak self, weak client] existed in
+            guard let self, let client else { return }
+            self.queue.async {
+                self.respondJSON(client, status: existed ? "200 OK" : "404 Not Found",
+                                 object: ["deleted": existed])
             }
         }
     }
@@ -1469,10 +1859,42 @@ public final class NMPDashboardServer {
     private static func reasonPhrase(for status: Int) -> String {
         switch status {
         case 400: return "Bad Request"
+        case 404: return "Not Found"
+        case 409: return "Conflict"
         case 429: return "Too Many Requests"
         case 503: return "Service Unavailable"
         default: return "Internal Server Error"
         }
+    }
+
+    /// The model name a saved chat is stamped with (BUG-14): the base
+    /// model's DISPLAY name. Slice artifacts ("…_sliced_a_b") are stripped;
+    /// a requested name that is just another spelling of the active model
+    /// (slug vs display name) resolves to the display name; a genuinely
+    /// different explicit name is kept (slice-stripped).
+    static func chatModelName(requested: String, meshInfo: MeshInfo) -> String {
+        func stripSlice(_ name: String) -> String {
+            name.replacingOccurrences(of: #"_sliced_\d+_\d+$"#, with: "",
+                                      options: .regularExpression)
+        }
+        // Same model, any spelling: compare lowercase alphanumerics so
+        // "qwen2.5-0.5b-instruct" == "Qwen2.5 0.5B Instruct".
+        func canonical(_ name: String) -> String {
+            String(name.lowercased().unicodeScalars.filter {
+                CharacterSet.alphanumerics.contains($0)
+            })
+        }
+        let activeTag = stripSlice(meshInfo.modelName)
+        let display = meshInfo.modelDisplayName.isEmpty
+            ? activeTag : stripSlice(meshInfo.modelDisplayName)
+        let cleaned = stripSlice(requested)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if cleaned.isEmpty
+            || canonical(cleaned) == canonical(activeTag)
+            || canonical(cleaned) == canonical(display) {
+            return display
+        }
+        return cleaned
     }
 
     private func respondJSONArray(_ client: Client, status: String, array: [Any]) {

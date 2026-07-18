@@ -30,6 +30,11 @@ public enum NMPOrchestrationError: Error, Equatable, Sendable {
     case peerNotConnected(UInt32)
     case assignmentRejected(peerID: UInt32, status: NMPShardAck.Status)
     case assignmentTimeout(unacked: [UInt32])
+    /// A newer assignment round started while this one was still waiting
+    /// for acks — the newer plan wins; this round's staged plan was never
+    /// committed. (Mode/strategy toggles can now overlap a slow
+    /// vault-streaming ack round, so this is a normal outcome, not a bug.)
+    case assignmentSuperseded
     case notAssigned
     case inputWidthMismatch(expected: Int, got: Int)
     case inferenceTimeout(peerID: UInt32, requestID: UInt32)
@@ -92,6 +97,18 @@ public final class NMPInferenceOrchestrator {
     /// Phase 6: fires for every decrypted packet a shard peer sends us —
     /// the liveness signal `NMPPeerHealthMonitor` feeds on.
     public var onPeerActivity: ((UInt32) -> Void)?
+    /// BUG-3: a peer's COMPUTE path is stalled — `computeStallThreshold`
+    /// consecutive remote-stage timeouts with no successful stage between
+    /// them. Fires with (peerID, consecutive timeouts) on every timeout at
+    /// or past the threshold. Packet activity (pings, metrics) from the
+    /// peer deliberately does NOT reset the count: a backgrounded iPhone
+    /// keeps its radio chatty while its engine is frozen, and that
+    /// heartbeat must not veto compute-path evidence. Consumers should
+    /// evict/re-shard around the peer immediately.
+    public var onPeerComputeStalled: ((UInt32, Int) -> Void)?
+    /// The peer completed a stage (or answered with an explicit status)
+    /// AFTER having been reported stalled — the stall was transient.
+    public var onPeerComputeRecovered: ((UInt32) -> Void)?
 
     // MARK: State
 
@@ -102,6 +119,12 @@ public final class NMPInferenceOrchestrator {
     /// for dead (by design — see Reliability.swift); a fresh request with
     /// a new requestID recovers at the cost of one extra stage timeout.
     public var stageRetryLimit = 1
+    /// BUG-3: consecutive remote-stage timeouts that flag a peer's compute
+    /// path as stalled (see `onPeerComputeStalled`). 2 = one fully failed
+    /// stage (first send + its retry) is enough — the observed failure
+    /// mode is a backgrounded phone that never answers again, and every
+    /// extra "give it a chance" round costs a whole failed generation.
+    public var computeStallThreshold = 2
     /// Peer-reported seconds-per-layer from completed inferences; feed
     /// back into `NMPModelSharder.plan(measuredSecondsPerLayer:)` to
     /// re-balance the next assignment round. Lock-protected: read by the
@@ -111,6 +134,17 @@ public final class NMPInferenceOrchestrator {
         measurementsLock.lock()
         defer { measurementsLock.unlock() }
         return measurements
+    }
+
+    /// Per-peer round-trip seconds — the FIXED network cost of using a peer
+    /// for a token (stage wall-clock minus the peer's self-timed compute),
+    /// independent of how many layers it holds. Local stages have none.
+    /// The latency planner adds one of these per peer that holds any layers,
+    /// so a fast-but-far peer isn't over-weighted by compute speed alone.
+    public var measuredRoundTripSeconds: [UInt32: Double] {
+        measurementsLock.lock()
+        defer { measurementsLock.unlock() }
+        return roundTripSeconds
     }
 
     /// Phase 9: seeds measurements from a persisted profile so a mesh can
@@ -167,6 +201,10 @@ public final class NMPInferenceOrchestrator {
     }
 
     private var measurements: [UInt32: Double] = [:]
+    /// Per-peer round-trip seconds (stage wall-clock − compute), the fixed
+    /// network cost of using the peer for a token — see
+    /// `measuredRoundTripSeconds`.
+    private var roundTripSeconds: [UInt32: Double] = [:]
     private var shares: [UInt32: Double] = [:]
     private var wireFormat: NMPActivationWireFormat = .float32
     private var vaultEndpointValue = ""
@@ -213,6 +251,9 @@ public final class NMPInferenceOrchestrator {
     }
     private var pendingRequests: [UInt32: PendingRequest] = [:]
     private var nextRequestID: UInt32 = 1
+    /// BUG-3: per-peer run of remote-stage timeouts with no success in
+    /// between (queue-owned, like all request state).
+    private var consecutiveStageTimeouts: [UInt32: Int] = [:]
 
     public init(
         localPeerID: UInt32,
@@ -257,6 +298,7 @@ public final class NMPInferenceOrchestrator {
         queue.async { [self] in
             connections.removeValue(forKey: peerID)
             reassemblers.removeValue(forKey: peerID)
+            consecutiveStageTimeouts.removeValue(forKey: peerID)
             // Fail anything in flight toward that peer.
             for (requestID, pending) in pendingRequests where pending.peerID == peerID {
                 completeRequest(requestID,
@@ -280,6 +322,14 @@ public final class NMPInferenceOrchestrator {
         completion: @escaping (Result<Void, NMPOrchestrationError>) -> Void
     ) {
         queue.async { [self] in
+            // A round can now legitimately still be in flight when the next
+            // one starts (setAutoBalance returns before its re-shard
+            // commits). Supersede it explicitly: silently overwriting the
+            // pending state would orphan its completion and let its stale
+            // timer misfire into THIS round.
+            if assignCompletion != nil {
+                finishAssignment(.failure(.assignmentSuperseded))
+            }
             guard !newPlan.isEmpty else {
                 completion(.failure(.emptyPlan))
                 return
@@ -478,7 +528,7 @@ public final class NMPInferenceOrchestrator {
                         completion(.failure(error))
                     case .success(let output):
                         recordMeasurement(peerID: entry.peerID, seconds: seconds,
-                                          layers: entry.layerSpan)
+                                          stageSeconds: seconds, layers: entry.layerSpan)
                         completion(.success(NMPStageResult(
                             output: output,
                             timing: NMPInferenceReport.ShardTiming(
@@ -511,7 +561,7 @@ public final class NMPInferenceOrchestrator {
                     DispatchTime.now().uptimeNanoseconds - stageBegan.uptimeNanoseconds) / 1e9
                 let computeSeconds = TimeInterval(meta.computeMicros) / 1e6
                 recordMeasurement(peerID: entry.peerID, seconds: computeSeconds,
-                                  layers: entry.layerSpan)
+                                  stageSeconds: stageSeconds, layers: entry.layerSpan)
                 completion(.success(NMPStageResult(
                     output: output,
                     timing: NMPInferenceReport.ShardTiming(
@@ -609,11 +659,45 @@ public final class NMPInferenceOrchestrator {
         pendingRequests[requestID]?.timer = timer
     }
 
-    private func recordMeasurement(peerID: UInt32, seconds: TimeInterval, layers: Int) {
-        guard layers > 0, seconds > 0 else { return }
+    private func recordMeasurement(peerID: UInt32, seconds: TimeInterval,
+                                   stageSeconds: TimeInterval, layers: Int) {
+        guard layers > 0 else { return }
         measurementsLock.lock()
         defer { measurementsLock.unlock() }
-        measurements[peerID] = seconds / Double(layers)
+        if seconds > 0 { measurements[peerID] = seconds / Double(layers) }
+        // Round trip = wall-clock stage minus the peer's own compute.
+        // Local stages have no hop, so they record nothing. A remote
+        // result of ~0 is a clock artifact (a throttled peer's self-timed
+        // compute can swallow the whole stage), NOT a free network — never
+        // store it, and never let it overwrite a real measurement:
+        // planByLatency once consumed such a zero as a genuinely free hop
+        // and moved every layer onto the phone (BUG-4).
+        guard peerID != localPeerID else { return }
+        let trip = stageSeconds - seconds
+        if trip > 0 { roundTripSeconds[peerID] = trip }
+    }
+
+    // MARK: Compute-path stall accounting (BUG-3)
+
+    /// Must run on `queue`. One more remote stage timed out against the
+    /// peer; at the threshold, tell the world its compute path is stalled.
+    private func noteStageTimeout(peerID: UInt32) {
+        let count = (consecutiveStageTimeouts[peerID] ?? 0) + 1
+        consecutiveStageTimeouts[peerID] = count
+        guard count >= max(1, computeStallThreshold) else { return }
+        onDiagnostic?("peer \(peerID): \(count) consecutive stage timeout(s) — "
+                      + "compute path stalled (heartbeat activity does not veto this)")
+        onPeerComputeStalled?(peerID, count)
+    }
+
+    /// Must run on `queue`. The peer answered a stage request (result or
+    /// explicit status) — its compute path is alive; reset the run.
+    private func noteStageAnswered(peerID: UInt32) {
+        guard let previous = consecutiveStageTimeouts.removeValue(forKey: peerID)
+        else { return }
+        if previous >= max(1, computeStallThreshold) {
+            onPeerComputeRecovered?(peerID)
+        }
     }
 
     // MARK: Inbound from shard peers
@@ -697,6 +781,19 @@ public final class NMPInferenceOrchestrator {
     ) {
         guard let pending = pendingRequests.removeValue(forKey: requestID) else { return }
         pending.timer?.cancel()
+        // Every remote stage attempt resolves exactly once through here —
+        // the single choke point for compute-path stall evidence (BUG-3).
+        switch result {
+        case .success:
+            noteStageAnswered(peerID: pending.peerID)
+        case .failure(.inferenceTimeout):
+            noteStageTimeout(peerID: pending.peerID)
+        case .failure(.peerReportedFailure):
+            // The peer ANSWERED (with an error) — compute path not stalled.
+            noteStageAnswered(peerID: pending.peerID)
+        case .failure:
+            break // detach/teardown paths carry no stall evidence
+        }
         pending.completion(result)
     }
 }

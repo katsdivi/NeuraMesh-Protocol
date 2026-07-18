@@ -50,12 +50,37 @@ export function Navbar({
           </button>
         ))}
       </nav>
-      <div className={`mesh-pill ${reachable ? 'online' : 'offline'}`}>
-        {reachable
-          ? `${health?.hostname?.replace(/\.local$/, '') ?? '…'} · `
-            + `${health?.mesh.engine ?? '…'} · ${health?.mesh.peers_alive ?? 0} peer(s)`
-          : 'mesh unreachable'}
-      </div>
+      <MeshPill health={health} reachable={reachable} />
     </header>
+  );
+}
+
+/** Green only when the mesh can actually generate: during a restart the
+ *  server answers status "ok" with ready:false (placeholder engine) for
+ *  ~80 s — that window shows amber "starting…", not green. Old servers
+ *  without `ready` behave as before (reachable = green). */
+function MeshPill({
+  health,
+  reachable,
+}: {
+  health: MeshHealth | null;
+  reachable: boolean;
+}) {
+  const ready = health?.ready ?? true;
+  if (!reachable) {
+    return <div className="mesh-pill offline">mesh unreachable</div>;
+  }
+  const host = health?.hostname?.replace(/\.local$/, '') ?? '…';
+  if (!ready) {
+    return (
+      <div className="mesh-pill starting">
+        {host} · starting… (engine loading)
+      </div>
+    );
+  }
+  return (
+    <div className="mesh-pill online">
+      {`${host} · ${health?.mesh.engine ?? '…'} · ${health?.mesh.peers_alive ?? 0} peer(s)`}
+    </div>
   );
 }

@@ -33,6 +33,26 @@
 import Foundation
 import NMP
 
+// MARK: - Chat history
+
+/// This device's on-disk chat store, under Application Support, stamped with
+/// the LAN hostname so a future mesh-shared view can name whose chats these
+/// are. Starts the inactivity sweep that packs quiet conversations to LZFSE.
+/// Returns nil (chat stays ephemeral) only if Application Support is
+/// unavailable.
+func makeChatStore() -> NMPChatStore? {
+    guard let base = try? FileManager.default.url(
+        for: .applicationSupportDirectory, in: .userDomainMask,
+        appropriateFor: nil, create: true) else { return nil }
+    let dir = base.appendingPathComponent("NeuraMesh/chats", isDirectory: true)
+    let store = NMPChatStore(directory: dir,
+                             deviceName: NMPLANIdentity.localHostname())
+    store.startSweeping()
+    print("[nmp-dashboard] chat history at \(dir.path) "
+          + "(quiet chats compress after \(Int(store.inactivityThreshold))s)")
+    return store
+}
+
 // MARK: - Arguments
 
 struct DashboardArguments {
@@ -148,7 +168,9 @@ func locatePublicDirectory() -> URL? {
     }
 }
 
-/// Sequential benchmark runs over the single-flight prompt service.
+/// Sequential benchmark runs over the single-flight prompt service. Every
+/// run is framed on the WebSocket (generation_started/complete, source
+/// "benchmark" — BUG-16); busy contention answers 429, not 500 (BUG-5).
 func wireBenchmark(server: NMPDashboardServer,
                    run: @escaping (String, Int,
                        @escaping (Result<NMPPromptInferenceService.GenerationResult,
@@ -160,12 +182,24 @@ func wireBenchmark(server: NMPDashboardServer,
                 respond(.success(results))
                 return
             }
+            server.reportGenerationStarted(
+                prompt: request.prompt, maxTokens: request.maxTokens,
+                speculative: false, source: "benchmark")
             run(request.prompt, request.maxTokens) { result in
                 switch result {
                 case .success(let generation):
+                    server.reportGenerationComplete(generation, source: "benchmark")
                     results.append(generation)
                     step()
+                case .failure(.busy):
+                    server.reportGenerationFailed(
+                        "an inference is already running", source: "benchmark")
+                    respond(.failure(.init(
+                        "an inference is already running — retry shortly",
+                        status: 429)))
                 case .failure(let error):
+                    server.reportGenerationFailed(String(describing: error),
+                                                  source: "benchmark")
                     respond(.failure(.init("run \(results.count + 1) failed: \(error)")))
                 }
             }
@@ -189,17 +223,34 @@ func wireComparisonRun(server: NMPDashboardServer,
     server.onComparisonRunRequest = { request, respond in
         server.reportMeshEvent("🏁 protocol race: generation, then measured "
                                + "NMP vs TCP transport replay")
+        server.reportGenerationStarted(
+            prompt: request.prompt, maxTokens: request.maxTokens,
+            speculative: request.enableSpeculation, source: "comparison")
         run(request) { result in
             switch result {
+            case .failure(.busy):
+                // Contention is a normal state, not a server fault (BUG-5).
+                server.reportGenerationFailed(
+                    "an inference is already running", source: "comparison")
+                respond(.failure(.init(
+                    "an inference is already running — retry shortly",
+                    status: 429)))
             case .failure(let error):
+                server.reportGenerationFailed(String(describing: error),
+                                              source: "comparison")
                 respond(.failure(.init("generation failed: \(error)")))
             case .success(let generation):
+                server.reportGenerationComplete(generation, source: "comparison")
                 let trips = generation.speculation?.meshRoundTrips
                     ?? generation.perTokenSeconds.count
                 guard generation.networkPayloadBytes >= 2, trips >= 1 else {
+                    // Honest refusal (nothing to fabricate), but a client
+                    // error class: the mesh's state has nothing to race
+                    // (BUG-6). Still no invented numbers.
                     respond(.failure(.init(
                         "this run moved no mesh traffic (local placement?) — "
-                            + "nothing to race")))
+                            + "nothing to race",
+                        status: 409)))
                     return
                 }
                 NMPTransportRace.run(plan: .init(
@@ -370,6 +421,7 @@ func runLlamaDashboard(model: NMPLlamaModel, arguments: DashboardArguments) -> N
     }
 
     let server = NMPDashboardServer()
+    server.chatStore = makeChatStore()
     server.onDiagnostic = { print("[nmp-dashboard] \($0)") }
     do {
         try server.start(port: port)
@@ -427,6 +479,12 @@ func runLlamaDashboard(model: NMPLlamaModel, arguments: DashboardArguments) -> N
     let promptService = NMPPromptInferenceService(
         orchestrator: testbed.orchestrator,
         codec: NMPLlamaPromptCodec(model: model))
+    // Radio mesh: one stalled token must not lock the pipeline (and 429
+    // every other request) for the orchestrator's 30 s whole-inference
+    // default. 4 s is 30×+ over measured token latency yet below the 5 s
+    // health-monitor drop, so a slow peer is retried and a dead one fails
+    // fast either way.
+    promptService.perTokenTimeout = 4
     let reportProgress: (Int, Int) -> Void = { done, total in
         server.updateInferenceProgress(
             progress: Double(done) / Double(max(total, 1)),
@@ -435,13 +493,27 @@ func runLlamaDashboard(model: NMPLlamaModel, arguments: DashboardArguments) -> N
     promptService.onProgress = reportProgress
     speculativeService?.onProgress = reportProgress
 
-    // Mesh 2.1: stream every confirmed token to every open browser.
-    let streamToken: (NMPGeneratedToken, Int, Int) -> Void = { token, count, requested in
-        server.reportGenerationToken(text: token.text, index: token.index,
-                                     count: count, requested: requested)
+    // Mesh 2.1: stream every confirmed token to every open browser, labeled
+    // with the surface that owns the generation (BUG-16). The plain service
+    // stamps its own activeSource (onToken fires on its queue); the
+    // speculative service has no source plumbing, so a queue-guarded label
+    // set at each dispatch site covers it.
+    let specSourceQueue = DispatchQueue(label: "nmp.dashboard.llama.specsource")
+    var specSource = "inference"
+    let setSpecSource: (String) -> Void = { label in
+        specSourceQueue.async { specSource = label }
     }
-    promptService.onToken = streamToken
-    speculativeService?.onToken = streamToken
+    promptService.onToken = { [weak promptService] token, count, requested in
+        server.reportGenerationToken(text: token.text, index: token.index,
+                                     count: count, requested: requested,
+                                     source: promptService?.activeSource ?? "inference")
+    }
+    speculativeService?.onToken = { token, count, requested in
+        let label = specSourceQueue.sync { specSource }
+        server.reportGenerationToken(text: token.text, index: token.index,
+                                     count: count, requested: requested,
+                                     source: label)
+    }
 
     // Mesh 2.1: in-flight flag for /api/devices/metrics.
     let llamaStateQueue = DispatchQueue(label: "nmp.dashboard.llama.state")
@@ -464,14 +536,16 @@ func runLlamaDashboard(model: NMPLlamaModel, arguments: DashboardArguments) -> N
         server.reportGenerationStarted(
             prompt: request.prompt, maxTokens: request.maxTokens,
             speculative: (request.enableSpeculation || dashboardArguments.speculation)
-                && speculativeService != nil)
+                && speculativeService != nil,
+            source: request.source)
         let handleResult: (Result<NMPPromptInferenceService.GenerationResult,
                                   NMPPromptInferenceService.ServiceError>) -> Void = { result in
             llamaStateQueue.async { llamaGenerationRunning = false }
             if case .success(let generation) = result {
-                server.reportGenerationComplete(generation)
+                server.reportGenerationComplete(generation, source: request.source)
             } else if case .failure(let error) = result {
-                server.reportGenerationFailed(String(describing: error))
+                server.reportGenerationFailed(String(describing: error),
+                                              source: request.source)
             }
             switch result {
             case .success(let generation):
@@ -507,6 +581,7 @@ func runLlamaDashboard(model: NMPLlamaModel, arguments: DashboardArguments) -> N
         if speculate, let speculativeService {
             server.reportMeshEvent("🌐 llama inference (speculative): "
                                    + "up to \(request.maxTokens) token(s)")
+            setSpecSource(request.source)
             speculativeService.run(prompt: request.prompt,
                                    maxTokens: request.maxTokens,
                                    completion: handleResult)
@@ -518,6 +593,7 @@ func runLlamaDashboard(model: NMPLlamaModel, arguments: DashboardArguments) -> N
             server.reportMeshEvent("🌐 llama inference: up to \(request.maxTokens) token(s)")
             promptService.run(prompt: request.prompt,
                               maxTokens: request.maxTokens,
+                              source: request.source,
                               completion: handleResult)
         }
     }
@@ -526,18 +602,23 @@ func runLlamaDashboard(model: NMPLlamaModel, arguments: DashboardArguments) -> N
     var meshInfo = NMPDashboardServer.MeshInfo()
     meshInfo.engine = "llamaCpp"
     meshInfo.modelName = model.name
+    meshInfo.modelDisplayName = model.name
     meshInfo.shardCount = 1
     meshInfo.wireFormat = testbed.orchestrator.activationWireFormat.rawValue
     meshInfo.speculationAvailable = speculativeService != nil
+    // The model finished loading during NMPLlamaModel init and the testbed
+    // is live — the mesh can genuinely generate from here (BUG-12).
+    meshInfo.ready = true
     server.meshInfo = meshInfo
 
     wireBenchmark(server: server) { prompt, maxTokens, completion in
         if dashboardArguments.speculation, let speculativeService {
+            setSpecSource("benchmark")
             speculativeService.run(prompt: prompt, maxTokens: maxTokens,
                                    completion: completion)
         } else {
             promptService.run(prompt: prompt, maxTokens: maxTokens,
-                              completion: completion)
+                              source: "benchmark", completion: completion)
         }
     }
 
@@ -545,13 +626,14 @@ func runLlamaDashboard(model: NMPLlamaModel, arguments: DashboardArguments) -> N
     wireComparisonRun(server: server) { request, completion in
         if request.enableSpeculation || dashboardArguments.speculation,
            let speculativeService {
+            setSpecSource("comparison")
             speculativeService.run(prompt: request.prompt,
                                    maxTokens: request.maxTokens,
                                    completion: completion)
         } else {
             promptService.run(prompt: request.prompt,
                               maxTokens: request.maxTokens,
-                              completion: completion)
+                              source: "comparison", completion: completion)
         }
     }
 
@@ -625,7 +707,13 @@ func runLlamaDashboard(model: NMPLlamaModel, arguments: DashboardArguments) -> N
                     + "(watch process_footprint_mb and gpu_percent during "
                     + "a generation: llama.cpp computes on the GPU via Metal)",
                 "generation_in_flight": llamaGenerationRunning,
+                // BUG-20: "manual_mode" is the honest name; the old key is
+                // kept for compat and mirrors it. Both false here: a llama
+                // plan has nothing to re-balance.
+                "manual_mode": false,
                 "allocation_supported": false,
+                "allocation_supported_note":
+                    "deprecated name — same value as manual_mode",
                 "allocation_note": "a llama plan is one full-range shard "
                     + "(llama.cpp cannot split layers), so there is nothing "
                     + "to re-balance — compute shares apply to the "
@@ -634,6 +722,8 @@ func runLlamaDashboard(model: NMPLlamaModel, arguments: DashboardArguments) -> N
                 "totals": [
                     "devices": peers.count,
                     "devices_alive": peers.count,
+                    "devices_note": "coordinator + every mesh member "
+                        + "(all in-process on this host)",
                     "layers_assigned": engine.layerCount,
                     "requests_served": llamaRequestsServed,
                     "net_bytes_per_sec": llamaNetRates.map { $0.toDeviceBps + $0.fromDeviceBps } ?? 0,
@@ -674,10 +764,62 @@ func runLlamaDashboard(model: NMPLlamaModel, arguments: DashboardArguments) -> N
 ///                  the whole model across shards on THIS box)
 ///   • recommended — the highest-quality compatible model that fits
 ///   • active     — the model this mesh is currently serving
+/// Caches the `~/models` scan. Parsing every GGUF header takes seconds, and
+/// the Models tab hits it on every open — so serve the last scan instantly
+/// and refresh in the background when it goes stale, instead of blocking the
+/// request on disk each time. The catalog changes rarely (you add a model),
+/// so a short TTL is plenty.
+final class NMPModelScanCache {
+    static let shared = NMPModelScanCache()
+    private let queue = DispatchQueue(label: "nmp.dashboard.modelscan")
+    private var cached: [NMPModelCandidate] = []
+    private var lastScan = Date.distantPast
+    private var refreshing = false
+    private let ttl: TimeInterval = 30
+
+    /// The last scan, immediately. Cold start scans synchronously (once);
+    /// a warm-but-stale cache returns now and refreshes in the background.
+    func candidates() -> [NMPModelCandidate] {
+        queue.sync {
+            if cached.isEmpty {
+                cached = NMPModelCatalog.scan(directory: "~/models")
+                lastScan = Date()
+            } else if Date().timeIntervalSince(lastScan) > ttl {
+                scheduleRefreshLocked()
+            }
+            return cached
+        }
+    }
+
+    /// Fills the cache off the request path (call at startup) so even the
+    /// first Models-tab open is instant. The scan runs on a background queue.
+    func warm() {
+        queue.async { [self] in
+            if cached.isEmpty || Date().timeIntervalSince(lastScan) > ttl {
+                scheduleRefreshLocked()
+            }
+        }
+    }
+
+    /// Must hold `queue`. Kicks a single background rescan.
+    private func scheduleRefreshLocked() {
+        guard !refreshing else { return }
+        refreshing = true
+        DispatchQueue.global(qos: .utility).async { [self] in
+            let scan = NMPModelCatalog.scan(directory: "~/models")
+            queue.async {
+                self.cached = scan
+                self.lastScan = Date()
+                self.refreshing = false
+            }
+        }
+    }
+}
+
 func shardModelCatalogJSON(currentPath: String) -> [[String: Any]] {
     let hostRAM = Int(NMPSystemCapabilityProbe.measure(peerID: 0x0000_0001).ramMB)
     let fitsRAM: (NMPModelCandidate) -> Bool = { Double($0.fileMB) <= Double(hostRAM) * 0.7 }
-    let all = NMPModelCatalog.scan(directory: "~/models")   // highest quality first
+    let all = NMPModelScanCache.shared.candidates()   // cached; highest quality first
     let recommendedPath = all.first {
         $0.architecture.hasPrefix("qwen") && fitsRAM($0)
     }?.path
@@ -774,10 +916,12 @@ func runLlamaShardDashboard(modelPath: String, selectionReason: String? = nil,
 
     let nodeQueue = DispatchQueue(label: "nmp.dashboard.shard.node")
     let node = NMPCoordinatorNode(engine: coordinatorEngine, modelTag: modelTag, queue: nodeQueue)
+    node.modelBytesPerLayer = perLayerBytes // RAM ceilings for the auto planner
     node.orchestrator.activationWireFormat = .float32 // lossless residual hand-off
     node.onStatus = { print("[nmp-dashboard] \($0)") }
 
     let server = NMPDashboardServer()
+    server.chatStore = makeChatStore()
     server.onDiagnostic = { print("[nmp-dashboard] \($0)") }
     do { try server.start(port: port) }
     catch { fatalError("dashboard server failed to start: \(error)") }
@@ -808,9 +952,20 @@ func runLlamaShardDashboard(modelPath: String, selectionReason: String? = nil,
     let hostCaps = NMPSystemCapabilityProbe.measure(peerID: node.localPeerID)
     var currentPlan: [NMPShardPlanEntry] = []
     var loadedByPeer: [UInt32: Int] = [:]
+    // The coordinator's MEASURED resident bytes and the range they were
+    // measured for. Re-plans keep the measurement while the range is
+    // unchanged instead of resetting to the modeled estimate (the
+    // 39.3↔176.1 MB flip-flop, BUG-19). stateQueue-owned.
+    var coordinatorMeasured: (range: Range<Int>, bytes: Int)?
     var peerNames: [UInt32: String] = [node.localPeerID: "coordinator (this Mac)"]
     var memberCaps: [UInt32: NMPCapabilities] = [hostCaps.peerID: hostCaps]
     var adaptiveChoice: (name: String, reason: String, decision: String, devices: Int)?
+    // stateQueue-owned mirror of node.autoBalance, so the metrics handler
+    // (server queue) reads the mode without racing the node's own queue.
+    var autoBalanceMode = true
+    // True while a generation is in flight, so the auto-rebalance timer never
+    // re-shards mid-token (which would strand the pass on a stale range).
+    var shardInferenceInFlight = false
 
     // The adaptive controller needs a catalog scan of ~/models, which parses
     // every GGUF there (seconds if a big model is present) — so build it in the
@@ -830,14 +985,35 @@ func runLlamaShardDashboard(modelPath: String, selectionReason: String? = nil,
     }
 
     // Push the current split to the Devices/Mesh tabs. MUST run on stateQueue.
+    // Every in-mesh device gets a row derived from the CURRENT committed plan
+    // — a 0-layer device shows an explicit exclusion, never its stale range
+    // (BUG-9), and the coordinator never vanishes at 0 layers (BUG-8).
     func pushShardDevices() {
+        var covered = Set<UInt32>()
         for device in NMPShardReport.devices(plan: currentPlan, loadedBytesByPeer: loadedByPeer) {
             let isCoord = device.peerID == node.localPeerID
+            covered.insert(device.peerID)
             server.updatePeerState(
                 peerID: device.peerID,
                 name: isCoord ? "coordinator (tokenizer + shard)" : shortName(device.peerID),
                 latencyMS: 0, loadPercent: 0,
                 assigned: isCoord ? "\(device.summary) · tokenizer" : device.summary,
+                alive: true)
+        }
+        if !covered.contains(node.localPeerID) {
+            covered.insert(node.localPeerID)
+            server.updatePeerState(
+                peerID: node.localPeerID,
+                name: "coordinator (tokenizer + shard)",
+                latencyMS: 0, loadPercent: 0,
+                assigned: "0 layers — tokenizer only this plan",
+                alive: true)
+        }
+        for peerID in memberCaps.keys where !covered.contains(peerID) {
+            server.updatePeerState(
+                peerID: peerID, name: shortName(peerID),
+                latencyMS: 0, loadPercent: 0,
+                assigned: "0 layers — excluded from the current plan",
                 alive: true)
         }
     }
@@ -871,6 +1047,11 @@ func runLlamaShardDashboard(modelPath: String, selectionReason: String? = nil,
         node.planAndAssign { result in
             switch result {
             case .failure(let error):
+                if case .assignmentSuperseded = error {
+                    // Benign: a newer plan replaced this round mid-flight;
+                    // the newer round reports its own outcome.
+                    return
+                }
                 if case .assignmentRejected(let peerID, .rejectedModelMismatch) = error {
                     server.reportMeshEvent("⚠️ \(shortName(peerID)) holds a DIFFERENT "
                         + "model than this mesh (\(modelTag)) — it stays connected but "
@@ -892,37 +1073,60 @@ func runLlamaShardDashboard(modelPath: String, selectionReason: String? = nil,
                     }
                 }
             case .success(let plan):
+                applyShardPlan(plan, trigger: trigger)
+            }
+        }
+    }
+
+    // Fold a freshly-assigned plan into the UI state. MUST be called off the
+    // node's completion (any queue); it hops to stateQueue itself. Shared by
+    // join/leave reshards, manual allocation, the auto-balance toggle, and the
+    // auto-rebalance tick so every path updates the mesh identically.
+    func applyShardPlan(_ plan: [NMPShardPlanEntry], trigger: String) {
+        stateQueue.async {
+            currentPlan = plan
+            loadedByPeer = Dictionary(uniqueKeysWithValues:
+                plan.map { ($0.peerID, max(0, $0.layerSpan) * perLayerBytes) })
+            // Keep the coordinator's MEASURED bytes while its range is
+            // unchanged — never flip back to the estimate (BUG-19).
+            if let mine = plan.first(where: { $0.peerID == node.localPeerID }),
+               let measured = coordinatorMeasured,
+               measured.range == mine.startLayer..<mine.endLayer {
+                loadedByPeer[node.localPeerID] = measured.bytes
+            }
+            pushShardDevices()
+            server.updateShardCount(plan.count)   // async — NOT a sync get-set (deadlocks)
+            let split = plan.map {
+                "L\($0.startLayer)–\($0.endLayer - 1)→\(shortName($0.peerID))"
+            }.joined(separator: "  ")
+            let honest = fullModelBytes > 0 && plan.count > 1
+                ? " (no device holds all \(fullModelBytes / 1_048_576) MB)" : ""
+            server.reportMeshEvent("🧩 re-sharded (\(trigger)) → "
+                + "\(plan.count) shard(s): \(split)\(honest)")
+            reportAdaptive()
+        }
+        // Replace the coordinator's estimate with its REAL loaded bytes:
+        // partial-loading its range also brings token_embd (first shard),
+        // output (last shard), or the whole model when it is the only
+        // shard — so the number can't under-report what this Mac holds.
+        if let mine = plan.first(where: { $0.peerID == node.localPeerID }) {
+            DispatchQueue.global(qos: .userInitiated).async {
+                _ = try? coordinatorEngine.preload(start: mine.startLayer, end: mine.endLayer)
+                // A plan is committed and the coordinator's weights are
+                // resident — the mesh can genuinely generate (BUG-12).
+                server.setReady(true)
+                let real = coordinatorEngine.loadedBytes
+                guard real > 0 else { return }
                 stateQueue.async {
-                    currentPlan = plan
-                    loadedByPeer = Dictionary(uniqueKeysWithValues:
-                        plan.map { ($0.peerID, max(0, $0.layerSpan) * perLayerBytes) })
+                    coordinatorMeasured = (mine.startLayer..<mine.endLayer, real)
+                    loadedByPeer[node.localPeerID] = real
                     pushShardDevices()
-                    server.meshInfo.shardCount = plan.count
-                    let split = plan.map {
-                        "L\($0.startLayer)–\($0.endLayer - 1)→\(shortName($0.peerID))"
-                    }.joined(separator: "  ")
-                    let honest = fullModelBytes > 0 && plan.count > 1
-                        ? " (no device holds all \(fullModelBytes / 1_048_576) MB)" : ""
-                    server.reportMeshEvent("🧩 re-sharded (\(trigger)) → "
-                        + "\(plan.count) shard(s): \(split)\(honest)")
-                    reportAdaptive()
-                }
-                // Replace the coordinator's estimate with its REAL loaded bytes:
-                // partial-loading its range also brings token_embd (first shard),
-                // output (last shard), or the whole model when it is the only
-                // shard — so the number can't under-report what this Mac holds.
-                if let mine = plan.first(where: { $0.peerID == node.localPeerID }) {
-                    DispatchQueue.global(qos: .userInitiated).async {
-                        _ = try? coordinatorEngine.preload(start: mine.startLayer, end: mine.endLayer)
-                        let real = coordinatorEngine.loadedBytes
-                        guard real > 0 else { return }
-                        stateQueue.async {
-                            loadedByPeer[node.localPeerID] = real
-                            pushShardDevices()
-                        }
-                    }
                 }
             }
+        } else {
+            // All layers live on peers; the coordinator still tokenizes.
+            // The plan is committed, so generation is served from here.
+            server.setReady(true)
         }
     }
 
@@ -940,33 +1144,61 @@ func runLlamaShardDashboard(modelPath: String, selectionReason: String? = nil,
             memberCaps[id] = nil
             peerNames[id] = nil
         }
+        // A departed peer's /api/devices row must go with it — rows derive
+        // from CURRENT membership + plan, never linger stale (BUG-9).
+        server.removePeerState(peerID: id)
         server.reportMeshEvent("📴 peer 0x\(String(id, radix: 16)) left — re-sharding")
         reshard(trigger: "leave: 0x\(String(id, radix: 16))")
+    }
+    // BUG-7 companion: setAutoBalance answers instantly with a STAGED plan
+    // while the SHARD_ASSIGN round runs in the background (a peer may
+    // vault-stream its new layers for ~30 s). The UI state moves only when
+    // the round actually COMMITS — which lands here.
+    node.onBackgroundReshard = { result in
+        switch result {
+        case .success(let plan):
+            applyShardPlan(plan, trigger: "balance-mode re-shard committed")
+        case .failure(.assignmentSuperseded):
+            break // a newer plan took over mid-round — its own commit reports
+        case .failure(let error):
+            server.reportMeshEvent("⚠️ balance-mode re-shard failed in the "
+                + "background: \(error) — the previous plan keeps serving")
+        }
     }
 
     let promptService = NMPPromptInferenceService(
         orchestrator: node.orchestrator,
         codec: NMPLlamaShardPromptCodec(model: vocab))
+    // See the llamaCpp path above: bound a stalled remote token at 4 s so a
+    // throttled shard peer (e.g. an iOS app iOS is suspending) can't hold
+    // the sequential pipeline — and 429 the whole mesh — for 30 s.
+    promptService.perTokenTimeout = 4
     promptService.onProgress = { done, total in
         server.updateInferenceProgress(
             progress: Double(done) / Double(max(total, 1)),
             stage: "sharded generation: token \(done)/\(total)")
     }
-    promptService.onToken = { token, count, requested in
+    promptService.onToken = { [weak promptService] token, count, requested in
+        // Fires on the service queue, where activeSource is owned (BUG-16).
         server.reportGenerationToken(text: token.text, index: token.index,
-                                     count: count, requested: requested)
+                                     count: count, requested: requested,
+                                     source: promptService?.activeSource ?? "inference")
     }
 
     server.onInferenceRequest = { request, respond in
         let shards = stateQueue.sync { currentPlan.count }
         server.reportGenerationStarted(
-            prompt: request.prompt, maxTokens: request.maxTokens, speculative: false)
+            prompt: request.prompt, maxTokens: request.maxTokens,
+            speculative: false, source: request.source)
         server.reportMeshEvent("🌐 sharded inference: up to \(request.maxTokens) token(s) "
                                + "across \(shards) shard(s)")
-        promptService.run(prompt: request.prompt, maxTokens: request.maxTokens) { result in
+        stateQueue.async { shardInferenceInFlight = true }
+        promptService.run(prompt: request.prompt, maxTokens: request.maxTokens,
+                          source: request.source) { result in
+            stateQueue.async { shardInferenceInFlight = false }
             switch result {
             case .success(let generation):
-                server.reportGenerationComplete(generation)
+                server.reportGenerationComplete(generation, source: request.source)
                 server.reportMeshEvent(String(
                     format: "🌐 sharded inference done: %d tokens in %.1f ms across %d shard(s)",
                     generation.tokenCount, generation.totalSeconds * 1000, generation.shardCount))
@@ -978,7 +1210,8 @@ func runLlamaShardDashboard(modelPath: String, selectionReason: String? = nil,
             case .failure(.codec(let reason)):
                 respond(.failure(status: 400, message: "prompt encoding failed: \(reason)"))
             case .failure(.orchestration(let error)):
-                server.reportGenerationFailed(String(describing: error))
+                server.reportGenerationFailed(String(describing: error),
+                                              source: request.source)
                 respond(.failure(status: 500, message: "mesh orchestration failed: \(error)"))
             }
         }
@@ -990,21 +1223,32 @@ func runLlamaShardDashboard(modelPath: String, selectionReason: String? = nil,
     // shard coordinator is a REAL UDP mesh, not the in-process loopback, so loss
     // testing is `sudo scripts/loss_lab.sh`, per Docs.)
     wireBenchmark(server: server) { prompt, maxTokens, completion in
-        promptService.run(prompt: prompt, maxTokens: maxTokens, completion: completion)
+        promptService.run(prompt: prompt, maxTokens: maxTokens,
+                          source: "benchmark", completion: completion)
     }
     wireComparisonRun(server: server) { request, completion in
         promptService.run(prompt: request.prompt, maxTokens: request.maxTokens,
-                          completion: completion)
+                          source: "comparison", completion: completion)
     }
 
     server.onDeviceMetricsRequest = { respond in
         let sample = resourceMonitor.sample()
-        let (planSnap, loadedSnap, namesSnap, choiceSnap) = stateQueue.sync {
-            (currentPlan, loadedByPeer, peerNames, adaptiveChoice)
+        let (planSnap, loadedSnap, namesSnap, choiceSnap, autoSnap, membersSnap,
+             coordMeasuredSnap, inFlightSnap) = stateQueue.sync {
+            (currentPlan, loadedByPeer, peerNames, adaptiveChoice, autoBalanceMode,
+             memberCaps, coordinatorMeasured, shardInferenceInFlight)
         }
         var peers: [[String: Any]] = []
+        var planned = Set<UInt32>()
         for device in NMPShardReport.devices(plan: planSnap, loadedBytesByPeer: loadedSnap) {
             let isCoord = device.peerID == node.localPeerID
+            planned.insert(device.peerID)
+            // Honest footprint labeling (BUG-19): the coordinator's number
+            // is MEASURED resident bytes once its preload finished (weights
+            // for its range PLUS token_embd/output head); every remote
+            // peer's is MODELED from its layer span × the file's bytes/layer.
+            let coordMeasured = isCoord && coordMeasuredSnap != nil
+                && coordMeasuredSnap!.range == device.startLayer..<device.endLayer
             peers.append([
                 "id": String(device.peerID, radix: 16),
                 "name": isCoord ? "coordinator (tokenizer + shard)"
@@ -1013,11 +1257,64 @@ func runLlamaShardDashboard(modelPath: String, selectionReason: String? = nil,
                 "assigned": isCoord ? "\(device.summary) · tokenizer" : device.summary,
                 "layers_loaded": device.layerCount,
                 "loaded_mb": device.loadedMB,
+                "loaded_mb_basis": coordMeasured
+                    ? "measured: resident weight bytes for its range incl. "
+                        + "token_embd/output head (why it exceeds the plan's "
+                        + "weights-only footprint_mb)"
+                    : "modeled: layer span × the model file's bytes/layer "
+                        + "(weights only)",
                 "compute_share": Double(device.layerCount) / Double(max(1, layerCount)),
                 "computing": false,
                 "is_coordinator": isCoord,
                 "link": isCoord ? "local — tokenizer + its own shard"
                     : "Wi-Fi/UDP (Noise IK, AES-GCM, FEC, NACK) — streams its layers from the vault",
+            ])
+        }
+        // The coordinator card is ALWAYS present — a 0-layer coordinator
+        // renders excluded-style like the phone does, instead of vanishing
+        // from its own mesh (BUG-8).
+        if !planned.contains(node.localPeerID) {
+            planned.insert(node.localPeerID)
+            peers.insert([
+                "id": String(node.localPeerID, radix: 16),
+                "name": "coordinator (tokenizer + shard)",
+                "alive": true,
+                "assigned": "0 layers · tokenizer",
+                "layers_loaded": 0,
+                "loaded_mb": 0,
+                "loaded_mb_basis": "no layers this plan",
+                "compute_share": 0.0,
+                "computing": false,
+                "is_coordinator": true,
+                "excluded": true,
+                "exclusion_reason": "the current plan gives the coordinator "
+                    + "0 layers — it still tokenizes and coordinates",
+                "link": "local — tokenizer, no shard this plan",
+            ], at: 0)
+        }
+        // Connected peers that the current plan gives ZERO layers stay VISIBLE
+        // (greyed, "excluded") instead of vanishing — auto mode drops a peer
+        // whose round trip isn't worth its compute, and the operator must see
+        // it's still in the mesh, just idle, not that it silently left.
+        for (peerID, _) in membersSnap
+        where peerID != node.localPeerID && !planned.contains(peerID) {
+            peers.append([
+                "id": String(peerID, radix: 16),
+                "name": namesSnap[peerID] ?? "peer 0x\(String(peerID, radix: 16))",
+                "alive": true,
+                "assigned": "0 layers",
+                "layers_loaded": 0,
+                "loaded_mb": 0,
+                "loaded_mb_basis": "no layers this plan",
+                "compute_share": 0.0,
+                "computing": false,
+                "is_coordinator": false,
+                "excluded": true,
+                "exclusion_reason": autoSnap
+                    ? "auto: its network round trip outweighs the compute it "
+                        + "would offload — Mac-only is faster for this model"
+                    : "manually set to 0% (excluded)",
+                "link": "connected (Wi-Fi/UDP) — holding no layers this plan",
             ])
         }
         var payload: [String: Any] = [
@@ -1026,16 +1323,35 @@ func runLlamaShardDashboard(modelPath: String, selectionReason: String? = nil,
                 + "holds ONLY its layer range (partial ggml load / vault stream), so once a "
                 + "peer joins no single device holds the whole \(fullModelBytes / 1_048_576) MB model. "
                 + "the coordinator's loaded_mb is MEASURED; a remote peer's is COMPUTED from its "
-                + "layer range × the model's bytes/layer.",
-            "generation_in_flight": false,
-            "allocation_supported": false,
-            "allocation_note": "the split auto-balances by each device's measured speed and "
-                + "capacity, and re-shards automatically when a device joins or leaves.",
+                + "layer range × the model's bytes/layer (see each card's loaded_mb_basis).",
+            "generation_in_flight": inFlightSnap,
+            // Auto mode owns the split (measured speed + capacity); manual mode
+            // hands the sliders to the operator. So allocation is "supported"
+            // exactly when auto is OFF — the UI gates the sliders on this.
+            "auto_balance": autoSnap,
+            // BUG-20: honest name for the same fact; allocation_supported is
+            // kept for compat and mirrors it (deprecated).
+            "manual_mode": !autoSnap,
+            "allocation_supported": !autoSnap,
+            "allocation_supported_note":
+                "deprecated name — same value as manual_mode",
+            "allocation_note": autoSnap
+                ? "AUTO: minimizes measured per-token latency — Σ(compute) + "
+                    + "each used peer's round trip — so a fast-but-far device is "
+                    + "used only when its compute saving beats its hop (or "
+                    + "capacity requires it). Re-shards on join/leave and as "
+                    + "measurements converge. Switch off to allocate manually."
+                : "MANUAL: set each device's compute share; 0% excludes it "
+                    + "(Mac-only, no per-token round trip). Switch Auto on to "
+                    + "rebalance for lowest measured latency.",
             "peers": peers,
             "totals": [
                 "devices": peers.count,
                 "devices_alive": peers.count,
-                "layers_assigned": layerCount,
+                "devices_note": "coordinator + every connected peer "
+                    + "(excluded 0-layer devices included) — same rows as "
+                    + "peers[] and /api/devices",
+                "layers_assigned": planSnap.reduce(0) { $0 + max(0, $1.layerSpan) },
             ] as [String: Any],
         ]
         if let choice = choiceSnap {
@@ -1049,6 +1365,7 @@ func runLlamaShardDashboard(modelPath: String, selectionReason: String? = nil,
 
     // GET /api/models — the installed catalog with compatibility flags, so the
     // UI can offer any model and flag the ones that won't work here.
+    NMPModelScanCache.shared.warm()   // fill off the request path so the tab is instant
     server.onModelsListRequest = { respond in
         respond(shardModelCatalogJSON(currentPath: modelPath))
     }
@@ -1071,31 +1388,53 @@ func runLlamaShardDashboard(modelPath: String, selectionReason: String? = nil,
                     "this Mac has no ‘\(requestedPath)’ in ~/models — the coordinator "
                         + "needs the file (it tokenizes and serves the vault). Installed: "
                         + (catalog.isEmpty ? "none"
-                            : catalog.map(\.name).joined(separator: ", ")))))
+                            : catalog.map(\.name).joined(separator: ", ")),
+                    status: 400)))
                 return
             }
         }
         guard FileManager.default.fileExists(atPath: expanded),
               let candidate = NMPModelCatalog.candidate(path: expanded) else {
             reply(.failure(NMPDashboardServer.BenchmarkFailure(
-                "no readable GGUF at \(requestedPath)")))
+                "no readable GGUF at \(requestedPath)", status: 400)))
+            return
+        }
+        // BUG-2: a vault slice / split fragment parses as a valid GGUF but
+        // is NOT a runnable model — the same metadata criterion that keeps
+        // slices out of /api/models rejects them here.
+        guard candidate.isCompleteModel else {
+            reply(.failure(NMPDashboardServer.BenchmarkFailure(
+                "‘\(candidate.name)’ is a vault slice — not a complete model "
+                    + "(it carries only a layer range of its base model); "
+                    + "select the full GGUF instead",
+                status: 400)))
             return
         }
         guard candidate.architecture.hasPrefix("qwen") else {
             reply(.failure(NMPDashboardServer.BenchmarkFailure(
                 "‘\(candidate.name)’ is a \(candidate.architecture) model — the shard "
-                    + "shim runs qwen2/qwen3 only (a llama-arch variant is future work)")))
+                    + "shim runs qwen2/qwen3 only (a llama-arch variant is future work)",
+                status: 400)))
             return
         }
         let hostRAM = Int(NMPSystemCapabilityProbe.measure(peerID: 0x0000_0001).ramMB)
         guard Double(candidate.fileMB) <= Double(hostRAM) * 0.7 else {
             reply(.failure(NMPDashboardServer.BenchmarkFailure(
                 "‘\(candidate.name)’ needs ~\(candidate.fileMB) MB in RAM; this host "
-                    + "has \(hostRAM) MB — add a device or pick a smaller quant")))
+                    + "has \(hostRAM) MB — add a device or pick a smaller quant",
+                status: 400)))
             return
         }
-        reply(.success("switching to \(candidate.name) — the mesh restarts and the page "
-                       + "reconnects in a few seconds"))
+        // Selecting the model that's already live is a no-op, not a
+        // multi-second mesh restart.
+        guard expanded != expandedPath else {
+            reply(.success(.init(summary: "already active", reconnecting: false)))
+            return
+        }
+        reply(.success(.init(
+            summary: "switching to \(candidate.name) — the mesh restarts and the page "
+                + "reconnects in a few seconds",
+            reconnecting: true)))
         server.reportMeshEvent("🔄 switching model → \(candidate.name); relaunching mesh")
         // Let the HTTP response flush, release the listener, then re-exec this
         // process onto the new --model (same PID, so start.sh/Ctrl-C still own it).
@@ -1110,8 +1449,14 @@ func runLlamaShardDashboard(modelPath: String, selectionReason: String? = nil,
     var shardMeshInfo = NMPDashboardServer.MeshInfo()
     shardMeshInfo.engine = "llamaShard"
     shardMeshInfo.modelName = modelTag
+    // Display name for saved-chat stamping (BUG-14): the catalog's name for
+    // the active model (GGUF general.name), falling back to the engine tag.
+    shardMeshInfo.modelDisplayName =
+        NMPModelCatalog.candidate(path: expandedPath)?.name ?? modelTag
     shardMeshInfo.shardCount = max(1, stateQueue.sync { currentPlan.count })
     shardMeshInfo.wireFormat = node.orchestrator.activationWireFormat.rawValue
+    // NOT ready yet: the startup re-shard + coordinator preload flip it via
+    // server.setReady(true) in applyShardPlan (BUG-12).
     server.meshInfo = shardMeshInfo
 
     if dashboardArguments.ui {
@@ -1125,6 +1470,196 @@ func runLlamaShardDashboard(modelPath: String, selectionReason: String? = nil,
     }
     if let selectionReason { server.reportMeshEvent("model choice — \(selectionReason)") }
 
+    // Manual allocation (POST /api/devices/<id>/allocate): cap one device's
+    // compute share and re-shard. Flips the mesh to MANUAL mode (auto off).
+    // A 0 share drops the device to zero layers — Mac-only, no round trip.
+    let hexName: (UInt32) -> String = { "0x" + String($0, radix: 16) }
+    let planSummary: ([NMPShardPlanEntry]) -> String = { plan in
+        plan.map { "\(hexName($0.peerID)): L\($0.startLayer)-\($0.endLayer - 1)" }
+            .joined(separator: ", ")
+    }
+    server.onAllocationRequest = { peerID, share, respond in
+        // BUG-10: an id that is not the coordinator or a connected member
+        // is a 404, not a silently-accepted share for a ghost.
+        let known = stateQueue.sync { memberCaps[peerID] != nil }
+        guard known else {
+            respond(.failure(.init("unknown device", status: 404)))
+            return
+        }
+        node.setManualShare(peerID: peerID, share: share) { result in
+            switch result {
+            case .success(let plan):
+                stateQueue.async { autoBalanceMode = false }
+                applyShardPlan(plan, trigger: String(
+                    format: "manual %.0f%% → %@", share * 100, hexName(peerID)))
+                // Lead with the target device's own resulting assignment
+                // (BUG-19's echo half), then the whole plan.
+                let mine = plan.first { $0.peerID == peerID }
+                let own = mine.map { "L\($0.startLayer)-\($0.endLayer - 1)" }
+                    ?? "0 layers (excluded)"
+                respond(.success("manual — \(hexName(peerID)): \(own); "
+                                 + "plan: " + planSummary(plan)))
+            case .failure(let error):
+                respond(.failure(.init("re-shard failed: \(error)")))
+            }
+        }
+    }
+
+    // POST /api/mesh/objective {"objective": "speed" | "capacityThenSpeed"}
+    // (BUG-11): applies the sharding objective through the node's existing
+    // plan-strategy API — "speed" packs the fastest device (fewest hops),
+    // "capacityThenSpeed" spreads across the fewest devices that hold the
+    // model, balanced by speed (the sharder's .capacityThenSpeed objective,
+    // which the node exposes as its `balanced` strategy).
+    server.onObjectiveRequest = { raw, respond in
+        let strategy: NMPCoordinatorNode.PlanStrategy?
+        switch raw {
+        case NMPShardingObjective.speed.rawValue: strategy = .speed
+        case NMPShardingObjective.capacityThenSpeed.rawValue: strategy = .balanced
+        default: strategy = nil
+        }
+        guard let strategy else {
+            respond(.failure(.init("unknown objective '\(raw)' — expected one of: "
+                + NMPShardingObjective.allCases.map(\.rawValue)
+                    .joined(separator: ", "),
+                status: 400)))
+            return
+        }
+        node.setPlanStrategy(strategy) { result in
+            switch result {
+            case .success(let plan):
+                stateQueue.async { autoBalanceMode = true }
+                applyShardPlan(plan, trigger: "objective: \(raw)")
+                respond(.success(planSummary(plan)))
+            case .failure(let error):
+                respond(.failure(.init("re-shard failed: \(error)")))
+            }
+        }
+    }
+
+    // POST /api/mesh/autobalance {"enabled": bool}. Auto = balance by measured
+    // speed + capacity (and keep converging); manual hands over the sliders.
+    // The node answers instantly with the STAGED plan (BUG-7: the assign
+    // round may vault-stream for ~30 s); the UI/devices state is updated by
+    // onBackgroundReshard when the round commits — never optimistically.
+    server.onAutoBalanceRequest = { enabled, respond in
+        node.setAutoBalance(enabled) { result in
+            switch result {
+            case .success(let plan):
+                stateQueue.async { autoBalanceMode = enabled }
+                respond(.success((enabled ? "auto — " : "manual — ")
+                    + planSummary(plan)
+                    + " (staged; re-shard applying in the background)"))
+            case .failure(let error):
+                respond(.failure(.init("re-shard failed: \(error)")))
+            }
+        }
+    }
+
+    // Auto-convergence: on a slow cadence, when idle and in auto mode, re-plan
+    // from FRESH measurements and re-assign only on a material change — so the
+    // split converges to speed-optimal after real traffic, then holds steady.
+    let rebalanceTimer = DispatchSource.makeTimerSource(queue: stateQueue)
+    rebalanceTimer.schedule(deadline: .now() + 20, repeating: 20)
+    rebalanceTimer.setEventHandler {
+        let inflight = shardInferenceInFlight   // read on stateQueue
+        node.autoRebalanceTick(inflight: inflight) { result in
+            if case .success(let plan)? = result {
+                applyShardPlan(plan, trigger: "auto-rebalance by measured speed")
+            }
+        }
+    }
+    rebalanceTimer.resume()
+
+    // GET /api/mesh/plans — preview the candidate splits (speed / balanced /
+    // capacity) with each device's storage footprint + % of its RAM, so the
+    // operator picks one instead of the mesh silently deciding — and can see
+    // that no device would end up full.
+    let strategyLabels: [NMPCoordinatorNode.PlanStrategy: (String, String)] = [
+        .speed: ("Best for speed",
+                 "fewest hops — minimizes measured per-token latency"),
+        .balanced: ("Balanced",
+                    "spread by measured speed across the mesh, capped by RAM"),
+        .capacity: ("Best for capacity",
+                    "even % load so no single device fills up"),
+    ]
+    server.onPlansRequest = { respond in
+        let (names, members) = stateQueue.sync { (peerNames, memberCaps) }
+        let coordFirst = members.sorted {
+            ($0.key == node.localPeerID ? 0 : 1) < ($1.key == node.localPeerID ? 0 : 1)
+        }
+        node.candidatePlans { candidates in
+            var plansJSON: [[String: Any]] = []
+            for (strategy, plan) in candidates {
+                let assigned = Dictionary(uniqueKeysWithValues:
+                    plan.entries.map { ($0.peerID, $0.layerSpan) })
+                var devices: [[String: Any]] = []
+                var maxPct = 0.0
+                for (peerID, caps) in coordFirst {
+                    let layers = assigned[peerID] ?? 0
+                    let footprintMB = perLayerBytes > 0
+                        ? layers * perLayerBytes / 1_048_576 : 0
+                    let ramMB = Int(caps.ramMB)
+                    let pct = ramMB > 0 ? Double(footprintMB) / Double(ramMB) * 100 : 0
+                    maxPct = max(maxPct, pct)
+                    let isCoord = peerID == node.localPeerID
+                    devices.append([
+                        "id": String(peerID, radix: 16),
+                        "name": isCoord ? "coordinator (this Mac)"
+                            : (names[peerID] ?? "peer 0x\(String(peerID, radix: 16))"),
+                        "layers": layers,
+                        "footprint_mb": footprintMB,
+                        "ram_mb": ramMB,
+                        "percent": (pct * 10).rounded() / 10,
+                        "is_coordinator": isCoord,
+                        "excluded": layers == 0 && !isCoord,
+                    ])
+                }
+                let (label, note) = strategyLabels[strategy]
+                    ?? (strategy.rawValue, "")
+                plansJSON.append([
+                    "strategy": strategy.rawValue,
+                    "label": label,
+                    "note": note,
+                    "fits": plan.capacityShortfall == 0,
+                    "capacity_shortfall": plan.capacityShortfall,
+                    "max_device_percent": (maxPct * 10).rounded() / 10,
+                    "devices": devices,
+                ])
+            }
+            respond(["current_strategy": node.planStrategy.rawValue,
+                     // BUG-19: name what footprint_mb IS, so it can't be
+                     // confused with the runtime loaded_mb in
+                     // /api/devices/metrics (which adds embeddings/output
+                     // head on the coordinator).
+                     "footprint_note": "footprint_mb is modeled, weights-only: "
+                        + "layer span × the model file's measured bytes/layer. "
+                        + "Runtime residency is larger (token_embd/output head, "
+                        + "KV cache) — see loaded_mb + loaded_mb_basis in "
+                        + "/api/devices/metrics.",
+                     "plans": plansJSON])
+        }
+    }
+
+    // POST /api/mesh/strategy {"strategy": ...} — apply a previewed plan.
+    server.onPlanStrategyRequest = { strategyRaw, respond in
+        guard let strategy = NMPCoordinatorNode.PlanStrategy(rawValue: strategyRaw) else {
+            respond(.failure(.init("unknown strategy '\(strategyRaw)' — "
+                                   + "use speed | balanced | capacity")))
+            return
+        }
+        node.setPlanStrategy(strategy) { result in
+            switch result {
+            case .success(let plan):
+                stateQueue.async { autoBalanceMode = true }
+                applyShardPlan(plan, trigger: "\(strategyRaw) plan")
+                respond(.success(planSummary(plan)))
+            case .failure(let error):
+                respond(.failure(.init("re-shard failed: \(error)")))
+            }
+        }
+    }
+
     // Assign the coordinator's OWN shard right away (no peer needed) so the mesh
     // is inferable immediately, THEN start Bonjour discovery in the background —
     // its first browse can take a few seconds and must not block the UI. Real
@@ -1137,6 +1672,29 @@ func runLlamaShardDashboard(modelPath: String, selectionReason: String? = nil,
     print("[nmp-dashboard] browsing for LAN shard peers (nmp-peer / iPhone app); "
           + "the coordinator holds all layers until one joins. Ctrl-C to stop")
     dispatchMain()
+}
+
+// Validate --engine against the ONE plugin registry (NMPPlugin.swift) before
+// dispatch. Unknown ids fail fast; the hashShard scaffold is a peer-only stub
+// with no dashboard orchestration, so it is rejected here rather than silently
+// falling through to the reference mesh.
+switch NMPPluginRegistry.descriptor(id: dashboardArguments.engine) {
+case .none:
+    FileHandle.standardError.write(Data("""
+    unknown --engine '\(dashboardArguments.engine)'. available on the dashboard: \
+    reference, llamaCpp, llamaShard.
+
+    """.utf8))
+    exit(2)
+case .some(let descriptor) where descriptor.id == "hashShard":
+    FileHandle.standardError.write(Data("""
+    --engine hashShard is a non-LLM SCAFFOLD (see Docs/Plugin_Architecture.md); \
+    it is selectable on nmp-peer only, not the dashboard.
+
+    """.utf8))
+    exit(2)
+default:
+    break
 }
 
 if dashboardArguments.engine == "llamaShard" {
@@ -1236,6 +1794,7 @@ do {
 // MARK: - Server
 
 let server = NMPDashboardServer()
+server.chatStore = makeChatStore()
 server.onDiagnostic = { print("[nmp-dashboard] \($0)") }
 do {
     try server.start(port: port)
@@ -1411,10 +1970,13 @@ promptService.onProgress = { done, total in
         progress: Double(done) / Double(max(total, 1)),
         stage: "API generation: token \(done)/\(total)")
 }
-// Mesh 2.1: stream every generated token to every open browser.
-promptService.onToken = { token, count, requested in
+// Mesh 2.1: stream every generated token to every open browser, labeled
+// with the owning surface (fires on the service queue, where activeSource
+// is owned — BUG-16).
+promptService.onToken = { [weak promptService] token, count, requested in
     server.reportGenerationToken(text: token.text, index: token.index,
-                                 count: count, requested: requested)
+                                 count: count, requested: requested,
+                                 source: promptService?.activeSource ?? "inference")
 }
 
 server.onInferenceRequest = { request, respond in
@@ -1422,13 +1984,16 @@ server.onInferenceRequest = { request, respond in
     server.reportMeshEvent("🌐 API inference: up to \(request.maxTokens) token(s)")
     server.reportGenerationStarted(prompt: request.prompt,
                                    maxTokens: request.maxTokens,
-                                   speculative: false)
-    promptService.run(prompt: request.prompt, maxTokens: request.maxTokens) { result in
+                                   speculative: false,
+                                   source: request.source)
+    promptService.run(prompt: request.prompt, maxTokens: request.maxTokens,
+                      source: request.source) { result in
         stateQueue.async { apiInferenceRunning = false }
         if case .success(let generation) = result {
-            server.reportGenerationComplete(generation)
+            server.reportGenerationComplete(generation, source: request.source)
         } else if case .failure(let error) = result {
-            server.reportGenerationFailed(String(describing: error))
+            server.reportGenerationFailed(String(describing: error),
+                                          source: request.source)
         }
         switch result {
         case .success(let generation):
@@ -1455,8 +2020,11 @@ server.onInferenceRequest = { request, respond in
 var referenceMeshInfo = NMPDashboardServer.MeshInfo()
 referenceMeshInfo.engine = "reference"
 referenceMeshInfo.modelName = testbed.modelTag
+referenceMeshInfo.modelDisplayName = testbed.modelTag
 referenceMeshInfo.shardCount = testbed.failover.activePlan.count
 referenceMeshInfo.wireFormat = testbed.orchestrator.activationWireFormat.rawValue
+// The simulated mesh assembled synchronously above — it can generate now.
+referenceMeshInfo.ready = true
 server.meshInfo = referenceMeshInfo
 
 // MARK: - Phase C: adaptive model selection on live churn
@@ -1512,7 +2080,8 @@ reevaluateModelSelection(trigger: "startup")
 // Benchmark runs pause the heartbeat loop exactly like API inference does.
 wireBenchmark(server: server) { prompt, maxTokens, completion in
     stateQueue.async { apiInferenceRunning = true }
-    promptService.run(prompt: prompt, maxTokens: maxTokens) { result in
+    promptService.run(prompt: prompt, maxTokens: maxTokens,
+                      source: "benchmark") { result in
         stateQueue.async { apiInferenceRunning = false }
         completion(result)
     }
@@ -1523,7 +2092,8 @@ wireBenchmark(server: server) { prompt, maxTokens, completion in
 wireComparisonRun(server: server) { request, completion in
     stateQueue.async { apiInferenceRunning = true }
     promptService.run(prompt: request.prompt,
-                      maxTokens: request.maxTokens) { result in
+                      maxTokens: request.maxTokens,
+                      source: "comparison") { result in
         // Heartbeat resumes when the API reply goes out; the race itself
         // is loopback-only but keeping the mesh quiet keeps timings clean.
         DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) {
@@ -1681,6 +2251,9 @@ server.onDeviceMetricsRequest = { respond in
         let totals: [String: Any] = [
             "devices": peers.count,
             "devices_alive": alivePeerIDs.count,
+            "devices_note": "devices counts every card in peers[] (incl. "
+                + "dropped-but-remembered ones); devices_alive counts "
+                + "current mesh members",
             "layers_assigned": totalLayers,
             "requests_served": serveStats.values.reduce(0) { $0 + $1.served },
             "net_bytes_per_sec": netToBps + netFromBps,
@@ -1695,7 +2268,13 @@ server.onDeviceMetricsRequest = { respond in
                 + "genuinely this machine's live kernel counters (GPU% is "
                 + "the whole machine: the reference engine computes on CPU)",
             "generation_in_flight": inFlight,
+            // BUG-20: manual_mode is the honest name (the reference mesh
+            // always accepts operator shares); allocation_supported is a
+            // deprecated alias kept for compat.
+            "manual_mode": true,
             "allocation_supported": true,
+            "allocation_supported_note":
+                "deprecated name — same value as manual_mode",
             "allocation_note": "compute share re-plans the mesh: a device "
                 + "at 50% is planned as half as fast and receives "
                 + "proportionally fewer layers — watch 'assigned' change",
@@ -1738,8 +2317,8 @@ server.onDeviceMetricsRequest = { respond in
 // layer spans that come back are the proof the allocation took effect.
 server.onAllocationRequest = { peerID, share, respond in
     guard testbed.failover.activePeers.contains(where: { $0.peerID == peerID }) else {
-        respond(.failure(.init(
-            "unknown peer 0x\(String(peerID, radix: 16)) — see GET /api/devices")))
+        // BUG-10: not a member of this mesh → 404, never a 200/500.
+        respond(.failure(.init("unknown device", status: 404)))
         return
     }
     testbed.orchestrator.setComputeShare(share, forPeer: peerID)

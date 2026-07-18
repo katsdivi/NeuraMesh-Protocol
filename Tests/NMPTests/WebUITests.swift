@@ -21,14 +21,17 @@ final class ProtocolComparisonModelTests: XCTestCase {
 
     func testNMPRowIsTheMeasuredRun() {
         let estimates = NMPProtocolComparisonModel.compare(inputs)
-        XCTAssertEqual(estimates.count, 3)
+        // 4 rows, matching the measured race's transports (BUG-17):
+        // NMP (measured), plain TCP, TCP+TLS 1.3, QUIC (all modeled).
+        XCTAssertEqual(estimates.count, 4)
+        XCTAssertEqual(estimates.map(\.name),
+                       ["NMP", "TCP", "TCP+TLS 1.3", "QUIC"])
         let nmp = estimates[0]
-        XCTAssertEqual(nmp.name, "NMP")
         XCTAssertTrue(nmp.measured)
         XCTAssertEqual(nmp.totalMs, 2278.6, accuracy: 0.01)
         XCTAssertEqual(nmp.tokensPerSec, 32 / 2.2786, accuracy: 0.01)
         XCTAssertTrue(estimates.dropFirst().allSatisfy { !$0.measured },
-                      "TCP/QUIC must be labeled modeled")
+                      "TCP/TLS/QUIC must be labeled modeled")
     }
 
     func testModeledProtocolsCostMoreOnCleanLAN() {
@@ -39,8 +42,11 @@ final class ProtocolComparisonModelTests: XCTestCase {
                                  "\(modeled.name) should carry handshake + per-trip overhead")
             XCTAssertLessThan(modeled.tokensPerSec, nmp.tokensPerSec)
         }
-        // TCP (2-RTT handshake, heavier per-trip) costs more than QUIC.
-        XCTAssertGreaterThan(estimates[1].totalMs, estimates[2].totalMs)
+        // TCP+TLS (2-RTT handshake, heavier per-trip) costs more than QUIC,
+        // and plain TCP costs less than TCP+TLS (no TLS RTT/crypto) — the
+        // auditable TLS-vs-TCP delta the plain row exists for (BUG-17).
+        XCTAssertGreaterThan(estimates[2].totalMs, estimates[3].totalMs)
+        XCTAssertLessThan(estimates[1].totalMs, estimates[2].totalMs)
     }
 
     func testLossWidensTheGapViaRecoveryCosts() {
@@ -191,7 +197,7 @@ final class WebUIRouteTests: XCTestCase {
         XCTAssertEqual(status, 200)
         let object = try json(data)
         let protocols = try XCTUnwrap(object["protocols"] as? [[String: Any]])
-        XCTAssertEqual(protocols.count, 3)
+        XCTAssertEqual(protocols.count, 4, "NMP + TCP + TCP+TLS + QUIC (BUG-17)")
         XCTAssertEqual(protocols[0]["measured"] as? Bool, true)
         XCTAssertEqual(protocols[1]["measured"] as? Bool, false)
         XCTAssertNotNil(object["note"], "the modeled-vs-measured note is required")

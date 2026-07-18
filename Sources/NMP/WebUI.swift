@@ -141,6 +141,18 @@ public enum NMPProtocolComparisonModel {
             assumptions: "measured run (wall clock, payload, round trips); "
                 + "handshake and FEC recovery measured in-repo")
 
+        // Plain TCP: same kernel stream as the TLS row minus the TLS
+        // handshake RTT + record crypto — matches the measured race's
+        // "TCP" leg so the model's TLS-vs-TCP delta can be audited.
+        let tcpPlain = estimate(
+            name: "TCP", measured: false,
+            handshakeMs: rtt,             // SYN/SYN-ACK, no crypto
+            perTripMs: 0.2,               // kernel framing, ACK interplay, HOL risk
+            recoveryMs: max(1.5 * rtt, 10.0), // fast retransmit; RTO tail worse
+            assumptions: "modeled: measured NMP run re-priced — 1×RTT "
+                + "handshake (no TLS), +0.2 ms/trip, loss = fast retransmit "
+                + "(≥1.5×RTT, floor 10 ms; RTO tails excluded)")
+
         let tcp = estimate(
             name: "TCP+TLS 1.3", measured: false,
             handshakeMs: 2 * rtt + 1.0,   // SYN RTT + TLS 1.3 RTT + crypto
@@ -158,7 +170,7 @@ public enum NMPProtocolComparisonModel {
             assumptions: "modeled: measured NMP run re-priced — 1×RTT+1 ms "
                 + "handshake, +0.15 ms/trip, loss = 1.25×RTT retransmit")
 
-        return [nmp, tcp, quic]
+        return [nmp, tcpPlain, tcp, quic]
     }
 }
 

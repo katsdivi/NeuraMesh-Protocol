@@ -87,6 +87,26 @@ public final class NMPPromptInferenceService {
     private let codec: NMPPromptCodec
     private var busy = false
 
+    /// Which surface owns the generation in flight ("inference" | "chat" |
+    /// "benchmark" | "comparison") — set by `run(source:)` ONLY once the
+    /// busy guard passes, so a rejected concurrent request never relabels
+    /// someone else's stream. Queue-owned: read it from `onToken` /
+    /// `onProgress` (both fire on the service queue), nowhere else.
+    public private(set) var activeSource = "inference"
+
+    /// Per-token mesh round-trip deadline. Each token is one pass, so this
+    /// bounds how long ONE stalled remote stage locks the (sequential)
+    /// pipeline before the pass fails and the retry/reshard path recovers.
+    /// The orchestrator's own 30 s default is sized for a whole inference,
+    /// not a single ~100 ms token: a real device (e.g. an iOS peer iOS is
+    /// throttling) that keeps its heartbeat alive but stalls one response
+    /// would otherwise hold `busy` — and 429 every other request — for the
+    /// full 30 s. Kept generous vs. measured token latency (~90 ms) + link
+    /// jitter so a merely-slow peer is retried, not abandoned. Default 30 s
+    /// preserves existing (loopback) test timing; the dashboard lowers it
+    /// for the radio mesh.
+    public var perTokenTimeout: TimeInterval = 30
+
     /// Hard cap per request: each token is a full mesh pass, so this
     /// bounds worst-case request wall clock.
     public static let maxTokensPerRequest = 128
@@ -109,8 +129,10 @@ public final class NMPPromptInferenceService {
     // MARK: API
 
     /// Generates up to `maxTokens` tokens for `prompt`. `completion` fires
-    /// on the service queue exactly once.
+    /// on the service queue exactly once. `source` labels the generation's
+    /// streamed events (see `activeSource`).
     public func run(prompt: String, maxTokens: Int,
+                    source: String = "inference",
                     completion: @escaping (Result<GenerationResult, ServiceError>) -> Void) {
         queue.async { [self] in
             guard !busy else {
@@ -130,6 +152,7 @@ public final class NMPPromptInferenceService {
                 return
             }
             busy = true
+            activeSource = source
             let state = GenerationState(
                 activations: initialInput,
                 requested: min(max(maxTokens, 1), Self.maxTokensPerRequest),
@@ -164,7 +187,8 @@ public final class NMPPromptInferenceService {
 
     private func step(_ state: GenerationState,
                       completion: @escaping (Result<GenerationResult, ServiceError>) -> Void) {
-        orchestrator.infer(input: state.activations) { [weak self] result in
+        orchestrator.infer(input: state.activations,
+                            stageTimeout: perTokenTimeout) { [weak self] result in
             guard let self else { return }
             self.queue.async {
                 switch result {

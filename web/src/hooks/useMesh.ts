@@ -13,6 +13,10 @@ export interface MeshEvent {
  */
 export interface LiveGeneration {
   status: 'idle' | 'running' | 'done' | 'failed';
+  /** Who kicked this generation off: "inference" | "chat" | "benchmark" |
+   *  "comparison". Lets tabs label or filter generations that aren't
+   *  theirs instead of interleaving them. Absent on older servers. */
+  source?: string;
   prompt?: string;
   speculative?: boolean;
   requested?: number;
@@ -88,6 +92,8 @@ export function useMesh() {
         case 'generation_started':
           setLiveGeneration({
             status: 'running',
+            source:
+              typeof event.source === 'string' ? event.source : undefined,
             prompt: String(event.prompt ?? ''),
             speculative: Boolean(event.speculative),
             requested: Number(event.max_tokens ?? 0),
@@ -98,6 +104,9 @@ export function useMesh() {
           setLiveGeneration((current) => ({
             ...current,
             status: 'running',
+            source:
+              current.source ??
+              (typeof event.source === 'string' ? event.source : undefined),
             requested: Number(event.requested ?? current.requested ?? 0),
             tokens: [...current.tokens, String(event.text ?? '')],
           }));

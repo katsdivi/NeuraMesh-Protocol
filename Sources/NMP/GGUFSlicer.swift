@@ -14,7 +14,8 @@
 //   • `<arch>.block_count` is kept at the FULL N — the shim's want()/clamp and
 //     `first`/`last` shard detection read it.
 //   • only the WANTED tensors are included, mirroring the shim's want():
-//       blk.[start,end).*  +  token_embd.weight (iff start==0)
+//       blk.[start,end).*  +  token_embd.weight (iff start==0, or end==N for a
+//                             tied-LM-head model with no output.weight)
 //                          +  output_norm.weight, output.weight (iff end==N)
 //   • the big tokenizer arrays are dropped (the shard never tokenizes) — the
 //     coordinator keeps the full model for that.
@@ -83,8 +84,13 @@ public enum NMPGGUFSlicer {
         let clampedEnd = (end < 0 || end > n) ? n : end
 
         // Which tensors this shard needs — mirrors the shim's want().
+        // Tied-LM-head models (no output.weight, e.g. Qwen2.5-1.5B) reuse
+        // token_embd.weight as the LM head, so the tail shard needs it too.
+        let tiedLMHead = !model.tensors.contains { $0.name == "output.weight" }
         func wanted(_ name: String) -> Bool {
-            if name == "token_embd.weight" { return start == 0 }
+            if name == "token_embd.weight" {
+                return start == 0 || (tiedLMHead && clampedEnd == n)
+            }
             if name == "output_norm.weight" { return clampedEnd == n }
             if name == "output.weight" { return clampedEnd == n }
             if let l = blockIndex(name) { return l >= start && l < clampedEnd }

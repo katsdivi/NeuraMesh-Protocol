@@ -38,10 +38,16 @@ public struct NMPModelCandidate: Equatable, Sendable {
     public let bytesPerLayer: Int
     /// Total weights — the primary quality signal.
     public let totalParameters: Int
+    /// False for layer slices / split fragments (vault streaming,
+    /// gguf_slice.py output): structurally valid GGUFs that carry only a
+    /// layer range of a model. Detected from METADATA, not filename — see
+    /// `NMPModelCatalog.isCompleteModel(_:)`. Never boot the mesh on one.
+    public let isCompleteModel: Bool
 
     public init(path: String, name: String, architecture: String,
                 layerCount: Int, hiddenSize: Int, fileBytes: Int,
-                bytesPerLayer: Int, totalParameters: Int) {
+                bytesPerLayer: Int, totalParameters: Int,
+                isCompleteModel: Bool = true) {
         self.path = path
         self.name = name
         self.architecture = architecture
@@ -50,6 +56,7 @@ public struct NMPModelCandidate: Equatable, Sendable {
         self.fileBytes = fileBytes
         self.bytesPerLayer = bytesPerLayer
         self.totalParameters = totalParameters
+        self.isCompleteModel = isCompleteModel
     }
 
     /// File size rounded to whole MB (the unit storage ceilings compare in).
@@ -91,19 +98,53 @@ public enum NMPModelCatalog {
             name: gguf.modelName ?? (expanded as NSString).lastPathComponent,
             architecture: gguf.architecture ?? "unknown",
             layerCount: layers, hiddenSize: hidden, fileBytes: fileBytes,
-            bytesPerLayer: bpl, totalParameters: gguf.totalParameters)
+            bytesPerLayer: bpl, totalParameters: gguf.totalParameters,
+            isCompleteModel: isCompleteModel(gguf)
+                && !filenameSuggestsSlice(expanded))
+    }
+
+    /// Filename-convention backstop, applied AFTER the metadata checks (a
+    /// slice whose name metadata was scrubbed still must not boot a mesh):
+    /// gguf_slice.py's vault outputs are "*_partN.gguf"; ad-hoc slices carry
+    /// "_sliced_<a>_<b>" in the filename.
+    static func filenameSuggestsSlice(_ path: String) -> Bool {
+        let file = (((path as NSString).lastPathComponent) as NSString)
+            .deletingPathExtension.lowercased()
+        return file.range(of: #"_part\d+$"#, options: .regularExpression) != nil
+            || file.range(of: #"_sliced_\d+_\d+"#, options: .regularExpression) != nil
+    }
+
+    /// METADATA slice detection (a slice "parses OK", so parsing is not
+    /// validation). Two slice flavors exist and each leaks through metadata:
+    ///  • NMPGGUFSlicer (Swift) keeps `<arch>.block_count` at the FULL N but
+    ///    carries only its range's `blk.<L>.*` tensors → block coverage
+    ///    falls short of block_count.
+    ///  • scripts/gguf_slice.py renumbers blocks AND overrides block_count,
+    ///    but stamps "…_sliced_<a>_<b>" into `general.name`.
+    static func isCompleteModel(_ gguf: NMPGGUFModel) -> Bool {
+        guard let layers = gguf.layerCount, layers > 0 else { return false }
+        let presentBlocks = Set(gguf.tensors.compactMap {
+            NMPGGUFSlicer.blockIndex($0.name)
+        })
+        guard presentBlocks.count >= layers else { return false }
+        let name = gguf.modelName ?? ""
+        return name.range(of: #"_sliced_\d+_\d+$"#,
+                          options: .regularExpression) == nil
     }
 
     /// Scans a directory for `.gguf` models, highest quality first. Skips
-    /// unreadable files and the `_partN` shards left by earlier experiments.
+    /// unreadable files and incomplete slices/fragments (metadata check —
+    /// the same criterion /api/models/select rejects on), so a vault slice
+    /// is never listed, recommended, auto-selected, or adaptively chosen.
     public static func scan(directory: String) -> [NMPModelCandidate] {
         let dir = (directory as NSString).expandingTildeInPath
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir) else {
             return []
         }
         return names
-            .filter { $0.hasSuffix(".gguf") && !$0.contains("_part") }
+            .filter { $0.hasSuffix(".gguf") }
             .compactMap { candidate(path: (dir as NSString).appendingPathComponent($0)) }
+            .filter(\.isCompleteModel)
             .sorted(by: NMPModelCandidate.higherQuality)
     }
 }

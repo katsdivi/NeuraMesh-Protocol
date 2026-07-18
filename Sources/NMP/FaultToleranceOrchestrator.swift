@@ -147,6 +147,24 @@ public final class NMPFailoverOrchestrator {
         orchestrator.onPeerActivity = { [weak healthMonitor] peerID in
             healthMonitor?.recordActivity(peerID: peerID)
         }
+        // Compute-path feed (BUG-3): consecutive stage timeouts flag the
+        // peer stalled in the health verdict — the heartbeat staying fresh
+        // on pings/metrics must not veto that — and trigger an immediate
+        // failover instead of waiting out the activity timeout (a chatty
+        // but frozen peer would otherwise blackhole every generation).
+        orchestrator.onPeerComputeStalled = { [weak self] peerID, count in
+            guard let self else { return }
+            self.healthMonitor.recordComputeStall(peerID: peerID)
+            self.onDiagnostic?("peer \(hex(peerID)) compute-stalled "
+                               + "(\(count) consecutive stage timeouts) — failing over now")
+            // handlePeerDrop self-guards (failoverInProgress / unknown
+            // peer). If it can't run right now, the stall flag stays set
+            // and the next health poll retries the eviction.
+            self.handlePeerDrop(peerID) { _ in }
+        }
+        orchestrator.onPeerComputeRecovered = { [weak healthMonitor] peerID in
+            healthMonitor?.recordComputeRecovery(peerID: peerID)
+        }
         for peer in peers where peer.peerID != localPeerID {
             healthMonitor.track(peerID: peer.peerID)
         }

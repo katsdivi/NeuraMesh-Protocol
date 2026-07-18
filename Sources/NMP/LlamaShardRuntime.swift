@@ -183,7 +183,9 @@ public final class NMPLlamaShardRuntime {
 
 /// One opened shard: blocks `[start, end)` of a GGUF model, with ONLY those
 /// blocks' weights loaded (plus token_embd on the first shard, output_norm +
-/// lm_head on the last). Evaluate a sequence with `eval`.
+/// lm_head on the last — for a tied-embeddings GGUF with no output.weight,
+/// such as Qwen2.5-1.5B, the last shard's lm_head IS token_embd, which it
+/// loads and uses). Evaluate a sequence with `eval`.
 public final class NMPLlamaShard {
 
     public let runtime: NMPLlamaShardRuntime

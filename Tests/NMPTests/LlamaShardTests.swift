@@ -10,8 +10,11 @@
 //
 //  Gating: needs the ggml shard shim (scripts/setup_shard.sh →
 //  Vendor/llama/libnmpshard.dylib) AND a Qwen2 GGUF; otherwise XCTSkip.
-//  The golden stream below is Qwen2.5-0.5B for "The capital of France is"
-//  (token ids [785,6722,315,9625,374]); point NMP_LLAMA_MODEL at that model.
+//  The PINNED golden stream below is Qwen2.5-0.5B for "The capital of France
+//  is" (token ids [785,6722,315,9625,374]). For any OTHER model (e.g. the
+//  tied-LM-head Qwen2.5-1.5B) the expected stream is derived live from
+//  llama.cpp — the same oracle that produced the pin — so the whole class
+//  runs bit-exact against upstream on both models.
 //
 
 import XCTest
@@ -38,8 +41,46 @@ enum ShardTestSupport {
 
     /// "The capital of France is" and its whole-model greedy continuation,
     /// "Paris. It is the largest city in" — the oracle from the C self-test.
+    /// This pin is specific to qwen2.5-0.5b-instruct (hidden 896, 24 blocks).
     static let promptTokens: [Int32] = [785, 6722, 315, 9625, 374]
     static let goldenContinuation: [Int32] = [12095, 13, 1084, 374, 279, 7772, 3283, 304]
+
+    /// The whole-model greedy continuation of `promptTokens` for WHATEVER
+    /// model NMP_LLAMA_MODEL points at: the pinned 0.5B stream when it is the
+    /// pinned fixture, else derived live from llama.cpp (nil when the llama
+    /// shim can't load to derive it). Computed once per process.
+    static let expectedContinuation: [Int32]? = {
+        guard let modelPath else { return nil }
+        if let gguf = try? NMPGGUFModel.load(path: modelPath),
+           gguf.hiddenSize == 896, gguf.layerCount == 24 {
+            return goldenContinuation   // the pinned 0.5B fixture
+        }
+        guard let oracle = LlamaTestSupport.fullModel else { return nil }
+        var context = promptTokens
+        var stream: [Int32] = []
+        for _ in 0..<goldenContinuation.count {
+            guard let top = try? oracle.decodeTopK(tokens: context, basePos: 0, k: 1).first
+            else { return nil }
+            stream.append(top.id)
+            context.append(top.id)
+        }
+        return stream
+    }()
+
+    static func requireGolden() throws -> [Int32] {
+        guard let stream = expectedContinuation else {
+            throw XCTSkip("model is not the pinned 0.5B fixture and the llama.cpp shim "
+                          + "is unavailable to derive its golden stream")
+        }
+        return stream
+    }
+
+    /// True when the model ships NO output.weight (tied word embeddings —
+    /// e.g. the Qwen2.5-1.5B GGUF): the LM head IS token_embd.weight.
+    static func isTiedLMHead(path: String) throws -> Bool {
+        let gguf = try NMPGGUFModel.load(path: path)
+        return !gguf.tensors.contains { $0.name == "output.weight" }
+    }
 
     /// Drives a split plan the way the pipeline does WITH the KV cache:
     /// prefill the whole prompt at cache position 0, then feed just the newest
@@ -97,6 +138,7 @@ final class LlamaShardTests: XCTestCase {
 
     func testTwoWaySplitMatchesWholeModel() throws {
         let path = try ShardTestSupport.requireModelPath()
+        let golden = try ShardTestSupport.requireGolden()
         let engineA = try NMPLlamaShardComputeEngine(modelPath: path)
         let engineB = try NMPLlamaShardComputeEngine(modelPath: path)
         let n = engineA.layerCount
@@ -105,9 +147,9 @@ final class LlamaShardTests: XCTestCase {
         let out = try ShardTestSupport.generate(
             engines: [(engineA, 0, split), (engineB, split, n)],
             prompt: ShardTestSupport.promptTokens,
-            count: ShardTestSupport.goldenContinuation.count,
+            count: golden.count,
             hiddenSize: engineA.hiddenSize)
-        XCTAssertEqual(out, ShardTestSupport.goldenContinuation)
+        XCTAssertEqual(out, golden)
 
         // The engines really only loaded their halves.
         let fileSize = (try FileManager.default
@@ -118,6 +160,7 @@ final class LlamaShardTests: XCTestCase {
 
     func testThreeWaySplitMatchesWholeModel() throws {
         let path = try ShardTestSupport.requireModelPath()
+        let golden = try ShardTestSupport.requireGolden()
         let engineA = try NMPLlamaShardComputeEngine(modelPath: path)
         let engineB = try NMPLlamaShardComputeEngine(modelPath: path)
         let engineC = try NMPLlamaShardComputeEngine(modelPath: path)
@@ -127,22 +170,23 @@ final class LlamaShardTests: XCTestCase {
         let out = try ShardTestSupport.generate(
             engines: [(engineA, 0, s1), (engineB, s1, s2), (engineC, s2, n)],
             prompt: ShardTestSupport.promptTokens,
-            count: ShardTestSupport.goldenContinuation.count,
+            count: golden.count,
             hiddenSize: engineA.hiddenSize)
-        XCTAssertEqual(out, ShardTestSupport.goldenContinuation)
+        XCTAssertEqual(out, golden)
     }
 
     func testSingleShardWholeModelMatches() throws {
         let path = try ShardTestSupport.requireModelPath()
+        let golden = try ShardTestSupport.requireGolden()
         let engine = try NMPLlamaShardComputeEngine(modelPath: path)
         let n = engine.layerCount
         // start==0 && end==N: one shard, tokens straight to logits.
         let out = try ShardTestSupport.generate(
             engines: [(engine, 0, n)],
             prompt: ShardTestSupport.promptTokens,
-            count: ShardTestSupport.goldenContinuation.count,
+            count: golden.count,
             hiddenSize: engine.hiddenSize)
-        XCTAssertEqual(out, ShardTestSupport.goldenContinuation)
+        XCTAssertEqual(out, golden)
     }
 
     // MARK: KV cache — the wire hand-off shrinks during decode
@@ -181,6 +225,7 @@ final class LlamaShardTests: XCTestCase {
     /// fake, which re-ran from tokens, would have been unaffected).
     func testZeroedResidualDivergesFromGolden() throws {
         let path = try ShardTestSupport.requireModelPath()
+        let golden = try ShardTestSupport.requireGolden()
         let engineA = try NMPLlamaShardComputeEngine(modelPath: path)
         let engineB = try NMPLlamaShardComputeEngine(modelPath: path)
         let n = engineA.layerCount
@@ -204,7 +249,7 @@ final class LlamaShardTests: XCTestCase {
         let badOut = try engineB.runLayers(start: split, end: n, input: corruptedWire)
         let good = try NMPLlamaWire.decodeResponse(goodOut).top?.id
         let bad = try NMPLlamaWire.decodeResponse(badOut).top?.id
-        XCTAssertEqual(good, ShardTestSupport.goldenContinuation.first)
+        XCTAssertEqual(good, golden.first)
         XCTAssertNotEqual(good, bad)
     }
 
@@ -227,15 +272,16 @@ final class LlamaShardTests: XCTestCase {
     /// An extreme boundary — a single-layer first shard — is still bit-exact.
     func testSingleLayerFirstShardMatches() throws {
         let path = try ShardTestSupport.requireModelPath()
+        let golden = try ShardTestSupport.requireGolden()
         let engineA = try NMPLlamaShardComputeEngine(modelPath: path)
         let engineB = try NMPLlamaShardComputeEngine(modelPath: path)
         let n = engineA.layerCount
         let out = try ShardTestSupport.generate(
             engines: [(engineA, 0, 1), (engineB, 1, n)],
             prompt: ShardTestSupport.promptTokens,
-            count: ShardTestSupport.goldenContinuation.count,
+            count: golden.count,
             hiddenSize: engineA.hiddenSize)
-        XCTAssertEqual(out, ShardTestSupport.goldenContinuation)
+        XCTAssertEqual(out, golden)
     }
 
     // MARK: Codec (needs the llama.cpp shim for the tokenizer)
@@ -306,6 +352,10 @@ final class LlamaShardTests: XCTestCase {
     /// to running from the full file. This is disk ≈ RAM: no slice holds it all.
     func testShardedGenerationFromSlicesMatchesFullModel() throws {
         let path = try ShardTestSupport.requireModelPath()
+        let golden = try ShardTestSupport.requireGolden()
+        // Tied-LM-head models: the TAIL slice carries token_embd.weight (it IS
+        // the LM head) — NMPGGUFSlicer.wanted() mirrors the shim's tied-aware
+        // want(), so this proof runs for tied and untied models alike.
         let n = try NMPLlamaShard(modelPath: path, start: 0, end: -1).layerCount
         let split = n / 2
 
@@ -338,9 +388,79 @@ final class LlamaShardTests: XCTestCase {
         let got = try ShardTestSupport.generate(
             engines: [(loEngine, 0, split), (hiEngine, split, n)],
             prompt: ShardTestSupport.promptTokens,
-            count: ShardTestSupport.goldenContinuation.count,
+            count: golden.count,
             hiddenSize: loEngine.hiddenSize)
-        XCTAssertEqual(got, ShardTestSupport.goldenContinuation,
+        XCTAssertEqual(got, golden,
                        "sharded-from-slices output must match the whole-model oracle")
+    }
+
+    // MARK: BUG-1 regression — tied LM head / wide heads (Qwen2.5-1.5B class)
+
+    /// BUG-1 (SEV-1): ANY generation on Qwen2.5-1.5B-Instruct segfaulted the
+    /// whole mesh on the FIRST token. Root cause: tied-word-embedding GGUFs
+    /// (Qwen2.5 ≤3B) ship NO `output.weight` — the LM head is
+    /// `token_embd.weight` — and the shim handed ggml_mul_mat the missing
+    /// tensor (NULL → EXC_BAD_ACCESS at 0x10, NULL->ne[0]). The fix loads and
+    /// uses token_embd as the LM head (llama.cpp's own loader fallback) and
+    /// validates the full tensor set at open. Gate: runs only when
+    /// NMP_LLAMA_MODEL points at a >64-head_dim model (the 1.5B: head_dim
+    /// 128); the 0.5B fixture (head_dim 64, output.weight present) skips.
+    func testWideHeadTiedLMHeadModelGeneratesBitExact() throws {
+        let path = try ShardTestSupport.requireModelPath()
+        let gguf = try NMPGGUFModel.load(path: path)
+        let heads = try XCTUnwrap(gguf.attentionHeadCount)
+        let hidden = try XCTUnwrap(gguf.hiddenSize)
+        let headDim = hidden / heads
+        guard headDim > 64 else {
+            throw XCTSkip("model head_dim \(headDim) ≤ 64 — point NMP_LLAMA_MODEL at "
+                          + "Qwen2.5-1.5B-Instruct (head_dim 128) for this regression")
+        }
+        let tied = try ShardTestSupport.isTiedLMHead(path: path)
+        let count = ShardTestSupport.goldenContinuation.count
+
+        // 1) The whole-model single-shard path — BUG-1's exact crash site
+        //    (LlamaShardEngine's isFirst && isLast local path) — generates.
+        let whole = try NMPLlamaShardComputeEngine(modelPath: path)
+        let n = whole.layerCount
+        let wholeStream = try ShardTestSupport.generate(
+            engines: [(whole, 0, n)], prompt: ShardTestSupport.promptTokens,
+            count: count, hiddenSize: whole.hiddenSize)
+        XCTAssertEqual(wholeStream.count, count)
+
+        // 2) Greedy determinism: fresh engine, identical stream.
+        let again = try NMPLlamaShardComputeEngine(modelPath: path)
+        let rerun = try ShardTestSupport.generate(
+            engines: [(again, 0, n)], prompt: ShardTestSupport.promptTokens,
+            count: count, hiddenSize: again.hiddenSize)
+        XCTAssertEqual(rerun, wholeStream, "greedy whole-model stream must be deterministic")
+
+        // 3) A 2-way split — whose LAST shard must load the tied LM head
+        //    WITHOUT holding block 0 — stays bit-exact vs the whole model.
+        let engineA = try NMPLlamaShardComputeEngine(modelPath: path)
+        let engineB = try NMPLlamaShardComputeEngine(modelPath: path)
+        let split = n / 2
+        let splitStream = try ShardTestSupport.generate(
+            engines: [(engineA, 0, split), (engineB, split, n)],
+            prompt: ShardTestSupport.promptTokens,
+            count: count, hiddenSize: engineA.hiddenSize)
+        XCTAssertEqual(splitStream, wholeStream,
+                       "split stream must equal the whole-model stream (tied=\(tied))")
+
+        // 4) Oracle: bit-exact vs llama.cpp itself, when its shim is loadable
+        //    (the same bar the 0.5B pinned golden holds).
+        if let expected = ShardTestSupport.expectedContinuation {
+            XCTAssertEqual(wholeStream, expected,
+                           "shard-shim greedy stream must be bit-exact vs llama.cpp")
+        }
+
+        // 5) Text sanity: the continuation of "The capital of France is"
+        //    must be coherent, not the punctuation soup of a wrong LM head.
+        if let vocab = LlamaTestSupport.vocabOnlyModel {
+            var bytes = Data()
+            for id in wholeStream { bytes.append(try vocab.pieceBytes(for: id)) }
+            let text = String(decoding: bytes, as: UTF8.self)
+            XCTAssertTrue(text.contains("Paris"),
+                          "greedy continuation should mention Paris, got: \(text)")
+        }
     }
 }

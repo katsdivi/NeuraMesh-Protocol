@@ -19,6 +19,15 @@
 //  0.5B and 14B; qwen2 (QKV bias) and qwen3 (QK-norm, no bias) are both
 //  handled by tensor-presence detection.
 //
+//  TIED LM HEAD: models with tied word embeddings (Qwen2.5 ≤3B among them)
+//  may ship a GGUF with NO `output.weight` at all — llama.cpp's loader falls
+//  back to `token_embd.weight` as the LM head, and so do we. The last shard
+//  therefore loads token_embd even when start != 0. Every tensor the eval
+//  graph will dereference is verified to exist at open time; a missing one
+//  fails the open cleanly instead of handing ggml a NULL operand (BUG-1: the
+//  Qwen2.5-1.5B GGUF is tied, and dereferencing the absent output.weight
+//  segfaulted in ggml_mul_mat on the first token).
+//
 //  KV CACHE (ABI 2): each shard keeps a persistent per-layer K/V cache, so a
 //  decode step processes ONLY the new token(s) and attends over the cached
 //  keys/values — O(n) per step instead of reprocessing the whole sequence.
@@ -50,6 +59,9 @@ typedef struct {
     int n_layer, n_embd, n_head, n_head_kv, head_dim, n_ff;
     float eps, rope_base;
     int has_qkv_bias, has_qk_norm;
+    // GGUF has no output.weight (tied word embeddings): the LM head IS
+    // token_embd.weight, which the last shard must load and use.
+    int tied_lm_head;
 } nmp_arch;
 
 struct nmp_shard {
@@ -57,6 +69,11 @@ struct nmp_shard {
     int start, end;
     struct ggml_context *ctx;   // holds ONLY this shard's tensors
     ggml_backend_t be;
+    // Backend buffers owning the actual weight/KV bytes. ggml_free(ctx) only
+    // releases tensor metadata — these must be freed explicitly or every
+    // re-shard leaks the prior shard's weights.
+    ggml_backend_buffer_t weights_buf;
+    ggml_backend_buffer_t kv_buf;
     size_t bytes_loaded;
     int n_tensors;
 
@@ -157,8 +174,9 @@ static float md_f32(struct gguf_context *g, const char *arch, const char *suf, f
 static int block_index(const char *name) {
     return strncmp(name, "blk.", 4) == 0 ? atoi(name + 4) : -1;
 }
-static int want(const char *name, int start, int end, int N) {
-    if (strcmp(name, "token_embd.weight") == 0)  return start == 0;
+static int want(const char *name, int start, int end, int N, int tied) {
+    if (strcmp(name, "token_embd.weight") == 0)
+        return start == 0 || (tied && end == N);   // tied: last shard needs the LM head
     if (strcmp(name, "output_norm.weight") == 0) return end == N;
     if (strcmp(name, "output.weight") == 0)      return end == N;
     int L = block_index(name);
@@ -170,13 +188,59 @@ static struct ggml_tensor *TT(struct nmp_shard *s, const char *fmt, int l) {
     return ggml_get_tensor(s->ctx, nm);
 }
 
+// Every tensor the eval graph will dereference must exist in s->ctx NOW — a
+// missing name (arch variant, bad slice, naming drift) must fail the open
+// cleanly, never reach ggml as a NULL operand (that is a guaranteed segfault:
+// ggml_mul_mat reads t0->ne[0], i.e. NULL + 16 — exactly BUG-1's crash).
+// Returns 1 when complete; else writes the first missing name into `missing`.
+static int have_tensor(struct nmp_shard *s, char *missing, size_t cap, const char *fmt, int l) {
+    if (l < 0) snprintf(missing, cap, "%s", fmt); else snprintf(missing, cap, fmt, l);
+    return ggml_get_tensor(s->ctx, missing) != NULL;
+}
+static int shard_tensors_complete(struct nmp_shard *s, char *missing, size_t cap) {
+    nmp_arch *a = &s->a;
+    int first = (s->start == 0), last = (s->end == a->n_layer);
+    #define NEED(fmt, l) do { \
+        if (!have_tensor(s, missing, cap, fmt, l)) return 0; \
+    } while (0)
+    if (first) NEED("token_embd.weight", -1);
+    if (last) {
+        NEED("output_norm.weight", -1);
+        NEED(a->tied_lm_head ? "token_embd.weight" : "output.weight", -1);
+    }
+    for (int l = s->start; l < s->end; l++) {
+        NEED("blk.%d.attn_norm.weight", l);
+        NEED("blk.%d.attn_q.weight", l);
+        NEED("blk.%d.attn_k.weight", l);
+        NEED("blk.%d.attn_v.weight", l);
+        if (a->has_qkv_bias) {
+            NEED("blk.%d.attn_q.bias", l);
+            NEED("blk.%d.attn_k.bias", l);
+            NEED("blk.%d.attn_v.bias", l);
+        }
+        if (a->has_qk_norm) {
+            NEED("blk.%d.attn_q_norm.weight", l);
+            NEED("blk.%d.attn_k_norm.weight", l);
+        }
+        NEED("blk.%d.attn_output.weight", l);
+        NEED("blk.%d.ffn_norm.weight", l);
+        NEED("blk.%d.ffn_gate.weight", l);
+        NEED("blk.%d.ffn_up.weight", l);
+        NEED("blk.%d.ffn_down.weight", l);
+    }
+    #undef NEED
+    return 1;
+}
+
 // ---- exported ABI ----
 
 int nmp_shard_abi_version(void) { return NMP_SHARD_ABI; }
 
 // Open a shard that owns blocks [start,end); partial-loads only those weights
-// (+ token_embd if start==0, + output_norm/output if end==n_layer). max_ctx is
-// the KV cache capacity (<=0 -> default); it bounds prompt+generated tokens.
+// (+ token_embd if start==0, + output_norm/output if end==n_layer; a tied
+// model has no output.weight, so its last shard loads token_embd instead —
+// the LM head). max_ctx is the KV cache capacity (<=0 -> default); it bounds
+// prompt+generated tokens.
 struct nmp_shard *nmp_shard_open(const char *path, int start, int end, int max_ctx) {
     nmp_shard_load_backends();
     struct nmp_shard *s = calloc(1, sizeof *s);
@@ -188,7 +252,7 @@ struct nmp_shard *nmp_shard_open(const char *path, int start, int end, int max_c
     struct ggml_context *meta = NULL;
     struct gguf_init_params ip = { .no_alloc = true, .ctx = &meta };
     struct gguf_context *g = gguf_init_from_file(path, ip);
-    if (!g) { free(s); return NULL; }
+    if (!g) { ggml_backend_free(s->be); free(s); return NULL; }
 
     const char *arch = gguf_get_val_str(g, gguf_find_key(g, "general.architecture"));
     nmp_arch *a = &s->a;
@@ -202,16 +266,41 @@ struct nmp_shard *nmp_shard_open(const char *path, int start, int end, int max_c
     a->rope_base = md_f32(g, arch, "rope.freq_base", 1000000.0f);
     if (end < 0 || end > a->n_layer) s->end = end = a->n_layer;
 
+    // Tied-LM-head detection MUST precede the copy loop: it decides whether
+    // the last shard also wants token_embd.weight (there is no output.weight
+    // to load — e.g. the Qwen2.5-1.5B-Instruct GGUF, 338 tensors, none of
+    // them an LM head).
+    a->tied_lm_head = 1;
+    for (struct ggml_tensor *t = ggml_get_first_tensor(meta); t; t = ggml_get_next_tensor(meta, t))
+        if (strcmp(ggml_get_name(t), "output.weight") == 0) { a->tied_lm_head = 0; break; }
+
     s->ctx = ggml_init((struct ggml_init_params){ ggml_tensor_overhead() * 2048, NULL, true });
     for (struct ggml_tensor *t = ggml_get_first_tensor(meta); t; t = ggml_get_next_tensor(meta, t)) {
         const char *nm = ggml_get_name(t);
-        if (!want(nm, start, end, a->n_layer)) continue;
+        if (!want(nm, start, end, a->n_layer, a->tied_lm_head)) continue;
         struct ggml_tensor *d = ggml_new_tensor(s->ctx, t->type, ggml_n_dims(t), t->ne);
         ggml_set_name(d, nm);
         if (strstr(nm, "attn_q.bias"))  a->has_qkv_bias = 1;
         if (strstr(nm, "attn_q_norm"))  a->has_qk_norm  = 1;
     }
-    ggml_backend_alloc_ctx_tensors(s->ctx, s->be);
+    ggml_free(meta); meta = NULL;   // metadata tensors are fully copied out
+
+    // Refuse to open a shard whose eval graph would dereference a missing
+    // tensor — the clean-error version of what used to be BUG-1's segfault.
+    char missing[160];
+    if (!shard_tensors_complete(s, missing, sizeof missing)) {
+        fprintf(stderr, "nmp_shard_open: %s blocks [%d,%d): required tensor '%s' not in GGUF — refusing to open\n",
+                path, s->start, s->end, missing);
+        gguf_free(g); ggml_free(s->ctx); ggml_backend_free(s->be); free(s);
+        return NULL;
+    }
+    s->weights_buf = ggml_backend_alloc_ctx_tensors(s->ctx, s->be);
+    if (!s->weights_buf) {
+        fprintf(stderr, "nmp_shard_open: %s blocks [%d,%d): weight buffer allocation failed\n",
+                path, s->start, s->end);
+        gguf_free(g); ggml_free(s->ctx); ggml_backend_free(s->be); free(s);
+        return NULL;
+    }
 
     FILE *f = fopen(path, "rb");
     size_t doff = gguf_get_data_offset(g);
@@ -220,7 +309,12 @@ struct nmp_shard *nmp_shard_open(const char *path, int start, int end, int max_c
         size_t off = doff + gguf_get_tensor_offset(g, ti), nb = ggml_nbytes(d);
         void *b = malloc(nb);
         fseek(f, (long) off, SEEK_SET);
-        if (fread(b, 1, nb, f) != nb) { free(b); fclose(f); gguf_free(g); return NULL; }
+        if (fread(b, 1, nb, f) != nb) {
+            free(b); fclose(f); gguf_free(g);
+            ggml_free(s->ctx); ggml_backend_buffer_free(s->weights_buf);
+            ggml_backend_free(s->be); free(s);
+            return NULL;
+        }
         ggml_backend_tensor_set(d, b, 0, nb); free(b);
         s->bytes_loaded += nb; s->n_tensors++;
     }
@@ -239,7 +333,13 @@ struct nmp_shard *nmp_shard_open(const char *path, int start, int end, int max_c
         s->v_cache[i] = ggml_new_tensor_3d(s->kv_ctx, GGML_TYPE_F32,
                                            a->head_dim, a->n_head_kv, s->max_ctx);
     }
-    ggml_backend_alloc_ctx_tensors(s->kv_ctx, s->be);
+    s->kv_buf = ggml_backend_alloc_ctx_tensors(s->kv_ctx, s->be);
+    if (!s->kv_buf) {
+        fprintf(stderr, "nmp_shard_open: %s blocks [%d,%d): KV buffer allocation failed\n",
+                path, s->start, s->end);
+        free_shard_internal(s);   // not yet registered; frees weights_buf too
+        return NULL;
+    }
     register_shard(s);
     return s;
 }
@@ -261,6 +361,9 @@ int  nmp_shard_max_ctx(struct nmp_shard *s) { return s->max_ctx; }
 // writing each block's new K/V into its persistent cache and attending over
 // the whole cached range [0, n_past+n_tokens). `gf` receives the cache-store
 // nodes so they execute before the attention reads them.
+// Returns NULL if a required weight tensor is missing (belt-and-braces: the
+// open already validated the full set) — the caller maps that to a clean
+// eval error instead of letting ggml dereference a NULL operand.
 static struct ggml_tensor *run_blocks(struct nmp_shard *s, struct ggml_context *ctx,
                                       struct ggml_cgraph *gf, struct ggml_tensor *cur,
                                       struct ggml_tensor *pos, struct ggml_tensor *mask,
@@ -269,22 +372,40 @@ static struct ggml_tensor *run_blocks(struct nmp_shard *s, struct ggml_context *
     int n_kv = n_past + n_tokens;
     for (int l = s->start; l < s->end; l++) {
         int ci = l - s->start;
+        struct ggml_tensor *w_attn_norm = TT(s, "blk.%d.attn_norm.weight", l);
+        struct ggml_tensor *w_q    = TT(s, "blk.%d.attn_q.weight", l);
+        struct ggml_tensor *w_k    = TT(s, "blk.%d.attn_k.weight", l);
+        struct ggml_tensor *w_v    = TT(s, "blk.%d.attn_v.weight", l);
+        struct ggml_tensor *w_ao   = TT(s, "blk.%d.attn_output.weight", l);
+        struct ggml_tensor *w_ffn  = TT(s, "blk.%d.ffn_norm.weight", l);
+        struct ggml_tensor *w_gate = TT(s, "blk.%d.ffn_gate.weight", l);
+        struct ggml_tensor *w_up   = TT(s, "blk.%d.ffn_up.weight", l);
+        struct ggml_tensor *w_down = TT(s, "blk.%d.ffn_down.weight", l);
+        if (!w_attn_norm || !w_q || !w_k || !w_v || !w_ao ||
+            !w_ffn || !w_gate || !w_up || !w_down) return NULL;
         struct ggml_tensor *inpL = cur;
-        struct ggml_tensor *x = ggml_mul(ctx, ggml_rms_norm(ctx, cur, a->eps), TT(s, "blk.%d.attn_norm.weight", l));
-        struct ggml_tensor *q = ggml_mul_mat(ctx, TT(s, "blk.%d.attn_q.weight", l), x);
-        struct ggml_tensor *k = ggml_mul_mat(ctx, TT(s, "blk.%d.attn_k.weight", l), x);
-        struct ggml_tensor *v = ggml_mul_mat(ctx, TT(s, "blk.%d.attn_v.weight", l), x);
+        struct ggml_tensor *x = ggml_mul(ctx, ggml_rms_norm(ctx, cur, a->eps), w_attn_norm);
+        struct ggml_tensor *q = ggml_mul_mat(ctx, w_q, x);
+        struct ggml_tensor *k = ggml_mul_mat(ctx, w_k, x);
+        struct ggml_tensor *v = ggml_mul_mat(ctx, w_v, x);
         if (a->has_qkv_bias) {
-            q = ggml_add(ctx, q, TT(s, "blk.%d.attn_q.bias", l));
-            k = ggml_add(ctx, k, TT(s, "blk.%d.attn_k.bias", l));
-            v = ggml_add(ctx, v, TT(s, "blk.%d.attn_v.bias", l));
+            struct ggml_tensor *b_q = TT(s, "blk.%d.attn_q.bias", l);
+            struct ggml_tensor *b_k = TT(s, "blk.%d.attn_k.bias", l);
+            struct ggml_tensor *b_v = TT(s, "blk.%d.attn_v.bias", l);
+            if (!b_q || !b_k || !b_v) return NULL;
+            q = ggml_add(ctx, q, b_q);
+            k = ggml_add(ctx, k, b_k);
+            v = ggml_add(ctx, v, b_v);
         }
         q = ggml_reshape_3d(ctx, q, a->head_dim, a->n_head, n_tokens);
         k = ggml_reshape_3d(ctx, k, a->head_dim, a->n_head_kv, n_tokens);
         v = ggml_reshape_3d(ctx, v, a->head_dim, a->n_head_kv, n_tokens);
         if (a->has_qk_norm) {
-            q = ggml_mul(ctx, ggml_rms_norm(ctx, q, a->eps), TT(s, "blk.%d.attn_q_norm.weight", l));
-            k = ggml_mul(ctx, ggml_rms_norm(ctx, k, a->eps), TT(s, "blk.%d.attn_k_norm.weight", l));
+            struct ggml_tensor *w_qn = TT(s, "blk.%d.attn_q_norm.weight", l);
+            struct ggml_tensor *w_kn = TT(s, "blk.%d.attn_k_norm.weight", l);
+            if (!w_qn || !w_kn) return NULL;
+            q = ggml_mul(ctx, ggml_rms_norm(ctx, q, a->eps), w_qn);
+            k = ggml_mul(ctx, ggml_rms_norm(ctx, k, a->eps), w_kn);
         }
         q = ggml_rope_ext(ctx, q, pos, NULL, a->head_dim, GGML_ROPE_TYPE_NEOX, 32768, a->rope_base, 1, 0, 1, 32, 1);
         k = ggml_rope_ext(ctx, k, pos, NULL, a->head_dim, GGML_ROPE_TYPE_NEOX, 32768, a->rope_base, 1, 0, 1, 32, 1);
@@ -310,13 +431,13 @@ static struct ggml_tensor *run_blocks(struct nmp_shard *s, struct ggml_context *
                                                    1.0f / sqrtf((float) a->head_dim), 0);
         struct ggml_tensor *vt = ggml_cont(ctx, ggml_permute(ctx, Vfull, 1, 2, 0, 3));
         struct ggml_tensor *kqv = ggml_permute(ctx, ggml_mul_mat(ctx, vt, kq), 0, 2, 1, 3);
-        cur = ggml_mul_mat(ctx, TT(s, "blk.%d.attn_output.weight", l), ggml_cont_2d(ctx, kqv, a->n_embd, n_tokens));
+        cur = ggml_mul_mat(ctx, w_ao, ggml_cont_2d(ctx, kqv, a->n_embd, n_tokens));
         cur = ggml_add(ctx, cur, inpL);
         struct ggml_tensor *inpFF = cur;
-        x = ggml_mul(ctx, ggml_rms_norm(ctx, cur, a->eps), TT(s, "blk.%d.ffn_norm.weight", l));
-        struct ggml_tensor *gt = ggml_silu(ctx, ggml_mul_mat(ctx, TT(s, "blk.%d.ffn_gate.weight", l), x));
-        struct ggml_tensor *ut = ggml_mul_mat(ctx, TT(s, "blk.%d.ffn_up.weight", l), x);
-        cur = ggml_add(ctx, ggml_mul_mat(ctx, TT(s, "blk.%d.ffn_down.weight", l), ggml_mul(ctx, gt, ut)), inpFF);
+        x = ggml_mul(ctx, ggml_rms_norm(ctx, cur, a->eps), w_ffn);
+        struct ggml_tensor *gt = ggml_silu(ctx, ggml_mul_mat(ctx, w_gate, x));
+        struct ggml_tensor *ut = ggml_mul_mat(ctx, w_up, x);
+        cur = ggml_add(ctx, ggml_mul_mat(ctx, w_down, ggml_mul(ctx, gt, ut)), inpFF);
     }
     return cur;
 }
@@ -326,7 +447,8 @@ static struct ggml_tensor *run_blocks(struct nmp_shard *s, struct ggml_context *
 //   else:                    pass in_hidden (float[n_embd*n_tokens]), tokens = NULL.
 //   non-last shard: writes out_hidden[n_embd*n_tokens] (residual to ship on).
 //   last shard (end==n_layer): writes out_ids[k]/out_logits[k] (top-k at last).
-// Returns 0 on success, negative on error.
+// Returns 0 on success, negative on error (-6: a required weight tensor is
+// missing — should be unreachable, the open validates the full set).
 int nmp_shard_eval(struct nmp_shard *s, const int32_t *tokens, const float *in_hidden,
                    int n_tokens, int n_past, float *out_hidden,
                    int k, int32_t *out_ids, float *out_logits) {
@@ -351,15 +473,27 @@ int nmp_shard_eval(struct nmp_shard *s, const int32_t *tokens, const float *in_h
     struct ggml_tensor *pos  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens); ggml_set_input(pos);
     struct ggml_tensor *mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_kv, n_tokens); ggml_set_input(mask);
     struct ggml_tensor *tok = NULL, *hin = NULL, *cur;
-    if (first) { tok = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens); ggml_set_input(tok);
-                 cur = ggml_get_rows(ctx, TT(s, "token_embd.weight", -1), tok); }
+    if (first) { struct ggml_tensor *emb = TT(s, "token_embd.weight", -1);
+                 if (!emb) { ggml_free(ctx); return -6; }
+                 tok = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens); ggml_set_input(tok);
+                 cur = ggml_get_rows(ctx, emb, tok); }
     else       { hin = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a->n_embd, n_tokens); ggml_set_input(hin); cur = hin; }
     cur = run_blocks(s, ctx, gf, cur, pos, mask, n_tokens, n_past);
+    if (!cur) { ggml_free(ctx); return -6; }
     struct ggml_tensor *outp;
     if (last) {
-        cur = ggml_mul(ctx, ggml_rms_norm(ctx, cur, a->eps), TT(s, "output_norm.weight", -1));
+        struct ggml_tensor *w_out_norm = TT(s, "output_norm.weight", -1);
+        // Tied word embeddings: the GGUF may carry no output.weight at all
+        // (Qwen2.5-1.5B-Instruct does not) — the LM head is token_embd.weight,
+        // same fallback llama.cpp's loader applies. Dereferencing the missing
+        // output.weight here was BUG-1: NULL->ne[0] == address 0x10 inside
+        // ggml_mul_mat, segfaulting the whole mesh on the first 1.5B token.
+        struct ggml_tensor *lm_head = TT(s, "output.weight", -1);
+        if (!lm_head) lm_head = TT(s, "token_embd.weight", -1);
+        if (!w_out_norm || !lm_head) { ggml_free(ctx); return -6; }
+        cur = ggml_mul(ctx, ggml_rms_norm(ctx, cur, a->eps), w_out_norm);
         struct ggml_tensor *lastcol = ggml_view_1d(ctx, cur, a->n_embd, (size_t)(n_tokens - 1) * cur->nb[1]);
-        outp = ggml_mul_mat(ctx, TT(s, "output.weight", -1), lastcol);
+        outp = ggml_mul_mat(ctx, lm_head, lastcol);
     } else outp = cur;
 
     ggml_build_forward_expand(gf, outp);
@@ -411,6 +545,8 @@ static void free_shard_internal(struct nmp_shard *s) {
     free(s->k_cache);
     free(s->v_cache);
     if (s->ctx) ggml_free(s->ctx);
+    if (s->kv_buf)      ggml_backend_buffer_free(s->kv_buf);
+    if (s->weights_buf) ggml_backend_buffer_free(s->weights_buf);
     if (s->be)  ggml_backend_free(s->be);
     free(s);
 }

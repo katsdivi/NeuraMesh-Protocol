@@ -129,6 +129,225 @@ public enum NMPModelSharder {
         return max(0, Int(usableBytes / Double(bytesPerLayer)))
     }
 
+    // MARK: - Latency-optimal plan (Phase B: network-aware balancing)
+
+    /// Minimizes MEASURED per-token wall-clock latency, not per-stage compute
+    /// balance. Autoregressive decode is sequential (token N+1 needs token N),
+    /// so stages don't pipeline-overlap and the real cost is the SUM:
+    ///
+    ///   latency = Σ(layers · computeRate[device]) + Σ(roundTrip[peer used])
+    ///
+    /// The coordinator is free (local, no round trip). Each peer that holds
+    /// ≥1 layer adds its fixed round trip once, so a peer is used only when its
+    /// compute saving outweighs that hop — or when capacity forces it (a model
+    /// too big for the coordinator alone). This is why a fast-but-far phone
+    /// gets no layers for a small model (Mac-only wins) yet a full share for a
+    /// model that won't fit on one device.
+    ///
+    /// - Parameters:
+    ///   - coordinatorPeerID: the local, round-trip-free device (always usable).
+    ///   - computeSecondsPerLayer / roundTripSeconds: from the orchestrator's
+    ///     measurements; missing entries fall back to class rate / a default
+    ///     hop so a cold mesh is conservative, not reckless. "No measurement
+    ///     yet" is UNKNOWN, never 0: a remote entry below
+    ///     `minimumMeasuredRoundTrip` is treated as unmeasured too, because a
+    ///     network hop is never free — churn/restarts once left zeroed
+    ///     round-trips that this planner consumed as real 0 ms and answered
+    ///     "put ALL layers on the phone" (BUG-4).
+    public static func planByLatency(
+        layerCount: Int,
+        coordinatorPeerID: UInt32,
+        peers: [NMPCapabilities],
+        computeSecondsPerLayer: [UInt32: Double] = [:],
+        roundTripSeconds: [UInt32: Double] = [:],
+        layerCapacities: [UInt32: Int] = [:],
+        defaultRoundTrip: TimeInterval = 0.03,
+        minimumMeasuredRoundTrip: TimeInterval = 0.001
+    ) -> NMPShardPlan {
+        guard layerCount > 0, !peers.isEmpty else {
+            return NMPShardPlan(entries: [], exclusions: [],
+                                objective: .speed, capacityShortfall: layerCount)
+        }
+        func rate(_ p: NMPCapabilities) -> Double {
+            if let m = computeSecondsPerLayer[p.peerID], m > 0 { return m }
+            switch p.computeClass {              // proxy s/layer before measurement
+            case .high: return 0.003
+            case .medium: return 0.006
+            case .low: return 0.012
+            }
+        }
+        func rtt(_ p: NMPCapabilities) -> Double {
+            guard p.peerID != coordinatorPeerID else { return 0 }
+            // Only a plausible real measurement counts; anything below the
+            // floor (or absent) costs the conservative default hop until an
+            // honest measurement exists.
+            if let measured = roundTripSeconds[p.peerID],
+               measured >= minimumMeasuredRoundTrip {
+                return measured
+            }
+            return defaultRoundTrip
+        }
+        func cap(_ p: NMPCapabilities) -> Int {
+            min(layerCount, max(0, layerCapacities[p.peerID] ?? Int.max))
+        }
+
+        guard let coordinator = peers.first(where: { $0.peerID == coordinatorPeerID })
+                ?? peers.first else {
+            return NMPShardPlan(entries: [], exclusions: [],
+                                objective: .speed, capacityShortfall: layerCount)
+        }
+        let others = peers.filter { $0.peerID != coordinator.peerID }
+
+        // Cost of a participation set: place all layers cheapest-rate-first
+        // under capacity, charge each peer that ends up holding ≥1 layer its
+        // round trip. Returns nil when the set can't hold the whole model.
+        func evaluate(_ participants: [NMPCapabilities])
+            -> (cost: Double, counts: [UInt32: Int])? {
+            guard participants.reduce(0, { $0 + cap($1) }) >= layerCount else { return nil }
+            var remaining = layerCount
+            var counts: [UInt32: Int] = [:]
+            for p in participants.sorted(by: { rate($0) < rate($1) }) {
+                guard remaining > 0 else { break }
+                let take = min(cap(p), remaining)
+                if take > 0 { counts[p.peerID] = take; remaining -= take }
+            }
+            guard remaining == 0 else { return nil }
+            var cost = 0.0
+            for p in participants {
+                let n = counts[p.peerID] ?? 0
+                cost += Double(n) * rate(p) + (n > 0 ? rtt(p) : 0)
+            }
+            return (cost, counts)
+        }
+
+        // Enumerate which peers may hold layers (coordinator always in). Real
+        // meshes are small; cap the search and fall back to "all peers" beyond.
+        var best: (cost: Double, counts: [UInt32: Int])?
+        if others.count <= 12 {
+            for mask in 0..<(1 << others.count) {
+                var set = [coordinator]
+                for (i, p) in others.enumerated() where (mask & (1 << i)) != 0 {
+                    set.append(p)
+                }
+                if let result = evaluate(set),
+                   best == nil || result.cost < best!.cost {
+                    best = result
+                }
+            }
+        } else {
+            best = evaluate(peers)
+        }
+
+        guard let winner = best else {
+            // Nowhere near enough capacity even using everything.
+            let placed = evaluate(peers)?.counts ?? [:]
+            return buildPlan(layerCount: layerCount, coordinator: coordinator,
+                             others: others, counts: placed,
+                             capacityShortfall: layerCount
+                                - placed.values.reduce(0, +), rttFor: rtt)
+        }
+        return buildPlan(layerCount: layerCount, coordinator: coordinator,
+                         others: others, counts: winner.counts,
+                         capacityShortfall: 0, rttFor: rtt)
+    }
+
+    /// Minimizes the PEAK per-device memory load: distributes layers in
+    /// proportion to each device's capacity so every device ends at the same
+    /// % full. This is the "no device fills up" plan — use it when devices are
+    /// storage/RAM-constrained. Falls back to an even split when capacities
+    /// are unknown (unbounded).
+    public static func planByCapacity(
+        layerCount: Int,
+        coordinatorPeerID: UInt32,
+        peers: [NMPCapabilities],
+        layerCapacities: [UInt32: Int] = [:]
+    ) -> NMPShardPlan {
+        guard layerCount > 0, !peers.isEmpty else {
+            return NMPShardPlan(entries: [], exclusions: [],
+                                objective: .capacityThenSpeed,
+                                capacityShortfall: layerCount)
+        }
+        let coordinator = peers.first { $0.peerID == coordinatorPeerID } ?? peers[0]
+        let others = peers.filter { $0.peerID != coordinator.peerID }
+        let ordered = [coordinator] + others
+
+        // Raw capacity drives the WEIGHTING (relative RAM); the placement
+        // limit clamps to the layer count. Clamping before weighting would
+        // flatten unequal-but-both-ample devices to an even split.
+        func rawCap(_ p: NMPCapabilities) -> Int {
+            max(0, layerCapacities[p.peerID] ?? Int.max)
+        }
+        func cap(_ p: NMPCapabilities) -> Int { min(layerCount, rawCap(p)) }
+        // Weight = capacity; unbounded (Int.max) → even weighting so a
+        // weightless/unknown mesh still splits sensibly.
+        let bounded = ordered.allSatisfy { rawCap($0) < Int.max }
+        let weights: [Double] = ordered.map {
+            bounded ? Double(rawCap($0)) : 1.0
+        }
+        let totalWeight = max(weights.reduce(0, +), 1)
+
+        // Ideal (fractional) share per device, then largest-remainder rounding
+        // to whole layers, clamped to capacity.
+        var counts: [UInt32: Int] = [:]
+        var remainders: [(peerID: UInt32, frac: Double, capLeft: Int)] = []
+        var placed = 0
+        for (i, device) in ordered.enumerated() {
+            let ideal = Double(layerCount) * weights[i] / totalWeight
+            let n = min(Int(ideal.rounded(.down)), cap(device))
+            counts[device.peerID] = n
+            placed += n
+            remainders.append((device.peerID, ideal - Double(n),
+                               cap(device) - n))
+        }
+        // Hand out the leftover layers to the largest remainders that still
+        // have capacity.
+        var leftover = layerCount - placed
+        for r in remainders.sorted(by: { $0.frac > $1.frac }) where leftover > 0 {
+            guard r.capLeft > 0 else { continue }
+            let give = min(r.capLeft, leftover)
+            counts[r.peerID, default: 0] += give
+            leftover -= give
+        }
+        return buildPlan(layerCount: layerCount, coordinator: coordinator,
+                         others: others, counts: counts,
+                         capacityShortfall: max(0, leftover),
+                         rttFor: { _ in 0 })
+    }
+
+    /// Lays out decided per-device layer counts as contiguous pipeline
+    /// ranges — coordinator first (it owns the embedding, so it needs no
+    /// inbound hop), then peers in speed order — and records who got nothing.
+    private static func buildPlan(
+        layerCount: Int, coordinator: NMPCapabilities, others: [NMPCapabilities],
+        counts: [UInt32: Int], capacityShortfall: Int,
+        rttFor: (NMPCapabilities) -> Double
+    ) -> NMPShardPlan {
+        var entries: [NMPShardPlanEntry] = []
+        var exclusions: [NMPShardExclusion] = []
+        var cursor = 0
+        var shardIndex = 0
+        let ordered = [coordinator] + others  // coordinator leads the pipeline
+        for device in ordered {
+            let n = counts[device.peerID] ?? 0
+            if n > 0 {
+                entries.append(NMPShardPlanEntry(
+                    peerID: device.peerID, shardIndex: shardIndex,
+                    startLayer: cursor, endLayer: cursor + n))
+                cursor += n
+                shardIndex += 1
+            } else if device.peerID != coordinator.peerID {
+                exclusions.append(NMPShardExclusion(
+                    peerID: device.peerID,
+                    reason: String(format:
+                        "excluded: its %.0f ms round trip outweighs the compute "
+                        + "it would offload (Mac-only is faster here)",
+                        rttFor(device) * 1000)))
+            }
+        }
+        return NMPShardPlan(entries: entries, exclusions: exclusions,
+                            objective: .speed, capacityShortfall: capacityShortfall)
+    }
+
     /// Backward-compatible Phase 5 entry point: speed-weighted split with a
     /// 1-layer floor, no capacity ceilings. Equivalent to `planDetailed`
     /// with unbounded capacities and `.capacityThenSpeed`.

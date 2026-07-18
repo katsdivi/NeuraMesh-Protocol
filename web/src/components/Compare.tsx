@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { api, type ComparisonRun, type ProtocolEstimate } from '../api';
+import { api, ApiError, type ComparisonRun, type ProtocolEstimate } from '../api';
 import { ProtocolComparison, RaceResults } from './ProtocolComparison';
 
 /**
@@ -168,14 +168,33 @@ function RealRace() {
   const [running, setRunning] = useState(false);
   const [race, setRace] = useState<ComparisonRun | null>(null);
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
 
   const run = async () => {
     setRunning(true);
     setError('');
+    setNotice('');
     try {
       setRace(await api.comparisonRun({ prompt, max_tokens: maxTokens }));
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      // Expected states, not faults: 429 = the mesh is mid-generation;
+      // 409 = the current placement is Mac-only, so a race has no mesh
+      // traffic to replay.
+      if (err instanceof ApiError && err.status === 429) {
+        setNotice(
+          'The mesh is busy generating — wait for the current run to '
+            + 'finish and try again.',
+        );
+      } else if (err instanceof ApiError && err.status === 409) {
+        setNotice(
+          'This placement is local-only (all layers on this Mac), so the '
+            + 'generation moved no mesh traffic — nothing to race. Give the '
+            + 'phone some layers (Devices tab → Manual → raise its compute '
+            + 'share) to race the transports over a real link.',
+        );
+      } else {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
       setRunning(false);
     }
@@ -223,6 +242,7 @@ function RealRace() {
         >
           {running ? 'Racing…' : 'Run the race'}
         </button>
+        {notice && <div className="note-box">{notice}</div>}
         {error && <div className="error-box">{error}</div>}
       </div>
 

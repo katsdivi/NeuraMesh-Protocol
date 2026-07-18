@@ -172,24 +172,33 @@ if arguments.engineKind == "llamaShard" {
         """.utf8))
         exit(1)
     }
-} else if let path = arguments.ggufPath {
+} else {
+    // Pure-compute plugins (reference) built from generic context through the
+    // ONE registry factory (NMPPlugin.swift). An unknown --engine fails here.
+    guard let descriptor = NMPPluginRegistry.descriptor(id: arguments.engineKind),
+          let makeGeneric = descriptor.makeGeneric else {
+        FileHandle.standardError.write(Data("""
+        --engine '\(arguments.engineKind)' is not usable as a coordinator. available:
+        \(NMPPluginRegistry.helpBlock)
+
+        """.utf8))
+        exit(2)
+    }
+    let context = NMPPluginContext(
+        layers: arguments.layers, hiddenSize: arguments.hidden,
+        ggufPath: arguments.ggufPath, modelTag: arguments.modelTag,
+        slowSecondsPerLayer: arguments.slowMillisPerLayer / 1000)
     do {
-        let gguf = try NMPGGUFModel.load(path: path)
-        let referenceEngine = try NMPReferenceComputeEngine(gguf: gguf)
-        referenceEngine.simulatedSecondsPerLayer = arguments.slowMillisPerLayer / 1000
-        engine = referenceEngine
-        if let name = gguf.modelName { modelTag = name }
-        print("[coordinator] loaded GGUF: \(gguf.modelName ?? path) — "
-              + "\(referenceEngine.layerCount) layers × \(referenceEngine.hiddenSize) hidden")
+        let instance = try makeGeneric(context)
+        engine = instance.engine
+        modelTag = instance.modelTag
+        print("[coordinator] \(descriptor.id) engine: \(modelTag) — "
+              + "\(engine.layerCount) layers × \(engine.hiddenSize) hidden")
     } catch {
-        FileHandle.standardError.write(Data("failed to load GGUF at \(path): \(error)\n".utf8))
+        FileHandle.standardError.write(Data(
+            "failed to start \(descriptor.id) engine: \(error)\n".utf8))
         exit(1)
     }
-} else {
-    let referenceEngine = NMPReferenceComputeEngine(
-        layerCount: arguments.layers, hiddenSize: arguments.hidden)
-    referenceEngine.simulatedSecondsPerLayer = arguments.slowMillisPerLayer / 1000
-    engine = referenceEngine
 }
 
 // MARK: - Helpers

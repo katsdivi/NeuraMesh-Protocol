@@ -60,6 +60,119 @@ final class FaultToleranceTests: XCTestCase {
         XCTAssertEqual(monitor.trackedPeers, [])
     }
 
+    // MARK: Compute-path stall verdict (BUG-3)
+
+    func testHealthMonitorComputeStallOverridesFreshHeartbeat() {
+        var now = Date(timeIntervalSince1970: 1000)
+        let monitor = NMPPeerHealthMonitor(heartbeatTimeout: 5.0, clock: { now })
+        monitor.track(peerID: 0xA)
+
+        // The heartbeat stays fresh the whole time — this is exactly the
+        // backgrounded-phone shape: pings echo, metrics flow, compute dead.
+        now = now.addingTimeInterval(1.0)
+        monitor.recordActivity(peerID: 0xA)
+        XCTAssertEqual(monitor.checkHealth(), [])
+
+        monitor.recordComputeStall(peerID: 0xA)
+        monitor.recordActivity(peerID: 0xA) // ping echo must NOT veto the stall
+        XCTAssertTrue(monitor.isComputeStalled(peerID: 0xA))
+        XCTAssertEqual(monitor.checkHealth(), [0xA],
+                       "compute evidence outranks a fresh heartbeat")
+
+        // A completed stage clears the verdict.
+        monitor.recordComputeRecovery(peerID: 0xA)
+        XCTAssertEqual(monitor.checkHealth(), [])
+
+        // Untracked peers cannot be flagged (mirror of recordActivity).
+        monitor.recordComputeStall(peerID: 0xB)
+        XCTAssertEqual(monitor.checkHealth(), [])
+        XCTAssertFalse(monitor.isComputeStalled(peerID: 0xB))
+
+        // Re-tracking (a rejoin) starts fresh — no stale stall flag.
+        monitor.recordComputeStall(peerID: 0xA)
+        monitor.track(peerID: 0xA)
+        XCTAssertEqual(monitor.checkHealth(), [])
+
+        // forget() drops the flag with the peer.
+        monitor.recordComputeStall(peerID: 0xA)
+        monitor.forget(peerID: 0xA)
+        XCTAssertEqual(monitor.checkHealth(), [])
+    }
+
+    func testStalledPeerIsEvictedWhileHeartbeatSaysAlive() throws {
+        // Heartbeat window 60 s: the activity clock CANNOT evict anyone
+        // inside this test — only compute-path evidence can. This is the
+        // BUG-3 shape: the phone's liveness read "alive" for ~3 minutes
+        // while every generation timed out against it.
+        let testbed = try NMPMeshTestbed(layerCount: 8, hiddenSize: 96,
+                                         remotePeerCount: 2,
+                                         heartbeatTimeout: 60)
+        _ = try testbed.startSync()
+        let victim = testbed.remotePeers[1].capabilities.peerID
+
+        let resharded = expectation(description: "evicted + re-sharded")
+        testbed.failover.onResharded = { plan, _ in
+            if !plan.contains(where: { $0.peerID == victim }) {
+                resharded.fulfill()
+            }
+        }
+
+        testbed.silencePeer(victim)
+        // ONE failed generation: first send + its retry = 2 consecutive
+        // stage timeouts = the stall threshold. No health-check polling is
+        // running — eviction must come from the compute verdict alone.
+        XCTAssertThrowsError(try testbed.inferSync(input: testbed.makeInput(),
+                                                   stageTimeout: 0.3))
+        wait(for: [resharded], timeout: 5)
+        XCTAssertFalse(testbed.failover.activePlan.contains { $0.peerID == victim },
+                       "the stalled peer must be routed around immediately")
+
+        // The blackhole is over: the very next inference serves.
+        let report = try testbed.inferSync(input: testbed.makeInput())
+        XCTAssertEqual(report.perShard.count, 2, "coordinator + survivor")
+    }
+
+    func testStageSuccessResetsTheStallCount() throws {
+        let testbed = try NMPMeshTestbed(layerCount: 8, hiddenSize: 96,
+                                         remotePeerCount: 1,
+                                         heartbeatTimeout: 60)
+        _ = try testbed.startSync()
+        let peer = testbed.remotePeers[0]
+        let peerID = peer.capabilities.peerID
+        // One timeout per failed pass, so strikes are countable one by one.
+        testbed.orchestrator.stageRetryLimit = 0
+
+        // Strike 1.
+        testbed.silencePeer(peerID)
+        XCTAssertThrowsError(try testbed.inferSync(input: testbed.makeInput(),
+                                                   stageTimeout: 0.3))
+        // Recovery: a served stage must reset the consecutive count.
+        peer.coordinatorInjector.reset()
+        peer.peerInjector.reset()
+        _ = try testbed.inferSync(input: testbed.makeInput())
+
+        // Strike 1 again — NOT 2 — so no eviction may happen here. (Give a
+        // wrongful async eviction a beat to land before asserting it didn't.)
+        testbed.silencePeer(peerID)
+        XCTAssertThrowsError(try testbed.inferSync(input: testbed.makeInput(),
+                                                   stageTimeout: 0.3))
+        Thread.sleep(forTimeInterval: 0.3)
+        XCTAssertTrue(testbed.failover.activePlan.contains { $0.peerID == peerID },
+                      "one timeout after a success is below the threshold")
+
+        // The next CONSECUTIVE timeout crosses it → eviction.
+        let resharded = expectation(description: "evicted after 2 consecutive")
+        testbed.failover.onResharded = { plan, _ in
+            if !plan.contains(where: { $0.peerID == peerID }) {
+                resharded.fulfill()
+            }
+        }
+        XCTAssertThrowsError(try testbed.inferSync(input: testbed.makeInput(),
+                                                   stageTimeout: 0.3))
+        wait(for: [resharded], timeout: 5)
+        XCTAssertFalse(testbed.failover.activePlan.contains { $0.peerID == peerID })
+    }
+
     // MARK: Failover over a real mesh
 
     func testFailoverReShardsToRemainingPeers() throws {

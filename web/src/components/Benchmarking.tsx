@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { api, type BenchmarkResults } from '../api';
+import { api, ApiError, type BenchmarkResults } from '../api';
 
 export function Benchmarking() {
   const [prompt, setPrompt] = useState('The future of AI is');
@@ -8,14 +8,24 @@ export function Benchmarking() {
   const [running, setRunning] = useState(false);
   const [results, setResults] = useState<BenchmarkResults | null>(null);
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
 
   const start = async () => {
     setRunning(true);
     setError('');
+    setNotice('');
     try {
       setResults(await api.benchmark({ prompt, max_tokens: maxTokens, runs }));
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      // 429 = another generation holds the mesh — an expected state, not a fault.
+      if (err instanceof ApiError && err.status === 429) {
+        setNotice(
+          'The mesh is busy generating (someone else’s run is in flight) — '
+            + 'wait a moment and try again.',
+        );
+      } else {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
       setRunning(false);
     }
@@ -67,6 +77,7 @@ export function Benchmarking() {
         >
           {running ? `Benchmarking (${runs} runs)…` : 'Start Benchmark'}
         </button>
+        {notice && <div className="note-box">{notice}</div>}
         {error && <div className="error-box">{error}</div>}
       </div>
 
@@ -91,7 +102,17 @@ export function Benchmarking() {
           </div>
 
           <div className="card">
-            <h3>Runs</h3>
+            <h3>
+              Runs
+              {results.runs_requested !== undefined &&
+                results.runs_requested !== results.runs.length && (
+                  <span className="fact-sub">
+                    {' '}
+                    · requested {results.runs_requested}, server clamped to{' '}
+                    {results.runs.length}
+                  </span>
+                )}
+            </h3>
             {results.runs.map((run) => (
               <div key={run.run} className="run-item">
                 <span>run {run.run}</span>

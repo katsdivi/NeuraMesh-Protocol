@@ -40,6 +40,14 @@ export function Inference({
   // leading spaces.
   const joiner = health?.mesh.engine === 'reference' ? ' ' : '';
   const streaming = live.status === 'running';
+  // WS generations now say who started them ("inference" | "chat" |
+  // "benchmark" | "comparison"). Anything that isn't a plain inference
+  // run gets labeled so a benchmark's tokens aren't mistaken for a run
+  // from this tab. Old servers send no source — treated as our own.
+  const foreignSource =
+    live.source !== undefined && live.source !== 'inference'
+      ? live.source
+      : undefined;
   // A finished run this tab did NOT submit still deserves its numbers.
   const spectatorResult = !result && !loading && live.status === 'done'
     ? live.result : undefined;
@@ -122,7 +130,9 @@ export function Inference({
       {streaming && (
         <div>
           <div className="note-box">
-            Live — streaming to every open browser
+            {foreignSource
+              ? `Live — a ${foreignSource} generation elsewhere on the mesh`
+              : 'Live — streaming to every open browser'}
             {live.prompt ? ` · “${live.prompt}”` : ''}
             {live.speculative ? ' · speculative' : ''} ·{' '}
             {live.tokens.length}/{live.requested || '?'} tokens
@@ -136,13 +146,18 @@ export function Inference({
       )}
 
       {live.status === 'failed' && !loading && (
-        <div className="error-box">{live.error}</div>
+        <div className="error-box">
+          {foreignSource ? `${foreignSource} run: ` : ''}
+          {live.error}
+        </div>
       )}
 
       {spectatorResult && (
         <div>
           <div className="note-box">
-            Result of the run just streamed (submitted from another device).
+            {foreignSource
+              ? `Result of the ${foreignSource} run just streamed (not started from this tab).`
+              : 'Result of the run just streamed (submitted from another device).'}
           </div>
           <div className="output-box">
             {spectatorResult.output || '(no tokens emitted)'}
@@ -197,7 +212,11 @@ export function Inference({
             <div className="metric-card">
               <div className="metric-label">Latency</div>
               <div className="metric-value">{result.latency_ms.toFixed(0)} ms</div>
-              <div className="metric-sub">{result.token_count} tokens</div>
+              <div className="metric-sub">
+                {result.token_count} tokens
+                {result.max_tokens_effective !== undefined &&
+                  ` · clamped to ${result.max_tokens_effective}`}
+              </div>
             </div>
             <div className="metric-card">
               <div className="metric-label">Payload</div>

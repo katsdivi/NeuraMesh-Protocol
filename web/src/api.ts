@@ -3,6 +3,10 @@
 
 export interface MeshHealth {
   status: string;
+  /** True only when the real engine + model are live. During a restart
+   *  there is a window where status is "ok" but ready is false (the
+   *  placeholder reference engine answers). Absent on older servers. */
+  ready?: boolean;
   hostname: string;
   mesh: {
     engine: string;
@@ -101,12 +105,51 @@ export interface ShardingObjective {
   label: string;
 }
 
+/** One device's footprint under a candidate shard plan. */
+export interface PlanDevice {
+  id: string;
+  name: string;
+  layers: number;
+  footprint_mb: number;
+  ram_mb: number;
+  /** Footprint as a % of the device's RAM (how full it'd get). */
+  percent: number;
+  is_coordinator: boolean;
+  excluded: boolean;
+}
+
+/** A candidate shard plan (speed / balanced / capacity) to preview. */
+export interface PlanCandidate {
+  strategy: string;
+  label: string;
+  note: string;
+  /** False when the model can't fit even across the whole mesh. */
+  fits: boolean;
+  capacity_shortfall: number;
+  /** The fullest any single device gets under this plan. */
+  max_device_percent: number;
+  devices: PlanDevice[];
+}
+
+export interface ShardPlans {
+  current_strategy: string;
+  plans: PlanCandidate[];
+}
+
 export interface DeviceMetrics {
   host: HostSample;
   host_note: string;
   generation_in_flight: boolean;
+  /** Deprecated mode indicator (true = manual sliders drive the split).
+   *  Kept for older servers; prefer manual_mode. */
   allocation_supported: boolean;
+  /** True = manual mode (operator compute-share sliders drive the split).
+   *  Same meaning as the deprecated allocation_supported. */
+  manual_mode?: boolean;
   allocation_note: string;
+  /** Shard mode: true = layers auto-balance by measured speed + capacity;
+   *  false = manual (the operator's compute-share sliders drive the split). */
+  auto_balance?: boolean;
   peers: PeerMetric[];
   totals?: MeshTotals;
   // Mesh 2.8: live layer-distribution strategy.
@@ -197,6 +240,9 @@ export interface InferenceResult {
   round_trips: number;
   wire_format: string;
   speculation?: SpeculationStats;
+  /** Present when the server clamped the requested max_tokens — the
+   *  value the generation actually ran with. */
+  max_tokens_effective?: number;
   /** Mesh 2.5: "Compare protocols" runs the MEASURED transport race on
    *  the generation's real traffic pattern — no modeled numbers here. */
   transport_race?: TransportRace;
@@ -216,6 +262,9 @@ export interface BenchmarkResults {
   avg_tokens_per_sec: number;
   avg_latency_ms: number;
   stddev_latency_ms: number;
+  /** Echo of the requested run count — differs from runs.length when the
+   *  server clamped it. Absent on older servers. */
+  runs_requested?: number;
   runs: BenchmarkRun[];
 }
 
@@ -223,6 +272,25 @@ export interface BenchmarkResults {
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
   content: string;
+}
+
+/** A saved conversation's sidebar row (no message bodies). */
+export interface ChatSummary {
+  id: string;
+  title: string;
+  /** The device that owns this conversation (its LAN hostname). */
+  device: string;
+  model: string;
+  created_at: number;
+  updated_at: number;
+  message_count: number;
+  /** The on-disk copy has been squeezed to LZFSE (quiet session). */
+  compressed: boolean;
+}
+
+/** A saved conversation with its full transcript. */
+export interface SavedConversation extends ChatSummary {
+  messages: ChatMessage[];
 }
 
 /** An installed model in ~/models, with the flags the picker needs. */
@@ -248,6 +316,16 @@ export interface ModelInfo {
   note: string;
 }
 
+/** A non-2xx API reply, carrying the HTTP status so callers can treat
+ *  expected states (429 busy, 409 nothing-to-race) as flow, not faults. */
+export class ApiError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
 async function post<T>(path: string, body: unknown): Promise<T> {
   const response = await fetch(path, {
     method: 'POST',
@@ -256,7 +334,10 @@ async function post<T>(path: string, body: unknown): Promise<T> {
   });
   const data = await response.json();
   if (!response.ok) {
-    throw new Error(data.error ?? `${response.status} ${response.statusText}`);
+    throw new ApiError(
+      response.status,
+      data.error ?? `${response.status} ${response.statusText}`,
+    );
   }
   return data as T;
 }
@@ -280,6 +361,31 @@ export const api = {
     max_tokens: number;
     enable_speculation?: boolean;
   }): Promise<InferenceResult> => post('/api/chat', request),
+
+  /** Saved conversations on THIS device, newest first. Empty when history
+   *  is disabled server-side. */
+  listChats: (): Promise<ChatSummary[]> =>
+    fetch('/api/chats').then((r) => (r.ok ? r.json() : [])),
+
+  /** One saved conversation with its full transcript. */
+  loadChat: (id: string): Promise<SavedConversation> =>
+    fetch(`/api/chats/${id}`).then((r) => {
+      if (!r.ok) throw new Error(`${r.status}`);
+      return r.json();
+    }),
+
+  /** Create (blank id) or replace a conversation; returns the stored row
+   *  (with the generated id + derived title for a new chat). */
+  saveChat: (request: {
+    id?: string;
+    title?: string;
+    model?: string;
+    messages: ChatMessage[];
+  }): Promise<ChatSummary> => post('/api/chats', request),
+
+  /** Delete a saved conversation. */
+  deleteChat: (id: string): Promise<{ deleted: boolean }> =>
+    post(`/api/chats/${id}/delete`, {}),
 
   benchmark: (request: {
     prompt: string;
@@ -315,12 +421,39 @@ export const api = {
   clients: (): Promise<WebClient[]> =>
     fetch('/api/clients').then((r) => r.json()),
 
-  /** Mesh 2.1: set a peer's mesh compute share (re-shards the mesh). */
+  /** Mesh 2.1: set a peer's mesh compute share (re-shards the mesh).
+   *  New servers echo share_requested + the resulting assignment and
+   *  404 unknown device ids. */
   allocate: (
     peerId: string,
     share: number,
-  ): Promise<{ status: string; summary: string }> =>
-    post(`/api/devices/${peerId}/allocate`, { share }),
+  ): Promise<{
+    status: string;
+    summary: string;
+    share_requested?: number;
+    assigned?: string;
+  }> => post(`/api/devices/${peerId}/allocate`, { share }),
+
+  /** Auto (balance by measured speed + capacity) vs manual (operator
+   *  compute-share sliders). Switching re-shards the mesh. */
+  setAutoBalance: (
+    enabled: boolean,
+  ): Promise<{ status: string; auto_balance: boolean; summary: string }> =>
+    post('/api/mesh/autobalance', { enabled }),
+
+  /** Preview the candidate shard plans (speed / balanced / capacity) with
+   *  per-device footprints, before committing one. */
+  meshPlans: (): Promise<ShardPlans> =>
+    fetch('/api/mesh/plans').then((r) => {
+      if (!r.ok) throw new Error(`${r.status}`);
+      return r.json();
+    }),
+
+  /** Apply a previewed plan (re-shards the mesh). */
+  applyStrategy: (
+    strategy: string,
+  ): Promise<{ status: string; strategy: string; summary: string }> =>
+    post('/api/mesh/strategy', { strategy }),
 
   /** Mesh 2.8: switch the sharding objective (re-shards the mesh). */
   setObjective: (

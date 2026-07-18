@@ -3,6 +3,7 @@ import {
   api,
   type DeviceMetrics,
   type PeerMetric,
+  type ShardPlans,
   type WebClient,
 } from '../api';
 
@@ -69,12 +70,67 @@ export function Devices() {
     }
   };
 
+  // Pre-shard plan preview: the 3 candidate splits + their footprints.
+  const [plans, setPlans] = useState<ShardPlans | null>(null);
+  const [plansBusy, setPlansBusy] = useState(false);
+  const loadPlans = async () => {
+    setPlansBusy(true);
+    setError('');
+    try {
+      setPlans(await api.meshPlans());
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setPlansBusy(false);
+    }
+  };
+  const applyPlan = async (strategy: string) => {
+    setPlansBusy(true);
+    setError('');
+    try {
+      const res = await api.applyStrategy(strategy);
+      setLastAction(`Applied ${strategy} plan: ${res.summary}`);
+      await Promise.all([refresh(), loadPlans()]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setPlansBusy(false);
+    }
+  };
+
+  const [autoBusy, setAutoBusy] = useState(false);
+  // Which mode the in-flight toggle POST is switching TO — a real change
+  // re-shards the mesh and can take seconds (longer while the phone holds
+  // layers), so the toggle needs a visible in-progress state.
+  const [autoPending, setAutoPending] = useState<boolean | null>(null);
+  const switchAutoBalance = async (enabled: boolean) => {
+    setAutoBusy(true);
+    setAutoPending(enabled);
+    setError('');
+    try {
+      const response = await api.setAutoBalance(enabled);
+      setLastAction(`${enabled ? 'Auto' : 'Manual'} balancing: ${response.summary}`);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setAutoBusy(false);
+      setAutoPending(null);
+    }
+  };
+
   const commitShare = async (peerId: string, share: number) => {
     setBusyPeer(peerId);
     setError('');
     try {
       const response = await api.allocate(peerId, share);
-      setLastAction(`Re-sharded: ${response.summary}`);
+      setLastAction(
+        `Re-sharded${
+          response.share_requested !== undefined
+            ? ` (requested share ${Math.round(response.share_requested * 100)}%)`
+            : ''
+        }: ${response.summary}`,
+      );
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -90,6 +146,11 @@ export function Devices() {
 
   const host = metrics?.host;
   const totals = metrics?.totals;
+  // Contract: manual_mode is the mode flag going forward; the deprecated
+  // allocation_supported carries the same meaning on older servers.
+  const manualMode = metrics
+    ? metrics.manual_mode ?? metrics.allocation_supported
+    : false;
 
   return (
     <div>
@@ -237,14 +298,147 @@ export function Devices() {
         )}
 
       <h2>Mesh peers</h2>
-      {metrics && !metrics.allocation_supported && (
+      {metrics && metrics.auto_balance !== undefined && (
+        <div className="card objective-card">
+          <div className="objective-head">
+            <div>
+              <strong>Layer balancing</strong>
+              <div className="objective-explain">
+                {metrics.auto_balance
+                  ? 'Auto — layers split by each device’s measured speed & '
+                    + 'capacity; re-shards on join/leave and as measurements '
+                    + 'converge.'
+                  : 'Manual — set each device’s compute share below. 0% '
+                    + 'excludes a device (Mac-only, no per-token round trip).'}
+              </div>
+            </div>
+            <div className="objective-toggle">
+              <button
+                className={`objective-option ${metrics.auto_balance ? 'active' : ''}`}
+                disabled={autoBusy || metrics.auto_balance === true}
+                onClick={() => switchAutoBalance(true)}
+              >
+                {autoPending === true ? 'Auto…' : 'Auto'}
+              </button>
+              <button
+                className={`objective-option ${!metrics.auto_balance ? 'active' : ''}`}
+                disabled={autoBusy || metrics.auto_balance === false}
+                onClick={() => switchAutoBalance(false)}
+              >
+                {autoPending === false ? 'Manual…' : 'Manual'}
+              </button>
+            </div>
+          </div>
+          {autoBusy && (
+            <div className="model-switching" style={{ marginTop: 'var(--spacing-sm)', marginBottom: 0 }}>
+              <div className="spinner-dot" />
+              <span className="objective-explain" style={{ marginTop: 0 }}>
+                Switching to {autoPending ? 'auto' : 'manual'} — re-sharding
+                the mesh. This can take a while when a phone holds layers;
+                leave this tab open.
+              </span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {metrics && metrics.auto_balance !== undefined && (
+        <div className="card plan-preview">
+          <div className="objective-head">
+            <div>
+              <strong>Sharding plan</strong>
+              <div className="objective-explain">
+                Compare how each strategy splits the model across your devices —
+                and how full each one gets — then apply one.
+              </div>
+            </div>
+            <button
+              className="ghost-button"
+              disabled={plansBusy}
+              onClick={loadPlans}
+            >
+              {plans ? 'Refresh' : 'Preview plans'}
+            </button>
+          </div>
+          {plans && (
+            <div className="plan-grid">
+              {plans.plans.map((plan) => {
+                const isCurrent = plan.strategy === plans.current_strategy;
+                return (
+                  <div
+                    key={plan.strategy}
+                    className={`plan-option${isCurrent ? ' active' : ''}`}
+                  >
+                    <div className="plan-option-head">
+                      <strong>{plan.label}</strong>
+                      {isCurrent && <span className="badge">current</span>}
+                    </div>
+                    <div className="plan-note">{plan.note}</div>
+                    <div className="plan-devices">
+                      {plan.devices.map((d) => (
+                        <div key={d.id} className="plan-device">
+                          <div className="plan-device-top">
+                            <span className="plan-device-name">
+                              {d.is_coordinator ? 'This Mac' : d.name}
+                              {d.excluded && (
+                                <span className="plan-excl"> · idle</span>
+                              )}
+                            </span>
+                            <span className="plan-device-layers">
+                              {d.layers} layer{d.layers === 1 ? '' : 's'}
+                              {d.footprint_mb > 0 && ` · ${d.footprint_mb} MB`}
+                            </span>
+                          </div>
+                          <div className="plan-bar">
+                            <div
+                              className={`plan-bar-fill${
+                                d.percent >= 85 ? ' hot' : ''
+                              }`}
+                              style={{ width: `${Math.min(100, d.percent)}%` }}
+                            />
+                          </div>
+                          <div className="plan-device-pct">
+                            {d.ram_mb > 0
+                              ? `${d.percent}% of ${(d.ram_mb / 1024).toFixed(0)} GB RAM`
+                              : 'footprint unknown'}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="plan-foot">
+                      {plan.fits ? (
+                        <span className="plan-peak">
+                          peak device {plan.max_device_percent}% full
+                        </span>
+                      ) : (
+                        <span className="plan-peak hot">
+                          ✗ won’t fit ({plan.capacity_shortfall} layers over)
+                        </span>
+                      )}
+                      <button
+                        className="primary-button"
+                        disabled={plansBusy || isCurrent || !plan.fits}
+                        onClick={() => applyPlan(plan.strategy)}
+                      >
+                        {isCurrent ? 'Applied' : 'Apply'}
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+      {metrics && !manualMode
+        && metrics.auto_balance === undefined && (
         <div className="note-box">{metrics.allocation_note}</div>
       )}
       {metrics?.peers.map((peer) => (
         <PeerCard
           key={peer.id}
           peer={peer}
-          allocationSupported={metrics.allocation_supported}
+          allocationSupported={manualMode}
           share={draft[peer.id] ?? peer.compute_share}
           busy={busyPeer !== null}
           resharding={busyPeer === peer.id}
@@ -482,7 +676,7 @@ function PeerCard({
           </label>
           <input
             type="range"
-            min={10}
+            min={0}
             max={100}
             step={5}
             value={Math.round(share * 100)}
